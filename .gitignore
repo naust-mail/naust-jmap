@@ -1,0 +1,13 @@
+# Go
+*.test
+*.out
+/bin/
+
+# Editor/OS
+.idea/
+*.swp
+.DS_Store
+
+# hidden folders
+.[a-zA-Z0-9]*/
+.[a-zA-Z0-9]*/**/*

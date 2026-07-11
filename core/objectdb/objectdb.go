@@ -1,0 +1,511 @@
+// Package objectdb is the runtime's object database: collections of
+// typed records with in-commit index maintenance, a per-account change
+// log, and per-type state strings, built once over any backend.Backend.
+//
+// Consistency contract (the matched pair): every mutation happens under
+// the account's lease and commits as ONE atomic batch containing the
+// object writes, index updates, the change log entry, the sequence
+// bump, and the lease fencing assertion. The change log is part of the
+// commit, never a downstream event - a state string can therefore never
+// disagree with the data it describes.
+//
+// Reads take no lease. A multi-object read concurrent with a commit may
+// observe a torn view across objects (single Get/Scan calls are atomic;
+// groups are not). RFC 8620 section 3.10 already tells clients data may
+// change between method calls; a snapshot upgrade via an optional
+// backend interface can tighten this later without API change.
+package objectdb
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+
+	"github.com/naust-mail/naust-jmap/core/descriptor"
+	"github.com/naust-mail/naust-jmap/core/jmap"
+	"github.com/naust-mail/naust-jmap/core/providers/backend"
+	"github.com/naust-mail/naust-jmap/core/providers/lease"
+	"github.com/naust-mail/naust-jmap/core/providers/notify"
+)
+
+// Object is one record: property name to raw JSON value. The "id"
+// property is always present on stored objects.
+type Object map[string]json.RawMessage
+
+var (
+	// ErrNotFound reports a missing record.
+	ErrNotFound = errors.New("objectdb: record not found")
+	// ErrUnknownType reports an unregistered type name.
+	ErrUnknownType = errors.New("objectdb: unknown type")
+	// ErrCannotCalculateChanges maps to the cannotCalculateChanges
+	// method error (RFC 8620 section 5.2).
+	ErrCannotCalculateChanges = errors.New("objectdb: cannot calculate changes from that state")
+
+	errUnknownKind = errors.New("objectdb: unknown property kind")
+)
+
+// DB is the object database over one backend.
+type DB struct {
+	be       backend.Backend
+	leases   lease.Manager
+	types    map[string]*descriptor.Type
+	notifier notify.Notifier
+}
+
+// New wraps a backend and lease manager.
+func New(be backend.Backend, lm lease.Manager) *DB {
+	return &DB{be: be, leases: lm, types: make(map[string]*descriptor.Type)}
+}
+
+// RegisterType adds a type descriptor. Registration is not
+// concurrency-safe; register everything before serving.
+func (db *DB) RegisterType(t *descriptor.Type) error {
+	if err := t.Validate(); err != nil {
+		return err
+	}
+	if _, dup := db.types[t.Name]; dup {
+		return fmt.Errorf("objectdb: type %s already registered", t.Name)
+	}
+	db.types[t.Name] = t
+	return nil
+}
+
+// Type returns a registered descriptor, or nil.
+func (db *DB) Type(name string) *descriptor.Type { return db.types[name] }
+
+// TypeNames returns every registered type name, sorted.
+func (db *DB) TypeNames() []string {
+	names := make([]string, 0, len(db.types))
+	for name := range db.types {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// SetNotifier attaches a post-commit notifier: after every successful
+// commit, the touched types and their new state strings are published
+// for the account (the producer side of RFC 8620 section 7 push).
+// Delivery is best-effort by the notify contract - the commit is
+// already durable, and a lost notification only delays a client's
+// resync. Set before serving; not concurrency-safe.
+func (db *DB) SetNotifier(n notify.Notifier) { db.notifier = n }
+
+func unmarshal(raw []byte, v any) error { return json.Unmarshal(raw, v) }
+
+// Get returns one record.
+func (db *DB) Get(ctx context.Context, acct jmap.Id, typeName string, id jmap.Id) (Object, error) {
+	if db.types[typeName] == nil {
+		return nil, ErrUnknownType
+	}
+	raw, err := db.be.Get(ctx, objKey(acct, typeName, id))
+	if errors.Is(err, backend.ErrNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var obj Object
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, err
+	}
+	return obj, nil
+}
+
+// AllIds lists every record id of a type, in id order. If max > 0 and
+// more than max exist, it returns max+1 ids so the caller can detect
+// the overflow (RFC 8620 section 5.1: /get with ids null is subject to
+// maxObjectsInGet).
+func (db *DB) AllIds(ctx context.Context, acct jmap.Id, typeName string, max int) ([]jmap.Id, error) {
+	if db.types[typeName] == nil {
+		return nil, ErrUnknownType
+	}
+	start, end := prefixRange(seg(string(acct)), seg("o"), seg(typeName))
+	var ids []jmap.Id
+	err := db.be.Scan(ctx, start, end, false, func(k, _ []byte) bool {
+		ids = append(ids, idFromObjKey(k))
+		return max <= 0 || len(ids) <= max
+	})
+	return ids, err
+}
+
+// idFromObjKey recovers the trailing id segment of an object key.
+func idFromObjKey(k []byte) jmap.Id {
+	// The id is the last segment; strip the terminator and unescape.
+	// Ids use the section 1.2 alphabet, so no escapes occur in practice.
+	end := len(k) - 2 // drop 0x00 0x01 terminator
+	start := end
+	for start >= 2 && !(k[start-2] == 0x00 && k[start-1] == 0x01) {
+		start--
+	}
+	return jmap.Id(k[start:end])
+}
+
+// TypeState returns the current state string for a type in an account
+// ("0" for a type never written; RFC 8620 section 5.1 state semantics).
+func (db *DB) TypeState(ctx context.Context, acct jmap.Id, typeName string) (string, error) {
+	if db.types[typeName] == nil {
+		return "", ErrUnknownType
+	}
+	raw, err := db.be.Get(ctx, typeStateKey(acct, typeName))
+	if errors.Is(err, backend.ErrNotFound) {
+		return "0", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	seq, err := backend.DecodeInt64(raw)
+	if err != nil {
+		return "", err
+	}
+	return strconv.FormatInt(seq, 10), nil
+}
+
+// Update runs fn under the account's writer lease and commits every
+// staged mutation atomically. It returns the new per-type state strings
+// for the types fn touched. fn returning an error commits nothing.
+func (db *DB) Update(ctx context.Context, acct jmap.Id, fn func(u *Update) error) (map[string]string, error) {
+	l, err := db.leases.Acquire(ctx, acct)
+	if err != nil {
+		return nil, err
+	}
+	defer l.Release()
+
+	// AllocateSequence: read the counter once under the lease; the
+	// incremented value persists inside the same batch as the log entry
+	// it numbers, so a sequence number exists iff its commit succeeded
+	// (monotonic, never reused, survives restart).
+	var current int64
+	if raw, err := db.be.Get(ctx, seqKey(acct)); err == nil {
+		if current, err = backend.DecodeInt64(raw); err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(err, backend.ErrNotFound) {
+		return nil, err
+	}
+	sequence := current + 1
+
+	u := &Update{db: db, ctx: ctx, acct: acct, staged: make(map[string]*stagedRecord)}
+	if err := fn(u); err != nil {
+		return nil, err
+	}
+	if len(u.staged) == 0 {
+		return map[string]string{}, nil
+	}
+
+	batch, touched, err := u.buildBatch(sequence)
+	if err != nil {
+		return nil, err
+	}
+	batch.Set(seqKey(acct), backend.EncodeInt64(sequence))
+	l.Fence(batch)
+	if err := db.be.WriteBatch(ctx, batch); err != nil {
+		return nil, err
+	}
+	states := make(map[string]string, len(touched))
+	for _, t := range touched {
+		states[t] = strconv.FormatInt(sequence, 10)
+	}
+	if db.notifier != nil && len(states) > 0 {
+		db.notifier.Publish(ctx, acct, jmap.TypeState(states))
+	}
+	return states, nil
+}
+
+// Update stages mutations for one atomic commit. Mutations to several
+// types in one Update are the cross-type hook mechanism: a plugin that
+// must adjust counters on a second type does it in the same commit.
+type Update struct {
+	db   *DB
+	ctx  context.Context
+	acct jmap.Id
+	// staged is keyed by type/id; each entry knows the pre-image (for
+	// index maintenance) and the final disposition.
+	staged map[string]*stagedRecord
+}
+
+type stagedRecord struct {
+	typeName string
+	id       jmap.Id
+	old      Object // nil = record did not exist before this Update
+	new      Object // nil = destroyed
+	created  bool
+}
+
+func stagedKey(typeName string, id jmap.Id) string { return typeName + "\x00" + string(id) }
+
+// Get reads a record as this Update sees it: staged changes first, then
+// committed state. Safe because the lease excludes other writers.
+func (u *Update) Get(typeName string, id jmap.Id) (Object, error) {
+	if st, ok := u.staged[stagedKey(typeName, id)]; ok {
+		if st.new == nil {
+			return nil, ErrNotFound
+		}
+		return st.new, nil
+	}
+	return u.db.Get(u.ctx, u.acct, typeName, id)
+}
+
+// Create stages a new record and returns its server-assigned id
+// (RFC 8620 section 1.2: ids are server-assigned and immutable). obj
+// must not contain "id".
+func (u *Update) Create(typeName string, obj Object) (jmap.Id, error) {
+	t := u.db.types[typeName]
+	if t == nil {
+		return "", ErrUnknownType
+	}
+	if _, has := obj["id"]; has {
+		return "", fmt.Errorf("objectdb: create must not carry an id")
+	}
+	if err := checkKinds(t, obj); err != nil {
+		return "", err
+	}
+	id := jmap.NewId()
+	stored := make(Object, len(obj)+1)
+	for k, v := range obj {
+		stored[k] = v
+	}
+	idJSON, _ := json.Marshal(id)
+	stored["id"] = idJSON
+	u.staged[stagedKey(typeName, id)] = &stagedRecord{typeName: typeName, id: id, new: stored, created: true}
+	return id, nil
+}
+
+// Put stages a full replacement of an existing record. obj must carry
+// the same id.
+func (u *Update) Put(typeName string, id jmap.Id, obj Object) error {
+	t := u.db.types[typeName]
+	if t == nil {
+		return ErrUnknownType
+	}
+	var gotId jmap.Id
+	if raw, has := obj["id"]; !has || unmarshal(raw, &gotId) != nil || gotId != id {
+		return fmt.Errorf("objectdb: put object id mismatch")
+	}
+	if err := checkKinds(t, obj); err != nil {
+		return err
+	}
+	if st, ok := u.staged[stagedKey(typeName, id)]; ok {
+		if st.new == nil {
+			return ErrNotFound
+		}
+		st.new = obj
+		return nil
+	}
+	old, err := u.db.Get(u.ctx, u.acct, typeName, id)
+	if err != nil {
+		return err
+	}
+	u.staged[stagedKey(typeName, id)] = &stagedRecord{typeName: typeName, id: id, old: old, new: obj}
+	return nil
+}
+
+// Destroy stages permanent removal (RFC 8620 section 5.3 destroy).
+func (u *Update) Destroy(typeName string, id jmap.Id) error {
+	if u.db.types[typeName] == nil {
+		return ErrUnknownType
+	}
+	if st, ok := u.staged[stagedKey(typeName, id)]; ok {
+		if st.new == nil {
+			return ErrNotFound
+		}
+		st.new = nil
+		return nil
+	}
+	old, err := u.db.Get(u.ctx, u.acct, typeName, id)
+	if err != nil {
+		return err
+	}
+	u.staged[stagedKey(typeName, id)] = &stagedRecord{typeName: typeName, id: id, old: old}
+	return nil
+}
+
+// checkKinds validates declared properties and kinds (mechanical part
+// of section 5.3 invalidProperties; attribute enforcement lives in the
+// runtime's /set).
+func checkKinds(t *descriptor.Type, obj Object) error {
+	for name, raw := range obj {
+		if name == "id" {
+			continue
+		}
+		p, declared := t.Properties[name]
+		if !declared {
+			return fmt.Errorf("objectdb: unknown property %q on %s", name, t.Name)
+		}
+		if err := p.CheckValue(raw); err != nil {
+			return fmt.Errorf("objectdb: property %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// logEntry is a change log record: per type, the ids created, updated,
+// and destroyed by one commit. The log is the canonical synchronization
+// stream that /changes and state strings are derived from.
+type logEntry struct {
+	Types map[string]*logTypeEntry `json:"types"`
+}
+
+type logTypeEntry struct {
+	Created   []jmap.Id `json:"created,omitzero"`
+	Updated   []jmap.Id `json:"updated,omitzero"`
+	Destroyed []jmap.Id `json:"destroyed,omitzero"`
+}
+
+func (u *Update) buildBatch(sequence int64) (*backend.Batch, []string, error) {
+	batch := &backend.Batch{}
+	entry := logEntry{Types: make(map[string]*logTypeEntry)}
+
+	// Deterministic op order for reproducibility.
+	keys := make([]string, 0, len(u.staged))
+	for k := range u.staged {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		st := u.staged[k]
+		t := u.db.types[st.typeName]
+		if st.created && st.new == nil {
+			continue // created and destroyed in one Update: no trace (5.2)
+		}
+		te := entry.Types[st.typeName]
+		if te == nil {
+			te = &logTypeEntry{}
+			entry.Types[st.typeName] = te
+		}
+		switch {
+		case st.new == nil: // destroy
+			batch.Delete(objKey(u.acct, st.typeName, st.id))
+			if err := indexOps(batch, u.acct, t, st.id, st.old, nil); err != nil {
+				return nil, nil, err
+			}
+			refOps(batch, u.acct, t, st.id, st.old, nil)
+			te.Destroyed = append(te.Destroyed, st.id)
+		case st.created:
+			raw, err := json.Marshal(st.new)
+			if err != nil {
+				return nil, nil, err
+			}
+			batch.Set(objKey(u.acct, st.typeName, st.id), raw)
+			if err := indexOps(batch, u.acct, t, st.id, nil, st.new); err != nil {
+				return nil, nil, err
+			}
+			refOps(batch, u.acct, t, st.id, nil, st.new)
+			te.Created = append(te.Created, st.id)
+		default: // update
+			raw, err := json.Marshal(st.new)
+			if err != nil {
+				return nil, nil, err
+			}
+			batch.Set(objKey(u.acct, st.typeName, st.id), raw)
+			if err := indexOps(batch, u.acct, t, st.id, st.old, st.new); err != nil {
+				return nil, nil, err
+			}
+			refOps(batch, u.acct, t, st.id, st.old, st.new)
+			te.Updated = append(te.Updated, st.id)
+		}
+	}
+
+	touched := make([]string, 0, len(entry.Types))
+	for typeName, te := range entry.Types {
+		if len(te.Created)+len(te.Updated)+len(te.Destroyed) == 0 {
+			delete(entry.Types, typeName)
+			continue
+		}
+		touched = append(touched, typeName)
+		batch.Set(typeStateKey(u.acct, typeName), backend.EncodeInt64(sequence))
+	}
+	if len(touched) == 0 {
+		// Everything cancelled out; commit nothing but the fence is
+		// still applied by the caller. Write no log entry.
+		return batch, touched, nil
+	}
+	raw, err := json.Marshal(entry)
+	if err != nil {
+		return nil, nil, err
+	}
+	batch.Set(logKey(u.acct, sequence), raw)
+	return batch, touched, nil
+}
+
+// indexOps maintains the order-preserving property indexes: delete
+// stale keys, set current ones. Runs inside the same commit as the
+// object write, so indexes can never disagree with records.
+func indexOps(batch *backend.Batch, acct jmap.Id, t *descriptor.Type, id jmap.Id, old, new Object) error {
+	for name, p := range t.Properties {
+		if !p.Indexed {
+			continue
+		}
+		var oldVal, newVal []byte
+		if old != nil {
+			if raw, has := old[name]; has {
+				v, err := indexValue(p, raw)
+				if err != nil {
+					return err
+				}
+				oldVal = v
+			}
+		}
+		if new != nil {
+			if raw, has := new[name]; has {
+				v, err := indexValue(p, raw)
+				if err != nil {
+					return err
+				}
+				newVal = v
+			}
+		}
+		switch {
+		case oldVal == nil && newVal == nil:
+		case oldVal == nil:
+			batch.Set(idxKey(acct, t.Name, name, newVal, id), nil)
+		case newVal == nil:
+			batch.Delete(idxKey(acct, t.Name, name, oldVal, id))
+		case string(oldVal) != string(newVal):
+			batch.Delete(idxKey(acct, t.Name, name, oldVal, id))
+			batch.Set(idxKey(acct, t.Name, name, newVal, id), nil)
+		}
+	}
+	return nil
+}
+
+// IdsWhereEqual returns the ids of records whose indexed property
+// equals value, straight from the property index (the /query planner's
+// fast path). The property must be declared Indexed. Equality follows
+// the index encoding, so string comparison is under i;ascii-casemap
+// (RFC 8620 section 5.5).
+func (db *DB) IdsWhereEqual(ctx context.Context, acct jmap.Id, typeName, prop string, value json.RawMessage) ([]jmap.Id, error) {
+	t := db.types[typeName]
+	if t == nil {
+		return nil, ErrUnknownType
+	}
+	p, declared := t.Properties[prop]
+	if !declared || !p.Indexed {
+		return nil, fmt.Errorf("objectdb: property %s.%s is not indexed", typeName, prop)
+	}
+	v, err := indexValue(p, value)
+	if err != nil {
+		return nil, err
+	}
+	start, end := prefixRange(seg(string(acct)), seg("x"), seg(typeName), seg(prop), v)
+	var ids []jmap.Id
+	err = db.be.Scan(ctx, start, end, false, func(k, _ []byte) bool {
+		ids = append(ids, idFromObjKey(k))
+		return true
+	})
+	return ids, err
+}
+
+// SortKey encodes a property value into the order-preserving form the
+// indexes use: bytes.Compare on two SortKeys matches the RFC 8620
+// section 5.5 comparison rules for the property's kind (booleans
+// false<true, numbers numerically, dates chronologically, strings under
+// i;ascii-casemap). /query uses it so in-memory filtering and sorting
+// agree exactly with index-based evaluation.
+func SortKey(p descriptor.Property, raw json.RawMessage) ([]byte, error) {
+	return indexValue(p, raw)
+}
