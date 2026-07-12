@@ -20,6 +20,13 @@ type ChangeSet struct {
 	Created   []jmap.Id
 	Updated   []jmap.Id
 	Destroyed []jmap.Id
+	// UpdatedProps is the union of property names that may have changed
+	// across the records reported in Updated (per-page when paging).
+	// nil means unknown - a consumed entry predates property tracking,
+	// or an id landed in Updated via destroy-then-create coalescing, so
+	// its whole property set may differ. Non-nil and empty means no
+	// property-level updates happened.
+	UpdatedProps []string
 }
 
 // Changes computes the ids created, updated, and destroyed for a type
@@ -56,6 +63,8 @@ func (db *DB) Changes(ctx context.Context, acct jmap.Id, typeName, sinceState st
 		dispDestroyed
 	)
 	disp := make(map[jmap.Id]int)
+	propsKnown := true
+	updatedProps := []string{}
 	apply := func(id jmap.Id, next int) {
 		prev, seen := disp[id]
 		if !seen {
@@ -71,6 +80,9 @@ func (db *DB) Changes(ctx context.Context, acct jmap.Id, typeName, sinceState st
 			disp[id] = dispDestroyed
 		case prev == dispDestroyed && next == dispCreated:
 			disp[id] = dispUpdated // net effect: it changed
+			// The record reappears with a possibly-unrelated property
+			// set, which per-update property tracking cannot describe.
+			propsKnown = false
 		default:
 			disp[id] = next
 		}
@@ -121,6 +133,13 @@ func (db *DB) Changes(ctx context.Context, acct jmap.Id, typeName, sinceState st
 		for _, id := range te.Destroyed {
 			apply(id, dispDestroyed)
 		}
+		if len(te.Updated) > 0 {
+			if te.UpdatedProps == nil {
+				propsKnown = false // entry predates property tracking
+			} else {
+				updatedProps = mergeProps(updatedProps, te.UpdatedProps)
+			}
+		}
 		lastConsumed = seqOfEntry
 		return true
 	})
@@ -140,6 +159,9 @@ func (db *DB) Changes(ctx context.Context, acct jmap.Id, typeName, sinceState st
 		case dispDestroyed:
 			out.Destroyed = append(out.Destroyed, id)
 		}
+	}
+	if propsKnown {
+		out.UpdatedProps = updatedProps
 	}
 	for _, ids := range [][]jmap.Id{out.Created, out.Updated, out.Destroyed} {
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })

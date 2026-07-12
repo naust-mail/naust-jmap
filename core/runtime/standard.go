@@ -23,10 +23,23 @@ import (
 // capability must additionally be advertised in the session via
 // Server.RegisterCapability.
 func RegisterStandardType(p *Processor, db *objectdb.DB, t *descriptor.Type, core jmap.CoreCapabilities) error {
+	return RegisterStandardTypeExt(p, db, t, core, nil)
+}
+
+// RegisterStandardTypeExt is RegisterStandardType with per-type
+// extension hooks (see Extensions) for datatypes whose RFC extends the
+// standard methods, as RFC 8621 does. A nil ext derives the plain
+// RFC 8620 methods.
+func RegisterStandardTypeExt(p *Processor, db *objectdb.DB, t *descriptor.Type, core jmap.CoreCapabilities, ext *Extensions) error {
+	if ext != nil {
+		if err := ext.validate(t); err != nil {
+			return err
+		}
+	}
 	if err := db.RegisterType(t); err != nil {
 		return err
 	}
-	st := &stdType{db: db, t: t, core: core}
+	st := &stdType{db: db, t: t, core: core, ext: ext}
 	p.Register(t.Name+"/get", t.Capability, st.get)
 	p.Register(t.Name+"/changes", t.Capability, st.changes)
 	p.Register(t.Name+"/set", t.Capability, st.set)
@@ -40,6 +53,7 @@ type stdType struct {
 	db   *objectdb.DB
 	t    *descriptor.Type
 	core jmap.CoreCapabilities
+	ext  *Extensions // nil = no extensions
 }
 
 // decodeArgs strictly decodes method arguments; unknown or mistyped
@@ -99,23 +113,40 @@ type getResponse struct {
 func (st *stdType) get(ctx context.Context, call *Call) []jmap.Invocation {
 	respName := st.t.Name + "/get"
 	var a getArgs
-	if err := decodeArgs(call.Args, &a); err != nil {
+	extra, err := st.decodeWithExtras("get", call.Args, &a)
+	if err != nil {
 		return fail(call.CallID, jmap.ErrInvalidArguments, err.Error())
 	}
 	if errType, desc := checkAccount(call, a.AccountId, false); errType != "" {
 		return fail(call.CallID, errType, desc)
 	}
 
-	// properties: null means all; the id property is always returned; an
-	// invalid property MUST reject the call with invalidArguments (5.1).
+	// properties: omitted or null means all, unless the type overrides
+	// that default with a fixed list (RFC 8621 section 4.2 does for
+	// Email); the id property is always returned; an invalid property
+	// MUST reject the call with invalidArguments (5.1). Names that are
+	// not stored properties may be computed ones (Extensions.Computed).
+	reqProps := a.Properties
+	if reqProps == nil && st.ext != nil && st.ext.DefaultGetProperties != nil {
+		reqProps = &st.ext.DefaultGetProperties
+	}
 	var props map[string]bool
-	if a.Properties != nil {
+	var computed []string
+	if reqProps != nil {
 		props = map[string]bool{"id": true}
-		for _, name := range *a.Properties {
-			if _, declared := st.t.Properties[name]; !declared && name != "id" {
-				return fail(call.CallID, jmap.ErrInvalidArguments, fmt.Sprintf("unknown property %q", name))
+		for _, name := range *reqProps {
+			if _, declared := st.t.Properties[name]; declared || name == "id" {
+				props[name] = true
+				continue
 			}
-			props[name] = true
+			if st.ext != nil && st.ext.Computed != nil && st.ext.Computed.Accepts(name) {
+				if !props[name] {
+					computed = append(computed, name)
+				}
+				props[name] = true
+				continue
+			}
+			return fail(call.CallID, jmap.ErrInvalidArguments, fmt.Sprintf("unknown property %q", name))
 		}
 	}
 
@@ -160,10 +191,22 @@ func (st *stdType) get(ctx context.Context, call *Call) []jmap.Invocation {
 		if err != nil {
 			return fail(call.CallID, jmap.ErrServerFail, err.Error())
 		}
+		var resolved map[string]json.RawMessage
+		if len(computed) > 0 {
+			resolved, err = st.ext.Computed.Resolve(ctx, a.AccountId, obj, computed, extra)
+			if err != nil {
+				return fail(call.CallID, jmap.ErrServerFail, err.Error())
+			}
+		}
 		if props != nil {
 			filtered := make(objectdb.Object, len(props))
 			for name := range props {
 				if v, has := obj[name]; has {
+					filtered[name] = v
+				}
+			}
+			for _, name := range computed {
+				if v, has := resolved[name]; has {
 					filtered[name] = v
 				}
 			}
@@ -199,7 +242,8 @@ type changesResponse struct {
 
 func (st *stdType) changes(ctx context.Context, call *Call) []jmap.Invocation {
 	var a changesArgs
-	if err := decodeArgs(call.Args, &a); err != nil {
+	extra, err := st.decodeWithExtras("changes", call.Args, &a)
+	if err != nil {
 		return fail(call.CallID, jmap.ErrInvalidArguments, err.Error())
 	}
 	if errType, desc := checkAccount(call, a.AccountId, false); errType != "" {
@@ -231,6 +275,22 @@ func (st *stdType) changes(ctx context.Context, call *Call) []jmap.Invocation {
 		Created:        emptyIfNil(cs.Created),
 		Updated:        emptyIfNil(cs.Updated),
 		Destroyed:      emptyIfNil(cs.Destroyed),
+	}
+	if st.ext != nil && st.ext.ExtraResponse != nil && st.ext.ExtraResponse.Changes != nil {
+		view := &ChangesView{
+			OldState:       resp.OldState,
+			NewState:       resp.NewState,
+			HasMoreChanges: resp.HasMoreChanges,
+			Created:        resp.Created,
+			Updated:        resp.Updated,
+			Destroyed:      resp.Destroyed,
+			UpdatedProps:   cs.UpdatedProps,
+		}
+		fields, err := st.ext.ExtraResponse.Changes(ctx, a.AccountId, view, extra)
+		if err != nil {
+			return fail(call.CallID, jmap.ErrServerFail, err.Error())
+		}
+		return replyExtra(st.t.Name+"/changes", call.CallID, resp, fields)
 	}
 	return reply(st.t.Name+"/changes", call.CallID, resp)
 }
@@ -268,7 +328,8 @@ var errStateMismatch = errors.New("runtime: ifInState does not match")
 
 func (st *stdType) set(ctx context.Context, call *Call) []jmap.Invocation {
 	var a setArgs
-	if err := decodeArgs(call.Args, &a); err != nil {
+	extra, err := st.decodeWithExtras("set", call.Args, &a)
+	if err != nil {
 		return fail(call.CallID, jmap.ErrInvalidArguments, err.Error())
 	}
 	if errType, desc := checkAccount(call, a.AccountId, true); errType != "" {
@@ -292,13 +353,13 @@ func (st *stdType) set(ctx context.Context, call *Call) []jmap.Invocation {
 		if a.IfInState != nil && *a.IfInState != state {
 			return errStateMismatch
 		}
-		if err := st.processCreates(u, call, a.Create, &resp); err != nil {
+		if err := st.processCreates(u, call, a.Create, extra, &resp); err != nil {
 			return err
 		}
-		if err := st.processUpdates(u, call, a.Update, &resp); err != nil {
+		if err := st.processUpdates(u, call, a.Update, extra, &resp); err != nil {
 			return err
 		}
-		return st.processDestroys(u, a.Destroy, call.CreatedIds, &resp)
+		return st.processDestroys(u, a.Destroy, call.CreatedIds, extra, &resp)
 	})
 	if errors.Is(err, errStateMismatch) {
 		return fail(call.CallID, jmap.ErrStateMismatch, "")
@@ -318,7 +379,7 @@ func (st *stdType) set(ctx context.Context, call *Call) []jmap.Invocation {
 // id ("#cid" in an Id-kind property) runs after that record is created,
 // whatever the map order (5.3: creates MUST happen before their creation
 // ids are referenced within a single call).
-func (st *stdType) processCreates(u *objectdb.Update, call *Call, creates map[jmap.Id]json.RawMessage, resp *setResponse) error {
+func (st *stdType) processCreates(u *objectdb.Update, call *Call, creates map[jmap.Id]json.RawMessage, extra map[string]json.RawMessage, resp *setResponse) error {
 	if len(creates) == 0 {
 		return nil
 	}
@@ -391,6 +452,16 @@ func (st *stdType) processCreates(u *objectdb.Update, call *Call, creates map[jm
 				resp.notCreated(cid, invalidProperties(bad))
 				continue
 			}
+			if st.ext != nil && st.ext.Set != nil && st.ext.Set.Validate != nil {
+				serr, err := st.ext.Set.Validate(u, nil, pc.obj, extra)
+				if err != nil {
+					return err
+				}
+				if serr != nil {
+					resp.notCreated(cid, serr)
+					continue
+				}
+			}
 			id, err := u.Create(st.t.Name, pc.obj)
 			if err != nil {
 				return err
@@ -427,7 +498,7 @@ func (st *stdType) processCreates(u *objectdb.Update, call *Call, creates map[jm
 	return nil
 }
 
-func (st *stdType) processUpdates(u *objectdb.Update, call *Call, updates map[jmap.Id]json.RawMessage, resp *setResponse) error {
+func (st *stdType) processUpdates(u *objectdb.Update, call *Call, updates map[jmap.Id]json.RawMessage, extra map[string]json.RawMessage, resp *setResponse) error {
 	for _, uid := range sortedIds(mapKeys(updates)) {
 		realId, ok := resolveIdArg(uid, call.CreatedIds)
 		if !ok {
@@ -460,6 +531,16 @@ func (st *stdType) processUpdates(u *objectdb.Update, call *Call, updates map[jm
 			resp.notUpdated(uid, invalidProperties(bad))
 			continue
 		}
+		if st.ext != nil && st.ext.Set != nil && st.ext.Set.Validate != nil {
+			serr, err := st.ext.Set.Validate(u, current, newObj, extra)
+			if err != nil {
+				return err
+			}
+			if serr != nil {
+				resp.notUpdated(uid, serr)
+				continue
+			}
+		}
 		if err := u.Put(st.t.Name, realId, newObj); err != nil {
 			return err
 		}
@@ -473,12 +554,28 @@ func (st *stdType) processUpdates(u *objectdb.Update, call *Call, updates map[jm
 	return nil
 }
 
-func (st *stdType) processDestroys(u *objectdb.Update, destroy []jmap.Id, createdIds map[jmap.Id]jmap.Id, resp *setResponse) error {
+func (st *stdType) processDestroys(u *objectdb.Update, destroy []jmap.Id, createdIds map[jmap.Id]jmap.Id, extra map[string]json.RawMessage, resp *setResponse) error {
 	for _, did := range destroy {
 		realId, ok := resolveIdArg(did, createdIds)
 		if !ok {
 			resp.notDestroyed(did, &jmap.SetError{Type: jmap.SetErrNotFound})
 			continue
+		}
+		if st.ext != nil && st.ext.Set != nil && st.ext.Set.Destroy != nil {
+			// The hook sees only records that exist; a missing one gets
+			// the plain notFound below.
+			if _, err := u.Get(st.t.Name, realId); err == nil {
+				serr, err := st.ext.Set.Destroy(u, realId, extra)
+				if err != nil {
+					return err
+				}
+				if serr != nil {
+					resp.notDestroyed(did, serr)
+					continue
+				}
+			} else if !errors.Is(err, objectdb.ErrNotFound) {
+				return err
+			}
 		}
 		err := u.Destroy(st.t.Name, realId)
 		if errors.Is(err, objectdb.ErrNotFound) {

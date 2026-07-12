@@ -6,11 +6,17 @@
 package descriptor
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
 )
+
+// isNull reports whether raw is the literal JSON null.
+func isNull(raw json.RawMessage) bool {
+	return string(bytes.TrimSpace(raw)) == "null"
+}
 
 // Kind is a property's JSON value type.
 type Kind uint8
@@ -51,6 +57,11 @@ type Property struct {
 	// reference index in-commit, which is what keeps referenced blobs
 	// safe from garbage collection.
 	BlobRef bool
+	// Nullable admits the literal JSON null as a stored value, for the
+	// spec's "Kind|null" properties (Mailbox's parentId is "Id|null").
+	// A stored null is distinct from an absent property: it appears as
+	// null in /get responses and sorts before every non-null value.
+	Nullable bool
 	// Default, if non-nil, is the value used when a create omits the
 	// property and the value restored when a patch sets it to null
 	// (section 5.3). Properties without a default are removed by null.
@@ -99,6 +110,15 @@ func (t *Type) Validate() error {
 // kind. Mechanical validation only; invalid values map to the
 // invalidProperties SetError (section 5.3).
 func (p Property) CheckValue(raw json.RawMessage) error {
+	if isNull(raw) {
+		// Guarded explicitly: json.Unmarshal treats null as a no-op
+		// success for every Go type, which would let null through each
+		// kind check below.
+		if p.Nullable {
+			return nil
+		}
+		return fmt.Errorf("null is not allowed")
+	}
 	switch p.Kind {
 	case KindString:
 		var s string

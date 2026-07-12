@@ -143,6 +143,37 @@ from its descriptor, not written per type.
 
 </details>
 
+<details>
+<summary>Design decisions worth knowing about</summary>
+
+Where the RFCs leave a behavior to the server, the choice is recorded here so
+embedders know what to expect. Both entries below concern the mail module
+(RFC 8621), which is in development; see the Roadmap.
+
+**Threads never merge.** Emails are grouped into Threads by their
+References/In-Reply-To chain plus a normalized subject. If two existing
+Threads later turn out to be one conversation (the message linking them
+arrives late), they stay separate: the late message joins the first Thread
+it matches. RFC 8621 section 3 leaves the algorithm server-defined, and this
+matches Gmail's behavior. Merging would require destroying and re-creating
+Email objects, because a Thread id is immutable once assigned. Splits are
+rare in practice: replies carry their full ancestor chain in References, so
+one missing message almost never breaks the link. The message-id index is
+stored permanently, so opt-in merging can be added later as a configuration
+option (default off) without a data-model change.
+
+**Unread Thread counts use the trash-aware rules.** RFC 8621 section 2 does
+not mandate how a Mailbox's unreadThreads count is calculated and sketches
+both a simple and a quality method. This runtime implements the quality
+method: Emails that are only in the trash do not make a conversation look
+unread in other Mailboxes, and vice versa. There is deliberately no flag to
+select the simple method: counts are stored and maintained incrementally, so
+switching semantics would require a full recount, and one correct behavior
+beats two switchable ones. Accounts with no trash-role Mailbox naturally get
+the simple behavior.
+
+</details>
+
 ## Roadmap
 
 naust-jmap is pre-release: no tagged versions yet. Coming next, in order:

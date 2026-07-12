@@ -1,6 +1,7 @@
 package objectdb
 
 import (
+	"bytes"
 	"strings"
 	"time"
 
@@ -71,8 +72,23 @@ func refKey(acct, blobID jmap.Id, typeName string, id jmap.Id) []byte {
 // indexValue encodes a property value so that bytes.Compare on index
 // keys matches the type's comparison rules (RFC 8620 section 5.5:
 // booleans false<true, numbers numerically, dates chronologically;
-// strings under the i;ascii-casemap collation).
+// strings under the i;ascii-casemap collation). Values of a Nullable
+// property carry a tag byte so the literal null has an encoding of its
+// own, sorting before every non-null value; non-nullable properties
+// keep the bare encoding.
 func indexValue(p descriptor.Property, raw []byte) ([]byte, error) {
+	if p.Nullable {
+		if string(bytes.TrimSpace(raw)) == "null" {
+			return []byte{0}, nil
+		}
+		bare := p
+		bare.Nullable = false
+		v, err := indexValue(bare, raw)
+		if err != nil {
+			return nil, err
+		}
+		return append([]byte{1}, v...), nil
+	}
 	switch p.Kind {
 	case descriptor.KindString:
 		var s string

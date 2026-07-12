@@ -52,13 +52,14 @@ type queryResponse struct {
 
 func (st *stdType) query(ctx context.Context, call *Call) []jmap.Invocation {
 	var a queryArgs
-	if err := decodeArgs(call.Args, &a); err != nil {
+	extra, err := st.decodeWithExtras("query", call.Args, &a)
+	if err != nil {
 		return fail(call.CallID, jmap.ErrInvalidArguments, err.Error())
 	}
 	if errType, desc := checkAccount(call, a.AccountId, false); errType != "" {
 		return fail(call.CallID, errType, desc)
 	}
-	root, errType, desc := parseFilter(st.t, a.Filter)
+	root, errType, desc := parseFilter(st.t, st.filterSemantics(), a.Filter)
 	if errType != "" {
 		return fail(call.CallID, errType, desc)
 	}
@@ -82,9 +83,10 @@ func (st *stdType) query(ctx context.Context, call *Call) []jmap.Invocation {
 
 	// Candidate set: an equality condition on an indexed property is
 	// answered by the index; anything else starts from all records.
+	// Custom filter semantics redefine what a condition means, so the
+	// equality fast path only applies to the core language.
 	var candidates []jmap.Id
-	var err error
-	if prop, value, ok := indexedEquality(st.t, root); ok {
+	if prop, value, ok := indexedEquality(st.t, root); ok && st.filterSemantics() == nil {
 		candidates, err = st.db.IdsWhereEqual(ctx, a.AccountId, st.t.Name, prop, value)
 	} else {
 		candidates, err = st.db.AllIds(ctx, a.AccountId, st.t.Name, 0)
@@ -93,11 +95,7 @@ func (st *stdType) query(ctx context.Context, call *Call) []jmap.Invocation {
 		return fail(call.CallID, jmap.ErrServerFail, err.Error())
 	}
 
-	type rec struct {
-		id  jmap.Id
-		obj objectdb.Object
-	}
-	matched := make([]rec, 0, len(candidates))
+	matched := make([]QueryRecord, 0, len(candidates))
 	for _, id := range candidates {
 		obj, err := st.db.Get(ctx, a.AccountId, st.t.Name, id)
 		if errors.Is(err, objectdb.ErrNotFound) {
@@ -106,23 +104,34 @@ func (st *stdType) query(ctx context.Context, call *Call) []jmap.Invocation {
 		if err != nil {
 			return fail(call.CallID, jmap.ErrServerFail, err.Error())
 		}
-		if root.matches(st.t, obj) {
-			matched = append(matched, rec{id: id, obj: obj})
+		if root.matches(st.t, st.filterSemantics(), obj) {
+			matched = append(matched, QueryRecord{Id: id, Obj: obj})
 		}
 	}
 	// Ties (including the empty sort) fall back to id order, keeping the
-	// full order stable between calls as 5.5 requires.
-	sort.Slice(matched, func(i, j int) bool {
+	// full order stable between calls as 5.5 requires. compare is that
+	// total order; Arrange receives it so sibling ordering under tree
+	// sort agrees exactly with the flat sort.
+	compare := func(a, b objectdb.Object) int {
 		for _, c := range cmps {
-			if r := c.compare(matched[i].obj, matched[j].obj); r != 0 {
-				return r < 0
+			if r := c.compare(a, b); r != 0 {
+				return r
 			}
 		}
-		return matched[i].id < matched[j].id
+		return strings.Compare(string(a["id"]), string(b["id"]))
+	}
+	sort.Slice(matched, func(i, j int) bool {
+		return compare(matched[i].Obj, matched[j].Obj) < 0
 	})
 	results := make([]jmap.Id, len(matched))
 	for i, m := range matched {
-		results[i] = m.id
+		results[i] = m.Id
+	}
+	if st.ext != nil && st.ext.Query != nil && st.ext.Query.Arrange != nil {
+		results, err = st.ext.Query.Arrange(ctx, a.AccountId, matched, compare, extra)
+		if err != nil {
+			return fail(call.CallID, jmap.ErrServerFail, err.Error())
+		}
 	}
 	total := int64(len(results))
 
@@ -208,7 +217,7 @@ func (st *stdType) queryChanges(ctx context.Context, call *Call) []jmap.Invocati
 	if a.MaxChanges != nil && (*a.MaxChanges < 0 || !jmap.ValidUnsignedInt(*a.MaxChanges)) {
 		return fail(call.CallID, jmap.ErrInvalidArguments, "maxChanges must be an UnsignedInt")
 	}
-	if _, errType, desc := parseFilter(st.t, a.Filter); errType != "" {
+	if _, errType, desc := parseFilter(st.t, st.filterSemantics(), a.Filter); errType != "" {
 		return fail(call.CallID, errType, desc)
 	}
 	if _, errType, desc := parseComparators(st.t, a.Sort); errType != "" {
@@ -238,11 +247,21 @@ type filterNode struct {
 	cond     map[string]json.RawMessage
 }
 
+// filterSemantics returns the type's custom FilterCondition semantics,
+// or nil for the core equality language.
+func (st *stdType) filterSemantics() FilterSemantics {
+	if st.ext == nil || st.ext.Query == nil {
+		return nil
+	}
+	return st.ext.Query.Filter
+}
+
 // parseFilter validates the filter argument. Structural violations
 // (bad operator, missing conditions) are invalidArguments; a
 // syntactically valid condition naming an undeclared property is
-// unsupportedFilter (5.5).
-func parseFilter(t *descriptor.Type, raw json.RawMessage) (*filterNode, string, string) {
+// unsupportedFilter (5.5). With FilterSemantics, condition leaves are
+// validated by the type instead of the core equality rules.
+func parseFilter(t *descriptor.Type, sem FilterSemantics, raw json.RawMessage) (*filterNode, string, string) {
 	if raw == nil || isNull(raw) {
 		return nil, "", ""
 	}
@@ -265,7 +284,7 @@ func parseFilter(t *descriptor.Type, raw json.RawMessage) (*filterNode, string, 
 		}
 		node := &filterNode{op: op, children: make([]*filterNode, 0, len(conds))}
 		for _, c := range conds {
-			child, errType, desc := parseFilter(t, c)
+			child, errType, desc := parseFilter(t, sem, c)
 			if errType != "" {
 				return nil, errType, desc
 			}
@@ -273,8 +292,19 @@ func parseFilter(t *descriptor.Type, raw json.RawMessage) (*filterNode, string, 
 		}
 		return node, "", ""
 	}
-	// FilterCondition: declared properties matched for equality.
+	// FilterCondition: type semantics when declared, else declared
+	// properties matched for equality.
 	for name, v := range m {
+		if sem != nil {
+			if err := sem.ValidateCondition(name, v); err != nil {
+				var unsup UnsupportedFilterError
+				if errors.As(err, &unsup) {
+					return nil, jmap.ErrUnsupportedFilter, unsup.Description
+				}
+				return nil, jmap.ErrInvalidArguments, fmt.Sprintf("filter condition %q: %v", name, err)
+			}
+			continue
+		}
 		p, declared := t.Properties[name]
 		if !declared {
 			return nil, jmap.ErrUnsupportedFilter, fmt.Sprintf("cannot filter on %q", name)
@@ -286,34 +316,40 @@ func parseFilter(t *descriptor.Type, raw json.RawMessage) (*filterNode, string, 
 	return &filterNode{cond: m}, "", ""
 }
 
-func (n *filterNode) matches(t *descriptor.Type, obj objectdb.Object) bool {
+func (n *filterNode) matches(t *descriptor.Type, sem FilterSemantics, obj objectdb.Object) bool {
 	if n == nil {
 		return true
 	}
 	switch n.op {
 	case "AND":
 		for _, c := range n.children {
-			if !c.matches(t, obj) {
+			if !c.matches(t, sem, obj) {
 				return false
 			}
 		}
 		return true
 	case "OR":
 		for _, c := range n.children {
-			if c.matches(t, obj) {
+			if c.matches(t, sem, obj) {
 				return true
 			}
 		}
 		return false
 	case "NOT":
 		for _, c := range n.children {
-			if c.matches(t, obj) {
+			if c.matches(t, sem, obj) {
 				return false
 			}
 		}
 		return true
 	}
 	for name, want := range n.cond {
+		if sem != nil {
+			if !sem.MatchCondition(obj, name, want) {
+				return false
+			}
+			continue
+		}
 		got, has := obj[name]
 		if !has {
 			return false

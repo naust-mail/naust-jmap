@@ -323,6 +323,60 @@ func (u *Update) Destroy(typeName string, id jmap.Id) error {
 	return nil
 }
 
+// IdsWhereEqual is DB.IdsWhereEqual as this Update sees it: the
+// committed index matches overlaid with the staged creates, updates,
+// and destroys. Cross-record invariants a plugin enforces during /set
+// (sibling-name uniqueness, single role per account) must see records
+// staged earlier in the same commit, which the committed index cannot.
+func (u *Update) IdsWhereEqual(typeName, prop string, value json.RawMessage) ([]jmap.Id, error) {
+	t := u.db.types[typeName]
+	if t == nil {
+		return nil, ErrUnknownType
+	}
+	p, declared := t.Properties[prop]
+	if !declared || !p.Indexed {
+		return nil, fmt.Errorf("objectdb: property %s.%s is not indexed", typeName, prop)
+	}
+	want, err := indexValue(p, value)
+	if err != nil {
+		return nil, err
+	}
+	committed, err := u.db.IdsWhereEqual(u.ctx, u.acct, typeName, prop, value)
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[jmap.Id]bool, len(committed))
+	for _, id := range committed {
+		set[id] = true
+	}
+	for _, st := range u.staged {
+		if st.typeName != typeName {
+			continue
+		}
+		delete(set, st.id)
+		if st.new == nil {
+			continue
+		}
+		raw, has := st.new[prop]
+		if !has {
+			continue
+		}
+		got, err := indexValue(p, raw)
+		if err != nil {
+			return nil, err
+		}
+		if string(got) == string(want) {
+			set[st.id] = true
+		}
+	}
+	ids := make([]jmap.Id, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids, nil
+}
+
 // checkKinds validates declared properties and kinds (mechanical part
 // of section 5.3 invalidProperties; attribute enforcement lives in the
 // runtime's /set).
@@ -353,6 +407,13 @@ type logTypeEntry struct {
 	Created   []jmap.Id `json:"created,omitzero"`
 	Updated   []jmap.Id `json:"updated,omitzero"`
 	Destroyed []jmap.Id `json:"destroyed,omitzero"`
+	// UpdatedProps is the union of property names that may have changed
+	// across this entry's updates (a mechanical old-vs-new diff, so a
+	// rewrite of an identical value may appear). It is what lets
+	// Mailbox/changes answer updatedProperties (RFC 8621 section 2.2).
+	// nil with a non-empty Updated means the entry predates the field
+	// and the changed set is unknown.
+	UpdatedProps []string `json:"updatedProps"`
 }
 
 func (u *Update) buildBatch(sequence int64) (*backend.Batch, []string, error) {
@@ -407,6 +468,10 @@ func (u *Update) buildBatch(sequence int64) (*backend.Batch, []string, error) {
 			}
 			refOps(batch, u.acct, t, st.id, st.old, st.new)
 			te.Updated = append(te.Updated, st.id)
+			if te.UpdatedProps == nil {
+				te.UpdatedProps = []string{}
+			}
+			te.UpdatedProps = mergeProps(te.UpdatedProps, diffProps(st.old, st.new))
 		}
 	}
 
@@ -430,6 +495,41 @@ func (u *Update) buildBatch(sequence int64) (*backend.Batch, []string, error) {
 	}
 	batch.Set(logKey(u.acct, sequence), raw)
 	return batch, touched, nil
+}
+
+// diffProps returns the property names whose raw values differ between
+// two versions of a record: a byte-level comparison, so it may report a
+// property rewritten with an identical value ("may have changed" is the
+// contract UpdatedProps carries).
+func diffProps(old, new Object) []string {
+	var names []string
+	for name, raw := range new {
+		if o, has := old[name]; !has || string(o) != string(raw) {
+			names = append(names, name)
+		}
+	}
+	for name := range old {
+		if _, has := new[name]; !has {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// mergeProps unions two name lists, sorted, without duplicates.
+func mergeProps(a, b []string) []string {
+	seen := make(map[string]bool, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, list := range [][]string{a, b} {
+		for _, name := range list {
+			if !seen[name] {
+				seen[name] = true
+				out = append(out, name)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // indexOps maintains the order-preserving property indexes: delete
