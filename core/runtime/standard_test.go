@@ -13,6 +13,7 @@ import (
 	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/providers/backend/memory"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
+	"github.com/naust-mail/naust-jmap/core/tuning"
 )
 
 // TestNote is the boring M0 datatype: one property of each interesting
@@ -28,6 +29,8 @@ func testNoteType() *descriptor.Type {
 			"revision": {Kind: descriptor.KindUnsignedInt, ServerSet: true, Default: json.RawMessage(`1`)},
 			"parentId": {Kind: descriptor.KindId},
 			"flagged":  {Kind: descriptor.KindBool, Indexed: true, Default: json.RawMessage(`false`)},
+			"labels":   {Kind: descriptor.KindObject},
+			"tags":     {Kind: descriptor.KindArray},
 		},
 	}
 }
@@ -397,6 +400,86 @@ func TestSetUpdateSemantics(t *testing.T) {
 	})
 }
 
+// TestCompositeKindsAndMemberPatch covers KindObject/KindArray storage
+// and RFC 8620 section 5.3 PatchObject member evaluation ({name}/{key}).
+func TestCompositeKindsAndMemberPatch(t *testing.T) {
+	ts := noteServer(t, DefaultCoreCapabilities())
+
+	getLabels := func(id string) map[string]any {
+		r := callAPI(t, ts, inv("TestNote/get",
+			fmt.Sprintf(`{"accountId":"Atest1","ids":[%q],"properties":["labels","tags"]}`, id), "0"))
+		return methodArgs(t, r, 0, "TestNote/get")["list"].([]any)[0].(map[string]any)
+	}
+	id := createNote(t, ts, `{"subject":"s","labels":{"a":true},"tags":["x","y"]}`)
+
+	t.Run("composite values stored and returned", func(t *testing.T) {
+		obj := getLabels(id)
+		if lbl := obj["labels"].(map[string]any); lbl["a"] != true || len(lbl) != 1 {
+			t.Fatalf("labels: %v", obj["labels"])
+		}
+		if tags := obj["tags"].([]any); len(tags) != 2 || tags[0] != "x" {
+			t.Fatalf("tags: %v", obj["tags"])
+		}
+	})
+
+	patch := func(p string) map[string]any {
+		r := callAPI(t, ts, inv("TestNote/set",
+			fmt.Sprintf(`{"accountId":"Atest1","update":{%q:%s}}`, id, p), "0"))
+		return methodArgs(t, r, 0, "TestNote/set")
+	}
+
+	t.Run("member add and remove accumulate", func(t *testing.T) {
+		if _, ok := patch(`{"labels/b":true,"labels/c":true}`)["updated"].(map[string]any)[id]; !ok {
+			t.Fatal("member add rejected")
+		}
+		lbl := getLabels(id)["labels"].(map[string]any)
+		if lbl["a"] != true || lbl["b"] != true || lbl["c"] != true || len(lbl) != 3 {
+			t.Fatalf("after add: %v", lbl)
+		}
+		patch(`{"labels/a":null}`) // null removes the member
+		lbl = getLabels(id)["labels"].(map[string]any)
+		if _, has := lbl["a"]; has || len(lbl) != 2 {
+			t.Fatalf("after remove: %v", lbl)
+		}
+	})
+
+	t.Run("whole-object replacement", func(t *testing.T) {
+		patch(`{"labels":{"only":true}}`)
+		lbl := getLabels(id)["labels"].(map[string]any)
+		if lbl["only"] != true || len(lbl) != 1 {
+			t.Fatalf("replace: %v", lbl)
+		}
+	})
+
+	t.Run("non-object value rejected", func(t *testing.T) {
+		se := patch(`{"labels":[1,2]}`)["notUpdated"].(map[string]any)[id].(map[string]any)
+		if se["type"] != "invalidProperties" {
+			t.Fatalf("%v", se)
+		}
+	})
+
+	t.Run("array kind rejects non-array", func(t *testing.T) {
+		se := patch(`{"tags":{"a":true}}`)["notUpdated"].(map[string]any)[id].(map[string]any)
+		if se["type"] != "invalidProperties" {
+			t.Fatalf("%v", se)
+		}
+	})
+
+	t.Run("deep pointer is invalidPatch", func(t *testing.T) {
+		se := patch(`{"labels/a/b":true}`)["notUpdated"].(map[string]any)[id].(map[string]any)
+		if se["type"] != "invalidPatch" {
+			t.Fatalf("%v", se)
+		}
+	})
+
+	t.Run("member pointer into a non-object kind is invalidPatch", func(t *testing.T) {
+		se := patch(`{"tags/0":"z"}`)["notUpdated"].(map[string]any)[id].(map[string]any)
+		if se["type"] != "invalidPatch" {
+			t.Fatalf("%v", se)
+		}
+	})
+}
+
 func TestSetDestroyAndIfInState(t *testing.T) {
 	ts := noteServer(t, DefaultCoreCapabilities())
 	id := createNote(t, ts, `{"subject":"a"}`)
@@ -537,4 +620,68 @@ func TestChangesEndToEnd(t *testing.T) {
 			t.Fatalf("paged created: %v, want %v", got, ids)
 		}
 	})
+}
+
+// TestChangesOmittedMaxChangesDefaults: when the client omits maxChanges the
+// server applies its own default cap and pages the rest, rather than
+// returning the whole change log at once. RFC 8620 section 5.2: "If not given
+// by the client, the server may choose how many to return", and a maxChanges
+// "set automatically by the server" MUST still bound the response. The
+// default is shrunk here so a handful of records drives the boundary.
+func TestChangesOmittedMaxChangesDefaults(t *testing.T) {
+	orig := tuning.DefaultMaxChanges
+	tuning.DefaultMaxChanges = 2
+	t.Cleanup(func() { tuning.DefaultMaxChanges = orig })
+
+	ts := noteServer(t, DefaultCoreCapabilities())
+	for i := 0; i < 5; i++ {
+		createNote(t, ts, fmt.Sprintf(`{"subject":"n%d"}`, i)) // states 1..5
+	}
+
+	seen := map[string]bool{}
+	state := "0"
+	pages := 0
+	for {
+		r := callAPI(t, ts, inv("TestNote/changes",
+			fmt.Sprintf(`{"accountId":"Atest1","sinceState":%q}`, state), "0"))
+		args := methodArgs(t, r, 0, "TestNote/changes")
+		c := args["created"].([]any)
+		// MUST NOT return more than the (auto-set) limit across all three
+		// arrays. These are pure creates, so counting created suffices, but
+		// assert the full sum to mirror the spec wording.
+		n := len(c) + len(args["updated"].([]any)) + len(args["destroyed"].([]any))
+		if n > tuning.DefaultMaxChanges {
+			t.Fatalf("page returned %d ids, exceeds the auto-set cap %d", n, tuning.DefaultMaxChanges)
+		}
+		for _, id := range c {
+			seen[id.(string)] = true
+		}
+		state = args["newState"].(string)
+		pages++
+		if args["hasMoreChanges"] != true {
+			break
+		}
+		if pages > 10 {
+			t.Fatal("paging never reported hasMoreChanges=false")
+		}
+	}
+	if len(seen) != 5 {
+		t.Fatalf("collected %d distinct created ids across pages, want 5", len(seen))
+	}
+	if state != "5" {
+		t.Fatalf("final newState = %q, want the current server state 5", state)
+	}
+	if pages < 3 {
+		t.Fatalf("5 changes under a cap of 2 must take at least 3 pages, took %d", pages)
+	}
+}
+
+// TestDefaultMaxChangesExceedsMaxObjectsInSet locks the invariant behind the
+// default: a single page of change ids must not exceed what one following
+// Foo/get (bounded by maxObjectsInSet) could ask for at once.
+func TestDefaultMaxChangesExceedsMaxObjectsInSet(t *testing.T) {
+	if int64(tuning.DefaultMaxChanges) <= DefaultCoreCapabilities().MaxObjectsInSet {
+		t.Fatalf("tuning.DefaultMaxChanges %d must exceed maxObjectsInSet %d",
+			tuning.DefaultMaxChanges, DefaultCoreCapabilities().MaxObjectsInSet)
+	}
 }

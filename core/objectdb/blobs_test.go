@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"slices"
 	"testing"
 	"time"
@@ -38,15 +39,20 @@ func newBlobDB(t *testing.T) (*DB, blob.Store) {
 	return db, kvstore.New(be)
 }
 
-// uploadBlob stores content and records it, like the upload endpoint.
+// uploadBlob stores content and records it, like the upload endpoint: it
+// streams the bytes into a writer and finalizes them (record then publish).
 func uploadBlob(t *testing.T, db *DB, store blob.Store, content, uploader string, at time.Time) jmap.Id {
 	t.Helper()
 	ctx := context.Background()
-	blobID := blob.IdFor([]byte(content))
-	if err := store.Put(ctx, acct, blobID, []byte(content)); err != nil {
+	bw, err := store.Create(ctx, acct)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.RecordBlobUpload(ctx, acct, blobID, uploader, at); err != nil {
+	if _, err := io.WriteString(bw, content); err != nil {
+		t.Fatal(err)
+	}
+	blobID, err := db.FinalizeBlobUpload(ctx, acct, bw, uploader, at)
+	if err != nil {
 		t.Fatal(err)
 	}
 	return blobID

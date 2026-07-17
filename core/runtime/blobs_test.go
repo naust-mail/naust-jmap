@@ -1,17 +1,21 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
 	"github.com/naust-mail/naust-jmap/core/providers/auth"
+	"github.com/naust-mail/naust-jmap/core/providers/backend"
 	"github.com/naust-mail/naust-jmap/core/providers/backend/memory"
 	"github.com/naust-mail/naust-jmap/core/providers/blob"
 	"github.com/naust-mail/naust-jmap/core/providers/blob/kvstore"
@@ -190,6 +194,107 @@ func TestUploadDownloadRoundTrip(t *testing.T) {
 	}
 }
 
+// TestUploadStoreFull: when the blob store is at capacity, Commit fails and
+// the upload is refused 507 (the body was within maxSizeUpload, so this is not
+// a 413).
+func TestUploadStoreFull(t *testing.T) {
+	core := DefaultCoreCapabilities()
+	be := memory.New()
+	db := objectdb.New(be, lease.NewInProcess(be))
+	// The blob store has its own tiny-capacity backend; the message is well
+	// under maxSizeUpload but too big to store.
+	store := kvstore.New(memory.New(memory.WithCapacity(4)))
+	srv, err := NewServer(multiAuth{}, NewProcessor(), "https://jmap.example.com", core)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.EnableBlobs(db, store)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp := uploadHTTP(t, ts, "Atest1", "john@example.com", "way over four bytes", "text/plain")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInsufficientStorage {
+		t.Fatalf("upload into a full store -> %d, want 507", resp.StatusCode)
+	}
+}
+
+// writeFaultStore is a blob.Store whose writer fails partway through the
+// streamed copy. It exercises the upload path's distinction between a body over
+// the size cap (a client error, 413) and a backend fault while the bytes are
+// being stored (a server error): both reach handleUpload through the one
+// io.Copy error, and only the former is "too large".
+type writeFaultStore struct {
+	err   error
+	after int64
+}
+
+func (writeFaultStore) Open(context.Context, jmap.Id, jmap.Id) (io.ReadCloser, int64, error) {
+	return nil, 0, blob.ErrNotFound
+}
+func (writeFaultStore) Put(context.Context, jmap.Id, jmap.Id, []byte) error { return nil }
+func (writeFaultStore) Delete(context.Context, jmap.Id, jmap.Id) error      { return nil }
+func (s writeFaultStore) Create(context.Context, jmap.Id) (blob.BlobWriter, error) {
+	return &faultWriter{store: s}, nil
+}
+
+type faultWriter struct {
+	store   writeFaultStore
+	written int64
+}
+
+func (w *faultWriter) Write(p []byte) (int, error) {
+	w.written += int64(len(p))
+	if w.written > w.store.after {
+		return 0, w.store.err
+	}
+	return len(p), nil
+}
+func (w *faultWriter) ID() jmap.Id              { return "Gtest" }
+func (w *faultWriter) Commit() (jmap.Id, error) { return "Gtest", nil }
+func (w *faultWriter) Abort() error             { return nil }
+
+// TestUploadBackendFaultNotTooLarge: a fault while the bytes are being stored
+// is reported by its real cause, not as a size violation. The body is well
+// under maxSizeUpload, so 413 here would be a lie; a generic fault is 500 and
+// an out-of-space fault is 507 (RFC 8620 6.1 requires an HTTP error with an RFC
+// 7807 body, and the status must describe the real failure).
+func TestUploadBackendFaultNotTooLarge(t *testing.T) {
+	core := DefaultCoreCapabilities()
+	core.MaxSizeUpload = 1 << 20 // far above the body: a 413 could only be wrong
+
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"generic fault", errors.New("backend unavailable"), http.StatusInternalServerError},
+		{"out of space", backend.ErrNoSpace, http.StatusInsufficientStorage},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			be := memory.New()
+			db := objectdb.New(be, lease.NewInProcess(be))
+			srv, err := NewServer(multiAuth{}, NewProcessor(), "https://jmap.example.com", core)
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv.EnableBlobs(db, writeFaultStore{err: tc.err, after: 4})
+			ts := httptest.NewServer(srv)
+			defer ts.Close()
+
+			resp := uploadHTTP(t, ts, "Atest1", "john@example.com", "a body larger than four bytes", "text/plain")
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusRequestEntityTooLarge {
+				t.Fatalf("backend fault (%v) misreported as 413 too-large", tc.err)
+			}
+			if resp.StatusCode != tc.want {
+				t.Fatalf("backend fault (%v) -> %d, want %d", tc.err, resp.StatusCode, tc.want)
+			}
+		})
+	}
+}
+
 func TestUploadErrors(t *testing.T) {
 	small := DefaultCoreCapabilities()
 	small.MaxSizeUpload = 8
@@ -318,5 +423,95 @@ func TestBlobCopy(t *testing.T) {
 		if got := methodArgs(t, r, 0, "error")["type"]; got != tc.wantErr {
 			t.Errorf("%s: error type = %v", name, got)
 		}
+	}
+}
+
+// countingStore wraps a Store and counts Opens, so a test can prove a
+// rejected blobId never reaches the store at all.
+type countingStore struct {
+	blob.Store
+	opens int
+}
+
+func (c *countingStore) Open(ctx context.Context, acct, id jmap.Id) (io.ReadCloser, int64, error) {
+	c.opens++
+	return c.Store.Open(ctx, acct, id)
+}
+
+// OpenBlob is the checked open every client-supplied blobId goes through.
+// Invalid ids, unknown ids, and section 6.1 denials (a non-uploader, or no
+// identity at all, on an unreferenced blob) all read as blob.ErrNotFound
+// without the store being touched; the uploader reads the content while it
+// is unreferenced, and any account member reads it once it is referenced.
+func TestOpenBlobChecks(t *testing.T) {
+	ctx := context.Background()
+	be := memory.New()
+	db := objectdb.New(be, lease.NewInProcess(be))
+	if err := db.RegisterType(testDocType()); err != nil {
+		t.Fatal(err)
+	}
+	store := &countingStore{Store: kvstore.New(be)}
+
+	bw, err := store.Create(ctx, "Atest1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(bw, "checked open content"); err != nil {
+		t.Fatal(err)
+	}
+	blobID, err := db.FinalizeBlobUpload(ctx, "Atest1", bw, "john@example.com", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	john := &auth.Identity{Username: "john@example.com"}
+	mallory := &auth.Identity{Username: "mallory@example.com"}
+
+	denied := []struct {
+		name  string
+		id    jmap.Id
+		ident *auth.Identity
+	}{
+		{"empty id", "", john},
+		{"path-shaped id", "G../../escape", john},
+		{"valid unknown id", "Gnosuchblob", john},
+		{"non-uploader on unreferenced", blobID, mallory},
+		{"no identity on unreferenced", blobID, nil},
+	}
+	for _, d := range denied {
+		if _, _, err := OpenBlob(ctx, db, store, "Atest1", d.id, d.ident); !errors.Is(err, blob.ErrNotFound) {
+			t.Errorf("%s: err = %v, want blob.ErrNotFound", d.name, err)
+		}
+	}
+	if store.opens != 0 {
+		t.Fatalf("denied opens reached the store %d times, want 0", store.opens)
+	}
+
+	// The uploader reads the blob while it is unreferenced.
+	rc, size, err := OpenBlob(ctx, db, store, "Atest1", blobID, john)
+	if err != nil {
+		t.Fatalf("uploader open: %v", err)
+	}
+	body, _ := io.ReadAll(rc)
+	rc.Close()
+	if string(body) != "checked open content" || size != int64(len(body)) {
+		t.Fatalf("uploader read %q (size %d)", body, size)
+	}
+
+	// Reference the blob; now any member of the account reads it.
+	raw, _ := json.Marshal(blobID)
+	if _, err := db.Update(ctx, "Atest1", func(u *objectdb.Update) error {
+		_, err := u.Create("TestDoc", objectdb.Object{"blobId": raw})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rc, _, err = OpenBlob(ctx, db, store, "Atest1", blobID, mallory)
+	if err != nil {
+		t.Fatalf("non-uploader open of referenced blob: %v", err)
+	}
+	rc.Close()
+	if store.opens != 2 {
+		t.Errorf("granted opens = %d, want 2", store.opens)
 	}
 }

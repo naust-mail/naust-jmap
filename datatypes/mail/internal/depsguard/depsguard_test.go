@@ -49,3 +49,27 @@ next:
 		t.Errorf("mail datatype module depends on disallowed package %s", pkg)
 	}
 }
+
+// oraclePkg is the frozen buffered parser, kept as the differential reference
+// for the streaming rewrite. It is a whole second parser: if anything outside a
+// test ever imports it, the module ships two parsers and the one nobody
+// maintains is reachable from a running server.
+const oraclePkg = module + "/internal/oracle"
+
+// TestOracleIsTestOnly fails if any package in the module imports the oracle in
+// its non-test build. Deps is the transitive import set of the package proper,
+// so only a real import shows up here - a _test.go import does not.
+func TestOracleIsTestOnly(t *testing.T) {
+	out, err := exec.Command("go", "list", "-f", "{{.ImportPath}} {{join .Deps \" \"}}", module+"/...").CombinedOutput()
+	if err != nil {
+		t.Fatalf("go list: %v\n%s", err, out)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(line)
+		for _, dep := range fields[1:] {
+			if dep == oraclePkg {
+				t.Errorf("%s imports %s in its non-test build; the oracle exists only for tests", fields[0], oraclePkg)
+			}
+		}
+	}
+}

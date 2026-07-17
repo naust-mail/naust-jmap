@@ -23,12 +23,14 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/providers/backend"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/providers/notify"
+	"github.com/naust-mail/naust-jmap/core/tuning"
 )
 
 // Object is one record: property name to raw JSON value. The "id"
@@ -53,11 +55,36 @@ type DB struct {
 	leases   lease.Manager
 	types    map[string]*descriptor.Type
 	notifier notify.Notifier
+	// idScheme selects how Create assigns record ids (see tuning.IdScheme).
+	idScheme tuning.IdScheme
+	// now supplies the wall-clock reading the ULID id scheme stamps into
+	// ids. It is a field only so a test can pin it; production uses time.Now.
+	now func() time.Time
 }
 
+// Option configures a DB at construction.
+type Option func(*DB)
+
+// WithIdScheme selects the record-id scheme (default tuning.DefaultIdScheme).
+func WithIdScheme(s tuning.IdScheme) Option { return func(db *DB) { db.idScheme = s } }
+
+// WithNow overrides the clock the ULID id scheme reads. It exists for
+// deterministic testing; production leaves the default, time.Now.
+func WithNow(now func() time.Time) Option { return func(db *DB) { db.now = now } }
+
 // New wraps a backend and lease manager.
-func New(be backend.Backend, lm lease.Manager) *DB {
-	return &DB{be: be, leases: lm, types: make(map[string]*descriptor.Type)}
+func New(be backend.Backend, lm lease.Manager, opts ...Option) *DB {
+	db := &DB{
+		be:       be,
+		leases:   lm,
+		types:    make(map[string]*descriptor.Type),
+		idScheme: tuning.DefaultIdScheme,
+		now:      time.Now,
+	}
+	for _, opt := range opts {
+		opt(db)
+	}
+	return db
 }
 
 // RegisterType adds a type descriptor. Registration is not
@@ -173,7 +200,13 @@ func (db *DB) Update(ctx context.Context, acct jmap.Id, fn func(u *Update) error
 		return nil, err
 	}
 	defer l.Release()
+	return db.update(ctx, acct, l, fn)
+}
 
+// update is Update's body under an already-held lease, so a caller that has
+// other lease-held work to do first (FinalizeBlobUploadThenUpdate) commits in
+// the same hold instead of queueing for the account a second time.
+func (db *DB) update(ctx context.Context, acct jmap.Id, l lease.Lease, fn func(u *Update) error) (map[string]string, error) {
 	// AllocateSequence: read the counter once under the lease; the
 	// incremented value persists inside the same batch as the log entry
 	// it numbers, so a sequence number exists iff its commit succeeded
@@ -188,11 +221,11 @@ func (db *DB) Update(ctx context.Context, acct jmap.Id, fn func(u *Update) error
 	}
 	sequence := current + 1
 
-	u := &Update{db: db, ctx: ctx, acct: acct, staged: make(map[string]*stagedRecord)}
+	u := &Update{db: db, ctx: ctx, acct: acct, staged: make(map[string]*stagedRecord), bumped: map[string]struct{}{}, sequence: sequence}
 	if err := fn(u); err != nil {
 		return nil, err
 	}
-	if len(u.staged) == 0 {
+	if len(u.staged) == 0 && len(u.bumped) == 0 {
 		return map[string]string{}, nil
 	}
 
@@ -225,6 +258,15 @@ type Update struct {
 	// staged is keyed by type/id; each entry knows the pre-image (for
 	// index maintenance) and the final disposition.
 	staged map[string]*stagedRecord
+	// bumped is the set of types whose state string this commit advances
+	// without staging any record - see BumpState.
+	bumped map[string]struct{}
+	// sequence is this commit's per-account sequence number, read once at
+	// the start of Update. createSeq counts records created in this commit.
+	// The Sequence id scheme (tuning.SchemeSequence) derives ids from the
+	// pair so they sort by in-account creation order without any extra read.
+	sequence  int64
+	createSeq int64
 }
 
 type stagedRecord struct {
@@ -249,6 +291,24 @@ func (u *Update) Get(typeName string, id jmap.Id) (Object, error) {
 	return u.db.Get(u.ctx, u.acct, typeName, id)
 }
 
+// newId assigns the id for one record under the DB's configured scheme
+// (tuning.IdScheme). All three schemes emit ids satisfying RFC 8620 section
+// 1.2. Sequence draws on this commit's per-account sequence and a per-commit
+// index, so ids sort by in-account creation order with no extra read; ULID
+// stamps the DB clock; Random derives from nothing.
+func (u *Update) newId() jmap.Id {
+	switch u.db.idScheme {
+	case tuning.SchemeSequence:
+		id := jmap.NewSequenceId(u.sequence, u.createSeq)
+		u.createSeq++
+		return id
+	case tuning.SchemeRandom:
+		return jmap.NewId()
+	default: // tuning.SchemeULID
+		return jmap.NewULID(u.db.now())
+	}
+}
+
 // Create stages a new record and returns its server-assigned id
 // (RFC 8620 section 1.2: ids are server-assigned and immutable). obj
 // must not contain "id".
@@ -263,7 +323,7 @@ func (u *Update) Create(typeName string, obj Object) (jmap.Id, error) {
 	if err := checkKinds(t, obj); err != nil {
 		return "", err
 	}
-	id := jmap.NewId()
+	id := u.newId()
 	stored := make(Object, len(obj)+1)
 	for k, v := range obj {
 		stored[k] = v
@@ -320,6 +380,23 @@ func (u *Update) Destroy(typeName string, id jmap.Id) error {
 		return err
 	}
 	u.staged[stagedKey(typeName, id)] = &stagedRecord{typeName: typeName, id: id, old: old}
+	return nil
+}
+
+// BumpState advances a type's state string in this commit without staging
+// any record. It exists for a push-only type - one that appears in the
+// StateChange "changed" map (RFC 8620 section 7.1) but holds no records of
+// its own, so nothing else would ever move its state. The bumped type is
+// included in the returned states and the post-commit Publish, and its
+// persisted state key is set to the commit sequence, but no change-log
+// entry is written: a bare bump has no created/updated/destroyed ids, and
+// such a type has no /changes method to read them. The type must be
+// registered (a method-less descriptor is enough).
+func (u *Update) BumpState(typeName string) error {
+	if u.db.types[typeName] == nil {
+		return ErrUnknownType
+	}
+	u.bumped[typeName] = struct{}{}
 	return nil
 }
 
@@ -445,6 +522,9 @@ func (u *Update) buildBatch(sequence int64) (*backend.Batch, []string, error) {
 				return nil, nil, err
 			}
 			refOps(batch, u.acct, t, st.id, st.old, nil)
+			if err := setIndexOps(batch, u.acct, t, st.id, st.old, nil); err != nil {
+				return nil, nil, err
+			}
 			te.Destroyed = append(te.Destroyed, st.id)
 		case st.created:
 			raw, err := json.Marshal(st.new)
@@ -456,6 +536,9 @@ func (u *Update) buildBatch(sequence int64) (*backend.Batch, []string, error) {
 				return nil, nil, err
 			}
 			refOps(batch, u.acct, t, st.id, nil, st.new)
+			if err := setIndexOps(batch, u.acct, t, st.id, nil, st.new); err != nil {
+				return nil, nil, err
+			}
 			te.Created = append(te.Created, st.id)
 		default: // update
 			raw, err := json.Marshal(st.new)
@@ -467,6 +550,9 @@ func (u *Update) buildBatch(sequence int64) (*backend.Batch, []string, error) {
 				return nil, nil, err
 			}
 			refOps(batch, u.acct, t, st.id, st.old, st.new)
+			if err := setIndexOps(batch, u.acct, t, st.id, st.old, st.new); err != nil {
+				return nil, nil, err
+			}
 			te.Updated = append(te.Updated, st.id)
 			if te.UpdatedProps == nil {
 				te.UpdatedProps = []string{}
@@ -475,10 +561,22 @@ func (u *Update) buildBatch(sequence int64) (*backend.Batch, []string, error) {
 		}
 	}
 
-	touched := make([]string, 0, len(entry.Types))
+	touched := make([]string, 0, len(entry.Types)+len(u.bumped))
 	for typeName, te := range entry.Types {
 		if len(te.Created)+len(te.Updated)+len(te.Destroyed) == 0 {
 			delete(entry.Types, typeName)
+			continue
+		}
+		touched = append(touched, typeName)
+		batch.Set(typeStateKey(u.acct, typeName), backend.EncodeInt64(sequence))
+	}
+	hasRecords := len(entry.Types) > 0
+
+	// Push-only types advanced via BumpState join touched - so they are
+	// published and returned - and get their state key set, but contribute
+	// no log entry (see BumpState). Skip any already moved by a record.
+	for typeName := range u.bumped {
+		if _, has := entry.Types[typeName]; has {
 			continue
 		}
 		touched = append(touched, typeName)
@@ -489,11 +587,13 @@ func (u *Update) buildBatch(sequence int64) (*backend.Batch, []string, error) {
 		// still applied by the caller. Write no log entry.
 		return batch, touched, nil
 	}
-	raw, err := json.Marshal(entry)
-	if err != nil {
-		return nil, nil, err
+	if hasRecords {
+		raw, err := json.Marshal(entry)
+		if err != nil {
+			return nil, nil, err
+		}
+		batch.Set(logKey(u.acct, sequence), raw)
 	}
-	batch.Set(logKey(u.acct, sequence), raw)
 	return batch, touched, nil
 }
 

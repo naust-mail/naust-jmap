@@ -38,7 +38,7 @@ runtime.
 | `core/providers/` | The interfaces the runtime needs (storage, blobs, leases, notifications, auth), each with a built-in in-process implementation | pick or implement         |
 | `drivers/`        | Provider implementations that need third-party dependencies (sqlite today), each its own module                                | import at most one or two |
 | `datatypes/`      | JMAP datatypes served on top of the runtime (mail arrives here first), each its own module                                     | import what you serve     |
-| `examples/`       | Runnable servers, starting with the quickstart below                                                                           | read                      |
+| `examples/`       | Runnable servers: the quickstart below and a full mail server (`examples/mailserver`)                                          | read                      |
 
 ## Quickstart
 
@@ -110,8 +110,11 @@ The core protocol (RFC 8620) is implemented end to end:
   capability gating, request limits, strict I-JSON.
 - The six derived standard methods over any registered datatype: `/get`,
   `/changes`, `/set`, `/copy`, `/query`, `/queryChanges`.
-- Binary data (`Server.EnableBlobs`): upload/download endpoints and
-  `Blob/copy`, with reference tracking and unreferenced-blob sweeping.
+- Binary data (`Server.EnableBlobs`): streaming upload/download endpoints and
+  `Blob/copy`, with reference tracking and unreferenced-blob sweeping. Two blob
+  stores ship: a whole-value store for the small-blob common case, and a chunked
+  streaming store that never holds a whole blob in memory, for content larger than
+  a comfortable in-memory value.
 - Push (`Server.EnablePush`): the event-source endpoint, plus verified
   `PushSubscription` webhooks with RFC 8291 encryption when given a
   subscription store and sender.
@@ -148,7 +151,7 @@ from its descriptor, not written per type.
 
 Where the RFCs leave a behavior to the server, the choice is recorded here so
 embedders know what to expect. Both entries below concern the mail module
-(RFC 8621), which is in development; see the Roadmap.
+(RFC 8621); see Mail below.
 
 **Threads never merge.** Emails are grouped into Threads by their
 References/In-Reply-To chain plus a normalized subject. If two existing
@@ -174,13 +177,61 @@ the simple behavior.
 
 </details>
 
+## Mail (RFC 8621)
+
+The first datatype module, `datatypes/mail`, implements RFC 8621's read model:
+Mailbox, Thread and Email as descriptor types over the derived RFC 8620
+machinery, plus message delivery (which sits below the JMAP protocol) through
+LMTP and HTTP ingest adapters. Composing and sending mail is the next
+milestone; see the Roadmap.
+
+A complete, persistent mail server - the sqlite driver, all three types, both
+delivery adapters, and push - is in
+[`examples/mailserver`](examples/mailserver/main.go):
+
+```sh
+go run ./examples/mailserver
+```
+
+It serves JMAP on `:8080`, accepts LMTP on `127.0.0.1:2400`, and takes an HTTP
+ingest `POST` on `/ingest`; the file's header walks through creating an Inbox,
+delivering a message both ways, and reading it back over JMAP.
+
+<details>
+<summary>RFC 8621 support matrix</summary>
+
+| Object / method                             | Status | Notes                                                                                     |
+|---------------------------------------------|--------|-------------------------------------------------------------------------------------------|
+| `Mailbox/get`, `/query`, `/changes`         | Yes    | 18 IANA roles, tree with a depth limit, computed `myRights`                               |
+| `Mailbox/set`                               | Yes    | create/update/destroy, `onDestroyRemoveEmails` cascade                                    |
+| Mailbox counters                            | Yes    | `totalEmails`, `unreadEmails`, `totalThreads`, `unreadThreads` (section 2.1, trash-aware) |
+| `Thread/get`, `/changes`                    | Yes    | References + subject grouping; Threads never merge (see Design decisions)                 |
+| `Email/get`                                 | Yes    | stored fast fields + on-demand MIME parse; `header:{name}:as{Form}:all` parsed forms      |
+| `Email/query`                               | Yes    | every section 4.4.1 condition, section 4.4.2 sort, `collapseThreads`, fast total          |
+| `Email/set` (keywords, mailboxIds, destroy) | Yes    | flag and file existing mail; per-record atomic                                            |
+| `Email/set` (create / compose)              | M3     | building a message from parts is the write slice                                          |
+| `Email/import`, `Email/parse`               | Yes    | ingest an uploaded blob; parse a blob without storing an Email                            |
+| `Email/copy`                                | M3     | cross-account copy lands with the write slice                                             |
+| `SearchSnippet/get`                         | Yes    | highlighted subject and body preview                                                      |
+| Delivery (LMTP, HTTP ingest)                | Yes    | transport-agnostic `Deliverer`; RFC 2033 LMTP; host-provided recipient `Resolver`         |
+| `EmailDelivery` push type                   | Yes    | section 1.5 method-less push; state advances on new mail only                             |
+| `EmailSubmission`, `Identity`               | M3     | outbound mail                                                                             |
+| `VacationResponse`                          | M3     |                                                                                           |
+
+Search is a swappable interface (`mail.Searcher`); the built-in implementation
+is case-insensitive substring matching. MDN (RFC 9007), S/MIME verification
+(RFC 9219), and quotas (RFC 9425) are later datatype modules.
+
+</details>
+
 ## Roadmap
 
-naust-jmap is pre-release: no tagged versions yet. Coming next, in order:
+naust-jmap is pre-release: no tagged versions yet. The mail read model (see
+Mail above) is implemented. Coming next, in order:
 
-- Mail (RFC 8621): `Email`, `Mailbox`, and `Thread` as the first datatype
-  module, with LMTP and HTTP delivery adapters
-- Mail submission: `EmailSubmission` and `Identity`
+- Mail write: composing an `Email` (`Email/set` create, `Email/copy`) and
+  sending it (`EmailSubmission`, `Identity`)
+- MDN, S/MIME verification, and quotas as further RFC 8621-family modules
 - A Postgres driver and multi-node cluster testing
 
 ## License

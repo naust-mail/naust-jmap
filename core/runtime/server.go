@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"strings"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/providers/auth"
+	"github.com/naust-mail/naust-jmap/core/tuning"
 )
 
 // DefaultCoreCapabilities returns the suggested minimum limits of
@@ -61,6 +63,9 @@ func NewServer(a auth.Authenticator, p *Processor, baseURL string, core jmap.Cor
 	}
 	if core.MaxConcurrentRequests < 1 || core.MaxCallsInRequest < 1 || core.MaxSizeRequest < 1 {
 		return nil, errors.New("runtime: core limits must be positive (RFC 8620 section 8.5 requires enforced limits)")
+	}
+	for _, warning := range tuning.Validate() {
+		log.Printf("naust-jmap: tuning: %s", warning)
 	}
 	return &Server{
 		authn:       a,

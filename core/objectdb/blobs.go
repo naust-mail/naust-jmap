@@ -27,13 +27,9 @@ import (
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/providers/backend"
 	"github.com/naust-mail/naust-jmap/core/providers/blob"
+	"github.com/naust-mail/naust-jmap/core/providers/lease"
+	"github.com/naust-mail/naust-jmap/core/tuning"
 )
-
-// MinUnreferencedAge is the floor on how long an unreferenced blob is
-// kept: RFC 8620 section 6 says an unreferenced blob MUST NOT be
-// deleted for at least 1 hour from the time of upload (except under
-// quota pressure, which this runtime does not implement).
-const MinUnreferencedAge = time.Hour
 
 // BlobUpload is a blob's upload record.
 type BlobUpload struct {
@@ -46,16 +42,81 @@ type BlobUpload struct {
 	Uploaders []string `json:"uploaders"`
 }
 
-// RecordBlobUpload registers an upload under the account's lease:
-// creates the blob's record or, for a reupload of existing content,
-// adds the uploader and resets the upload time.
-func (db *DB) RecordBlobUpload(ctx context.Context, acct, blobID jmap.Id, uploader string, now time.Time) error {
+// FinalizeBlobUpload records a streamed upload and publishes its content
+// as one lease-held step, so it cannot interleave with SweepBlobs (which
+// holds the same account lease). Holding the lease across both closes two
+// races the naive Commit-then-record order leaves open:
+//
+//   - A sweep that deletes an aged, unreferenced copy of the same content
+//     between the writer's dedup check and the record write, leaving a
+//     fresh record over content that was just deleted.
+//   - A crash after the content is published but before the record exists,
+//     which strands published bytes that no upload record and no reference
+//     cover, so neither SweepBlobs nor the store's own sweep can ever
+//     reclaim them.
+//
+// The record is written before bw.Commit publishes the content
+// (record-first). A crash in between then leaves a record for content that
+// is not yet addressable: SweepBlobs drops the unreferenced record after
+// its grace window and the store reclaims the still-parked pieces, rather
+// than the unreclaimable published-but-unrecorded bytes the reverse order
+// would leave. The recorded id is bw.ID, which content addressing keeps
+// equal to the id Commit returns.
+func (db *DB) FinalizeBlobUpload(ctx context.Context, acct jmap.Id, bw blob.BlobWriter, uploader string, now time.Time) (jmap.Id, error) {
 	l, err := db.leases.Acquire(ctx, acct)
 	if err != nil {
-		return err
+		return "", err
+	}
+	defer l.Release()
+	return db.finalizeBlobUpload(ctx, acct, bw, uploader, now, l)
+}
+
+// finalizeBlobUpload is FinalizeBlobUpload's body under an already-held lease.
+func (db *DB) finalizeBlobUpload(ctx context.Context, acct jmap.Id, bw blob.BlobWriter, uploader string, now time.Time, l lease.Lease) (jmap.Id, error) {
+	blobID := bw.ID()
+	if err := db.recordUpload(ctx, acct, blobID, uploader, now, l); err != nil {
+		return "", err
+	}
+	if _, err := bw.Commit(); err != nil {
+		return "", err
+	}
+	return blobID, nil
+}
+
+// FinalizeBlobUploadThenUpdate is FinalizeBlobUpload followed by Update under
+// ONE hold of the account lease. Delivery both publishes a message's blob and
+// creates its Email; acquiring the lease once for the pair removes a second
+// queue wait behind the account's other writers, without changing what
+// commits: the semantics are exactly the sequential composition of the two
+// calls, crash ordering included.
+//
+// The finalize half completes before fn runs, so when fn or its commit fails
+// the blob is already recorded and published - the returned blobId is then
+// non-empty alongside the error, and the caller must treat that state as
+// "blob finalized, update failed", just as if the two calls had been made
+// separately. A blob left that way is unreferenced and SweepBlobs reclaims it.
+// An empty blobId with an error means the finalize itself failed and nothing
+// was published.
+func (db *DB) FinalizeBlobUploadThenUpdate(ctx context.Context, acct jmap.Id, bw blob.BlobWriter, uploader string, now time.Time, fn func(u *Update) error) (jmap.Id, map[string]string, error) {
+	l, err := db.leases.Acquire(ctx, acct)
+	if err != nil {
+		return "", nil, err
 	}
 	defer l.Release()
 
+	blobID, err := db.finalizeBlobUpload(ctx, acct, bw, uploader, now, l)
+	if err != nil {
+		return "", nil, err
+	}
+	states, err := db.update(ctx, acct, l, fn)
+	return blobID, states, err
+}
+
+// recordUpload writes a blob's upload record under an already-held lease:
+// it reads the current record (if any), sets the upload time and adds the
+// uploader, and writes it fenced by the lease. A reupload of existing
+// content adds the uploader and resets the upload time (RFC 8620 section 6).
+func (db *DB) recordUpload(ctx context.Context, acct, blobID jmap.Id, uploader string, now time.Time, l lease.Lease) error {
 	rec, err := db.BlobUpload(ctx, acct, blobID)
 	if errors.Is(err, ErrNotFound) {
 		rec = &BlobUpload{}
@@ -121,7 +182,7 @@ func (u *Update) BlobExists(blobID jmap.Id) (bool, error) {
 
 // SweepBlobs garbage-collects the account's unreferenced blobs whose
 // last upload is older than the grace window (never less than
-// MinUnreferencedAge) and returns the blobIds it deleted. It runs under
+// tuning.BlobMinUnreferencedAge) and returns the blobIds it deleted. It runs under
 // the account lease, so it can never race a method call that is
 // referencing or de-referencing blobs - which is also how the section 6
 // rule "a blob MUST NOT be deleted during the method call that removed
@@ -131,8 +192,8 @@ func (u *Update) BlobExists(blobID jmap.Id) (bool, error) {
 // in between leaves a record whose content is gone (the next sweep
 // finishes the job) rather than invisible, unsweepable content.
 func (db *DB) SweepBlobs(ctx context.Context, acct jmap.Id, store blob.Store, now time.Time, grace time.Duration) ([]jmap.Id, error) {
-	if grace < MinUnreferencedAge {
-		grace = MinUnreferencedAge
+	if grace < tuning.BlobMinUnreferencedAge {
+		grace = tuning.BlobMinUnreferencedAge
 	}
 	l, err := db.leases.Acquire(ctx, acct)
 	if err != nil {

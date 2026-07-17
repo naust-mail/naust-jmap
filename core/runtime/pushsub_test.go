@@ -22,6 +22,7 @@ import (
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/providers/notify"
 	"github.com/naust-mail/naust-jmap/core/pushsub"
+	"github.com/naust-mail/naust-jmap/core/tuning"
 	"github.com/naust-mail/naust-jmap/core/webpush"
 )
 
@@ -556,7 +557,7 @@ func TestPushSubscriptionLimits(t *testing.T) {
 	t.Run("creation rate", func(t *testing.T) {
 		endpoint, hits := newPushEndpoint(t)
 		rig := newPushRig(t, endpoint.Client(), nil)
-		for i := range createRateMax {
+		for i := range tuning.PushSubscriptionCreateRateMax {
 			createPushSub(t, rig.ts, hits, fmt.Sprintf(`{"deviceClientId":"d%d","url":%q}`, i, endpoint.URL))
 		}
 		r := callAPI(t, rig.ts, inv("PushSubscription/set",

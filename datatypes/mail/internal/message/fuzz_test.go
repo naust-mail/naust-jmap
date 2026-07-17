@@ -8,7 +8,7 @@ import (
 
 // checkInvariants walks a parse result and verifies the structural
 // promises the rest of the mail datatype relies on.
-func checkInvariants(t *testing.T, m *Message) {
+func checkInvariants(t *testing.T, m *doc) {
 	t.Helper()
 	if m.Root == nil {
 		t.Fatal("nil bodyStructure root")
@@ -25,11 +25,11 @@ func checkInvariants(t *testing.T, m *Message) {
 		if isMultipart != (p.PartID == "") {
 			t.Errorf("part type %q: partId (%q) must be empty iff multipart/*", p.Type, p.PartID)
 		}
-		if isMultipart && p.Decoded != nil {
-			t.Errorf("multipart part %q carries decoded content", p.Type)
+		if _, captured := m.Content[p]; isMultipart && captured {
+			t.Errorf("multipart part %q carries content: the factory must see only leaves", p.Type)
 		}
-		if p.Size != uint64(len(p.Decoded)) {
-			t.Errorf("part %q: size %d != len(decoded) %d", p.PartID, p.Size, len(p.Decoded))
+		if p.Size != uint64(len(m.Content[p])) {
+			t.Errorf("part %q: size %d != len(content) %d", p.PartID, p.Size, len(m.Content[p]))
 		}
 		if !utf8.ValidString(p.Type) {
 			t.Errorf("part type %q is not valid UTF-8", p.Type)
@@ -68,7 +68,7 @@ func fuzzSeeds() []string {
 
 func TestParseCorpus(t *testing.T) {
 	for i, seed := range fuzzSeeds() {
-		checkInvariants(t, Parse([]byte(seed)))
+		checkInvariants(t, parseDoc(t, []byte(seed)))
 		_ = i
 	}
 }
@@ -78,7 +78,7 @@ func FuzzParse(f *testing.F) {
 		f.Add([]byte(seed))
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
-		checkInvariants(t, Parse(data))
+		checkInvariants(t, parseDoc(t, data))
 	})
 }
 

@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/providers/auth"
@@ -112,12 +113,16 @@ func (p *Processor) Process(ctx context.Context, req *jmap.Request, ident *auth.
 
 func (p *Processor) processCall(ctx context.Context, inv jmap.Invocation, ident *auth.Identity, using map[string]bool, createdIds map[jmap.Id]jmap.Id, prior []jmap.Invocation) (out []jmap.Invocation) {
 	// A panicking method must not take the request down; it failed alone
-	// (crash-only per-request isolation).
+	// (crash-only per-request isolation). The panic value is logged
+	// server-side but never returned to the client: it can carry internal
+	// state or a fragment of the data being processed, so the response
+	// carries only a generic serverFail (RFC 8620 section 3.6.2).
 	defer func() {
 		if r := recover(); r != nil {
+			log.Printf("naust-jmap: recovered panic in method %q: %v", inv.Name, r)
 			out = []jmap.Invocation{jmap.ErrorInvocation(inv.CallID, jmap.MethodError{
 				Type:        jmap.ErrServerFail,
-				Description: fmt.Sprintf("internal panic: %v", r),
+				Description: "internal error",
 			})}
 		}
 	}()

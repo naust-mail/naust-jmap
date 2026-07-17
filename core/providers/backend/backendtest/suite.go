@@ -24,6 +24,7 @@ type Config struct {
 // Run executes the full contract suite.
 func Run(t *testing.T, cfg Config) {
 	t.Run("GetSetDelete", func(t *testing.T) { testGetSetDelete(t, cfg) })
+	t.Run("NilValue", func(t *testing.T) { testNilValue(t, cfg) })
 	t.Run("BinaryKeysAndValues", func(t *testing.T) { testBinary(t, cfg) })
 	t.Run("ScanOrdering", func(t *testing.T) { testScanOrdering(t, cfg) })
 	t.Run("ScanBoundsAndEarlyStop", func(t *testing.T) { testScanBounds(t, cfg) })
@@ -59,7 +60,8 @@ func testGetSetDelete(t *testing.T, cfg Config) {
 	if got, _ = b.Get(ctx, []byte("k1")); string(got) != "v2" {
 		t.Errorf("overwrite: got %q", got)
 	}
-	// Empty (non-nil semantics irrelevant: absent vs empty must differ).
+	// Empty: absent and empty must differ. The nil case is separate, and it
+	// is NOT the same test - see testNilValue.
 	set(t, b, "empty", "")
 	if got, err = b.Get(ctx, []byte("empty")); err != nil || len(got) != 0 {
 		t.Errorf("empty value: %q, %v", got, err)
@@ -72,6 +74,63 @@ func testGetSetDelete(t *testing.T, cfg Config) {
 	}
 	if _, err := b.Get(ctx, []byte("k1")); !errors.Is(err, backend.ErrNotFound) {
 		t.Errorf("deleted key still present (err %v)", err)
+	}
+}
+
+// testNilValue pins the value contract: a nil value is a value, and it is the
+// same value as an empty one. Only "absent" is different.
+//
+// This is not hair-splitting. The object DB stores a key-only entry - an index
+// entry, a blob reference marker - by writing a nil value, because for those
+// the key IS the data (see objectdb.setindex). A driver that maps nil onto
+// something other than an empty byte string breaks every indexed write, and
+// therefore breaks delivery.
+//
+// The suite tested `[]byte("")` before this and thought it had the case
+// covered. It did not: that slice is empty but NON-NIL, and database/sql binds
+// the two differently - an empty slice becomes a zero-length blob, a nil slice
+// becomes SQL NULL. The SQLite driver's NOT NULL column rejected the latter,
+// so a fully green test suite shipped a driver that could not store an index
+// entry.
+func testNilValue(t *testing.T, cfg Config) {
+	b := cfg.Open(t)
+	defer b.Close()
+	ctx := context.Background()
+
+	var batch backend.Batch
+	batch.Set([]byte("key-only"), nil)
+	if err := b.WriteBatch(ctx, &batch); err != nil {
+		t.Fatalf("Set(key, nil): %v", err)
+	}
+
+	got, err := b.Get(ctx, []byte("key-only"))
+	if err != nil {
+		t.Fatalf("Get after nil Set: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("nil value read back as %q, want empty", got)
+	}
+
+	// Present-with-nil-value must still be distinguishable from absent.
+	if _, err := b.Get(ctx, []byte("absent")); !errors.Is(err, backend.ErrNotFound) {
+		t.Errorf("Get(absent) err = %v, want ErrNotFound", err)
+	}
+
+	// A nil value must be visible to a scan, since that is how index entries
+	// are read back.
+	seen := false
+	if err := b.Scan(ctx, []byte("key-only"), []byte("key-onlz"), false,
+		func(k, v []byte) bool {
+			seen = true
+			if len(v) != 0 {
+				t.Errorf("scanned nil value as %q, want empty", v)
+			}
+			return true
+		}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if !seen {
+		t.Error("key written with a nil value did not appear in a scan")
 	}
 }
 

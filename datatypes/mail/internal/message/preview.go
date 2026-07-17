@@ -6,17 +6,33 @@ import "strings"
 // than 256 characters in length").
 const previewMaxChars = 256
 
-// How much decoded content to consider per part when building the
-// preview; more than enough for 256 characters after collapsing.
-const previewTextBudget = 8 * 1024
-const previewHTMLBudget = 32 * 1024
+// PreviewTextBytes and PreviewHTMLBytes bound how much decoded content a
+// preview-capture sink retains per part before charset decoding: more than
+// enough for 256 characters after collapsing. A caller's preview sink caps its
+// capture at these so no whole part is ever held to build a preview.
+const (
+	PreviewTextBytes = 8 * 1024
+	PreviewHTMLBytes = 32 * 1024
+)
 
-// preview derives the plaintext preview fragment from the flattened body
-// lists, preferring plaintext parts and falling back to tag-stripped HTML.
-func preview(textBody, htmlBody []*Part) string {
-	text := bodyText(textBody)
+// PreviewSource is one flattened body part's captured, charset-decoded text and
+// its media type, for BuildPreview. The caller supplies these in body order
+// (textBody preferred, htmlBody as fallback); each Text is what that part's
+// preview sink captured, already bounded by PreviewTextBytes/PreviewHTMLBytes.
+type PreviewSource struct {
+	Type string
+	Text string
+}
+
+// BuildPreview derives the plaintext preview fragment (RFC 8621 4.1.4) from the
+// captured text of the flattened body parts, preferring the textBody parts and
+// falling back to tag-stripped htmlBody. White space is collapsed and the
+// result is capped at previewMaxChars. Because the algorithm may change over
+// time, 4.1.4 allows a later fetch to differ; the previous value is not wrong.
+func BuildPreview(textBody, htmlBody []PreviewSource) string {
+	text := previewJoin(textBody)
 	if strings.TrimSpace(text) == "" {
-		text = bodyText(htmlBody)
+		text = previewJoin(htmlBody)
 	}
 	collapsed := strings.Join(strings.Fields(text), " ")
 	runes := []rune(collapsed)
@@ -26,31 +42,24 @@ func preview(textBody, htmlBody []*Part) string {
 	return string(runes)
 }
 
-func bodyText(parts []*Part) string {
+// previewJoin concatenates the plaintext of the given parts up to the text
+// budget, stripping HTML tags from text/html parts and ignoring non-text parts.
+func previewJoin(parts []PreviewSource) string {
 	var b strings.Builder
 	for _, p := range parts {
-		if b.Len() >= previewTextBudget {
+		if b.Len() >= PreviewTextBytes {
 			break
 		}
 		switch p.Type {
 		case "text/plain":
-			s, _ := DecodeBody(capBytes(p.Decoded, previewTextBudget), p.Charset)
-			b.WriteString(s)
+			b.WriteString(p.Text)
 			b.WriteByte(' ')
 		case "text/html":
-			s, _ := DecodeBody(capBytes(p.Decoded, previewHTMLBudget), p.Charset)
-			b.WriteString(stripHTML(s))
+			b.WriteString(stripHTML(p.Text))
 			b.WriteByte(' ')
 		}
 	}
 	return b.String()
-}
-
-func capBytes(b []byte, n int) []byte {
-	if len(b) > n {
-		return b[:n]
-	}
-	return b
 }
 
 // stripHTML reduces HTML to its text content, best effort: tags become

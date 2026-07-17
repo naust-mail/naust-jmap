@@ -2,11 +2,7 @@ package message
 
 import (
 	"bytes"
-	"encoding/base64"
-	"io"
 	"mime"
-	"mime/quotedprintable"
-	"strconv"
 	"strings"
 
 	"golang.org/x/text/unicode/norm"
@@ -16,46 +12,14 @@ import (
 // blow the stack; parts nested deeper are treated as having no children.
 const maxMultipartDepth = 64
 
-// parsePart builds the bodyStructure node for one MIME entity.
-// defaultType applies when the entity has no usable Content-Type
-// ("text/plain", or "message/rfc822" inside multipart/digest, RFC 2046).
-// counter numbers leaf parts depth-first for partId assignment.
-func parsePart(headers []HeaderField, body []byte, defaultType string, counter *int, depth int) *Part {
-	p := &Part{Headers: headers}
-	typ, params, ctPresent := contentType(headers, defaultType)
-	p.Type = typ
-	p.Charset = charsetOf(typ, params, ctPresent)
-	p.Disposition, p.Name = dispositionOf(headers, params)
-	p.Cid = angleValue(headers, "Content-Id")
-	p.Language = languageOf(headers)
-	p.Location = locationOf(headers)
-
-	if strings.HasPrefix(typ, "multipart/") {
-		p.SubParts = []*Part{} // non-nil: partId/blobId are null iff multipart/*
-		boundary := params["boundary"]
-		if boundary == "" || depth >= maxMultipartDepth {
-			return p // unsplittable; keep the declared type with no children
-		}
-		childDefault := "text/plain"
-		if typ == "multipart/digest" {
-			childDefault = "message/rfc822"
-		}
-		for _, sub := range splitMultipart(body, boundary) {
-			subHeaders, subBody := parseHeaderBlock(sub)
-			p.SubParts = append(p.SubParts, parsePart(subHeaders, subBody, childDefault, counter, depth+1))
-		}
-		return p
-	}
-
-	// Leaf part (message/rfc822 included: bodyStructure does not recurse
-	// into embedded messages, RFC 8621 4.1.4).
-	*counter++
-	p.PartID = strconv.Itoa(*counter)
-	decoded, problem := decodeCTE(body, cteOf(headers))
-	p.EncodingProblem = problem
-	sealContent(p, decoded)
-	return p
-}
+// maxParts bounds the total number of body parts a single message yields.
+// maxMultipartDepth caps nesting depth, but not breadth: a bounded-size
+// message can still declare millions of tiny sibling parts, and one Part
+// struct per part balloons a small upload into hundreds of megabytes of
+// heap (roughly 15x). A real message has at most dozens of parts, so this
+// cap is far above anything legitimate; parts beyond it are dropped, the
+// same best-effort truncation maxMultipartDepth uses for over-deep nesting.
+const maxParts = 10000
 
 // contentType returns the canonical media type (lowercase, parameters
 // stripped), its parameters, and whether a Content-Type header field was
@@ -182,33 +146,6 @@ func locationOf(headers []HeaderField) *string {
 	return nil
 }
 
-// splitMultipart splits a multipart body at its boundary delimiters
-// (RFC 2046 5.1.1). The preamble, the epilogue, and everything after the
-// close delimiter are discarded; a missing close delimiter is tolerated.
-func splitMultipart(body []byte, boundary string) [][]byte {
-	delim := []byte("--" + boundary)
-	var parts [][]byte
-	start := -1 // offset of the current part's first byte; -1 = in preamble
-	pos := 0
-	for pos < len(body) {
-		line, next := nextLine(body, pos)
-		if isDelim, isClose := delimiterLine(line, delim); isDelim {
-			if start >= 0 {
-				parts = append(parts, trimPartTail(body[start:pos]))
-			}
-			if isClose {
-				return parts
-			}
-			start = next
-		}
-		pos = next
-	}
-	if start >= 0 {
-		parts = append(parts, trimPartTail(body[start:]))
-	}
-	return parts
-}
-
 // delimiterLine reports whether line is a boundary delimiter and whether
 // it is the close delimiter ("--boundary--"). Trailing white space is
 // permitted per RFC 2046.
@@ -230,47 +167,4 @@ func delimiterLine(line, delim []byte) (bool, bool) {
 func trimPartTail(part []byte) []byte {
 	part = bytes.TrimSuffix(part, []byte("\n"))
 	return bytes.TrimSuffix(part, []byte("\r"))
-}
-
-// decodeCTE removes the Content-Transfer-Encoding. Unknown encodings are
-// treated as identity (RFC 8621 4.1.4) with the problem flag set, feeding
-// EmailBodyValue.isEncodingProblem; decoding damage is likewise flagged.
-func decodeCTE(body []byte, cte string) ([]byte, bool) {
-	switch cte {
-	case "", "7bit", "8bit", "binary":
-		return body, false
-	case "base64":
-		return decodeBase64(body)
-	case "quoted-printable":
-		out, err := io.ReadAll(quotedprintable.NewReader(bytes.NewReader(body)))
-		return out, err != nil
-	default:
-		return body, true
-	}
-}
-
-// decodeBase64 decodes leniently: white space is expected between lines;
-// any other foreign octet is dropped and flagged as a problem.
-func decodeBase64(body []byte) ([]byte, bool) {
-	filtered := make([]byte, 0, len(body))
-	problem := false
-	for _, c := range body {
-		switch {
-		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '+', c == '/':
-			filtered = append(filtered, c)
-		case c == '=', c == ' ', c == '\t', c == '\r', c == '\n':
-			// padding and folding white space: ignored
-		default:
-			problem = true
-		}
-	}
-	if n := len(filtered) % 4; n == 1 { // impossible base64 length
-		filtered = filtered[:len(filtered)-1]
-		problem = true
-	}
-	out, err := base64.RawStdEncoding.DecodeString(string(filtered))
-	if err != nil {
-		return nil, true
-	}
-	return out, problem
 }

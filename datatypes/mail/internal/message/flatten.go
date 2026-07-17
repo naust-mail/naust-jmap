@@ -2,11 +2,12 @@ package message
 
 import "strings"
 
-// flatten decomposes a bodyStructure tree into the textBody, htmlBody, and
+// Flatten decomposes a bodyStructure tree into the textBody, htmlBody, and
 // attachments lists. It is a direct port of the suggested algorithm in
 // RFC 8621 4.1.4 (nil slice pointers play the JS nulls; pushes are
-// nil-guarded where the original would throw on pathological nesting).
-func flatten(root *Part) (textBody, htmlBody, attachments []*Part) {
+// nil-guarded where the original would throw on pathological nesting). It reads
+// only metadata, so it operates on the parser's content-free tree.
+func Flatten(root *Part) (textBody, htmlBody, attachments []*Part) {
 	var tb, hb, ab []*Part
 	tbp, hbp, abp := &tb, &hb, &ab
 	flattenParts([]*Part{root}, "mixed", false, hbp, tbp, abp)
@@ -89,10 +90,10 @@ func flattenParts(parts []*Part, multipartType string, inAlternative bool, htmlB
 	}
 }
 
-// hasAttachment implements the SHOULD rule of RFC 8621 4.1.4: true when
+// HasAttachment implements the SHOULD rule of RFC 8621 4.1.4: true when
 // the attachments list has at least one part that is not
 // Content-Disposition: inline.
-func hasAttachment(attachments []*Part) bool {
+func HasAttachment(attachments []*Part) bool {
 	for _, p := range attachments {
 		if p.Disposition == nil || *p.Disposition != "inline" {
 			return true

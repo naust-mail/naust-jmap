@@ -6,6 +6,8 @@ package jmap
 
 import (
 	"crypto/rand"
+	"encoding/base32"
+	"encoding/binary"
 	"time"
 )
 
@@ -29,21 +31,67 @@ func (id Id) Valid() bool {
 	return true
 }
 
-const idAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+// crockfordAlphabet is Crockford's base32 alphabet: 32 characters drawn from
+// the section 1.2 set, in ascending ASCII order. Because it ascends and
+// base32 encodes most-significant bits first, the lexical order of a
+// fixed-length encoded id equals the numeric order of the bytes it encodes -
+// this is what lets the time- and sequence-based ids below sort by creation
+// order. Being all uppercase, it also sidesteps the section 1.2 caution about
+// ids that differ only by ASCII case.
+const crockfordAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
-// NewId returns a random 17-character Id. Section 1.2 recommends defensive
-// allocation: the first character is always a letter, so ids never start
-// with a dash or digit, are never digit-only, and never spell "NIL".
-func NewId() Id {
-	var b [17]byte
-	if _, err := rand.Read(b[:]); err != nil {
+var crockford = base32.NewEncoding(crockfordAlphabet).WithPadding(base32.NoPadding)
+
+// idPrefix is the single leading letter every server-assigned id carries.
+// Section 1.2 advises a leading alphabetical character so an id never starts
+// with a dash or digit, is never digit-only, and never spells "NIL".
+const idPrefix = "N"
+
+func randomBytes(b []byte) {
+	if _, err := rand.Read(b); err != nil {
 		panic("jmap: crypto/rand failed: " + err.Error())
 	}
-	b[0] = idAlphabet[b[0]%52] // letters only
-	for i := 1; i < len(b); i++ {
-		b[i] = idAlphabet[b[i]%64]
-	}
-	return Id(b[:])
+}
+
+// NewId returns a random Id: the prefix followed by 128 random bits. It has no
+// structure and reveals nothing. Section 1.2 does not require ids to be
+// random; this is the scheme for deployments that want ids to leak neither
+// creation time nor ordering.
+func NewId() Id {
+	var b [16]byte
+	randomBytes(b[:])
+	return Id(idPrefix + crockford.EncodeToString(b[:]))
+}
+
+// NewULID returns a lexically sortable Id in the ULID layout: the prefix
+// followed by a 48-bit millisecond timestamp and 80 random bits. Ids sort by
+// creation time and cluster by time for index locality; the trade-off is that
+// the timestamp is readable by anyone who sees the id.
+func NewULID(now time.Time) Id {
+	var b [16]byte
+	ms := uint64(now.UnixMilli())
+	b[0] = byte(ms >> 40)
+	b[1] = byte(ms >> 32)
+	b[2] = byte(ms >> 24)
+	b[3] = byte(ms >> 16)
+	b[4] = byte(ms >> 8)
+	b[5] = byte(ms)
+	randomBytes(b[6:])
+	return Id(idPrefix + crockford.EncodeToString(b[:]))
+}
+
+// NewSequenceId returns a lexically sortable Id with no embedded wall-clock:
+// the prefix followed by a per-account sequence number, a within-commit index,
+// and 64 random bits. Ids sort by in-account creation order (sequence then
+// index) like a database sequence, while the random tail keeps them from being
+// enumerable and nothing reveals when the record was created. seq and index
+// must be non-negative.
+func NewSequenceId(seq, index int64) Id {
+	var b [20]byte
+	binary.BigEndian.PutUint64(b[0:8], uint64(seq))
+	binary.BigEndian.PutUint32(b[8:12], uint32(index))
+	randomBytes(b[12:])
+	return Id(idPrefix + crockford.EncodeToString(b[:]))
 }
 
 // MaxInt is the upper bound of the Int and UnsignedInt types (RFC 8620

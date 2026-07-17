@@ -38,6 +38,37 @@ func TestSendBlocksPrivate(t *testing.T) {
 	}
 }
 
+// TestRefusePrivateReservedRanges covers the dial-time check directly (dialing
+// these would attempt a real connection): every non-globally-routable range
+// RFC 8620 section 8.6 requires be refused, including the ranges Go's IsPrivate
+// misses (CGNAT, benchmarking, TEST-NETs, future-use, IPv6 documentation and
+// discard), while genuinely external unicast addresses are allowed.
+func TestRefusePrivateReservedRanges(t *testing.T) {
+	blocked := []string{
+		"100.64.0.1:443",    // RFC 6598 CGNAT
+		"192.0.0.1:443",     // RFC 6890 protocol assignments
+		"192.0.2.5:443",     // RFC 5737 TEST-NET-1
+		"198.18.0.1:443",    // RFC 2544 benchmarking
+		"203.0.113.9:443",   // RFC 5737 TEST-NET-3
+		"240.0.0.1:443",     // RFC 1112 reserved for future use
+		"[2001:db8::1]:443", // RFC 3849 IPv6 documentation
+		"[100::1]:443",      // RFC 6666 IPv6 discard
+		"10.1.2.3:443",      // RFC 1918 private (regression, already blocked)
+		"127.0.0.1:443",     // loopback (regression, already blocked)
+	}
+	for _, a := range blocked {
+		if err := refusePrivate("tcp", a, nil); !errors.Is(err, ErrPrivateHost) {
+			t.Errorf("%s: err = %v, want ErrPrivateHost", a, err)
+		}
+	}
+	allowed := []string{"8.8.8.8:443", "[2606:4700:4700::1111]:443"}
+	for _, a := range allowed {
+		if err := refusePrivate("tcp", a, nil); err != nil {
+			t.Errorf("%s: err = %v, want nil (globally routable)", a, err)
+		}
+	}
+}
+
 // TestSendHeaders checks the RFC 8620 section 7.2 POST shape: JSON
 // content type, the RFC 8030 TTL header, and - with keys - a body
 // under the aes128gcm content encoding that the keys decrypt.

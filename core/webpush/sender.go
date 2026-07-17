@@ -24,9 +24,9 @@ var ErrPrivateHost = errors.New("webpush: subscription URL resolves to a private
 
 // Sender POSTs push messages to subscription URLs. The zero value is
 // ready to use and safe: HTTPS only, redirects refused, and
-// connections to private, loopback, link-local, and unspecified
-// addresses blocked at dial time (after DNS resolution, so a rebinding
-// name cannot dodge the check).
+// connections to private, loopback, link-local, unspecified, and other
+// non-routable reserved addresses blocked at dial time (after DNS
+// resolution, so a rebinding name cannot dodge the check).
 type Sender struct {
 	// Client overrides the default HTTP client. A custom client keeps
 	// the HTTPS-only rule but does NOT get the private address blocking
@@ -105,6 +105,26 @@ var defaultClient = sync.OnceValue(func() *http.Client {
 	}
 })
 
+// reservedPrefixes are ranges that are not globally routable unicast and so
+// are never a valid external push endpoint (RFC 8620 section 8.6). The netip
+// predicates in refusePrivate already reject loopback, RFC 1918 private, RFC
+// 4193 unique-local, link-local, multicast, and unspecified addresses; these
+// are the remaining non-routable ranges those predicates miss, each of which
+// can resolve to a host on an internal or carrier network. The shared address
+// space in particular (RFC 6598) is reachable behind carrier-grade NAT and is
+// the practical SSRF gap a bare IsPrivate check leaves open.
+var reservedPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),   // RFC 6598 shared address space (CGNAT)
+	netip.MustParsePrefix("192.0.0.0/24"),    // RFC 6890 IETF protocol assignments
+	netip.MustParsePrefix("192.0.2.0/24"),    // RFC 5737 TEST-NET-1
+	netip.MustParsePrefix("198.18.0.0/15"),   // RFC 2544 benchmarking
+	netip.MustParsePrefix("198.51.100.0/24"), // RFC 5737 TEST-NET-2
+	netip.MustParsePrefix("203.0.113.0/24"),  // RFC 5737 TEST-NET-3
+	netip.MustParsePrefix("240.0.0.0/4"),     // RFC 1112 section 4 reserved for future use
+	netip.MustParsePrefix("2001:db8::/32"),   // RFC 3849 documentation
+	netip.MustParsePrefix("100::/64"),        // RFC 6666 discard-only
+}
+
 // refusePrivate rejects the connection if the resolved address is not
 // externally routable (RFC 8620 section 8.6). Running as a dial
 // control means every connection attempt is checked with the literal
@@ -118,6 +138,11 @@ func refusePrivate(network, address string, _ syscall.RawConn) error {
 	if addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() ||
 		addr.IsLinkLocalMulticast() || addr.IsMulticast() || addr.IsUnspecified() {
 		return ErrPrivateHost
+	}
+	for _, p := range reservedPrefixes {
+		if p.Contains(addr) {
+			return ErrPrivateHost
+		}
 	}
 	return nil
 }

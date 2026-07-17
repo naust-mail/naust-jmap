@@ -27,6 +27,7 @@ import (
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/providers/backend"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
+	"github.com/naust-mail/naust-jmap/core/tuning"
 )
 
 // Subscription is one stored push subscription. Wire-visible
@@ -77,16 +78,12 @@ var (
 	ErrTooMany = errors.New("pushsub: too many subscriptions for this credential")
 )
 
-// DefaultMaxPerCredential is the subscription cap used when Store's
-// MaxPerCredential is zero.
-const DefaultMaxPerCredential = 16
-
 // Store persists subscriptions in a backend.Backend.
 type Store struct {
 	be     backend.Backend
 	leases lease.Manager
 	// MaxPerCredential caps live (unexpired) subscriptions per
-	// credential; zero means DefaultMaxPerCredential.
+	// credential; zero means tuning.MaxPushSubscriptionsPerCredential.
 	MaxPerCredential int
 }
 
@@ -130,7 +127,7 @@ func (st *Store) Create(ctx context.Context, sub *Subscription) error {
 	}
 	limit := st.MaxPerCredential
 	if limit == 0 {
-		limit = DefaultMaxPerCredential
+		limit = tuning.MaxPushSubscriptionsPerCredential
 	}
 	if live >= limit {
 		return ErrTooMany

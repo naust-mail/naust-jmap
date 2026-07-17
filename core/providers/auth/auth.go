@@ -5,6 +5,7 @@
 package auth
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"net/http"
@@ -110,7 +111,13 @@ func (s *Static) Authenticate(r *http.Request) (*Identity, error) {
 	if !found {
 		expected = ""
 	}
-	match := subtle.ConstantTimeCompare([]byte(password), []byte(expected)) == 1
+	// Compare fixed-width digests, not the raw strings: subtle.ConstantTimeCompare
+	// returns early when its inputs differ in length, so comparing the passwords
+	// directly would leak the expected length through timing. Hashing both sides
+	// to 32 octets first makes the comparison length-independent.
+	got := sha256.Sum256([]byte(password))
+	want := sha256.Sum256([]byte(expected))
+	match := subtle.ConstantTimeCompare(got[:], want[:]) == 1
 	if !found || !match {
 		return nil, ErrUnauthenticated
 	}

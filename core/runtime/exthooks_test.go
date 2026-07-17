@@ -125,17 +125,17 @@ func (gadgetFilter) ValidateCondition(name string, value json.RawMessage) error 
 	return UnsupportedFilterError{Description: fmt.Sprintf("cannot filter on %q", name)}
 }
 
-func (gadgetFilter) MatchCondition(obj objectdb.Object, name string, value json.RawMessage) bool {
+func (gadgetFilter) MatchCondition(_ context.Context, _ jmap.Id, obj objectdb.Object, name string, value json.RawMessage) (bool, error) {
 	var want, got string
 	json.Unmarshal(value, &want)
 	json.Unmarshal(obj["subject"], &got)
 	switch name {
 	case "subject":
-		return got == want
+		return got == want, nil
 	case "text":
-		return strings.Contains(got, want)
+		return strings.Contains(got, want), nil
 	}
-	return false
+	return false, nil
 }
 
 func TestExtQueryHooks(t *testing.T) {

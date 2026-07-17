@@ -59,6 +59,9 @@ func MailboxType() *descriptor.Type {
 // AccountCapability.
 func RegisterMailbox(p *runtime.Processor, db *objectdb.DB, core jmap.CoreCapabilities) error {
 	ext := &runtime.Extensions{
+		// Mailbox has no /copy: RFC 8621 defines cross-account copy only
+		// for Email (section 2 lists get/changes/query/queryChanges/set).
+		Methods: []string{"get", "changes", "set", "query", "queryChanges"},
 		DefaultGetProperties: []string{
 			"name", "parentId", "role", "sortOrder", "totalEmails",
 			"unreadEmails", "totalThreads", "unreadThreads", "myRights",
@@ -327,7 +330,9 @@ func mailboxDestroy(u *objectdb.Update, id jmap.Id, extra map[string]json.RawMes
 		if string(extra["onDestroyRemoveEmails"]) != "true" {
 			return &jmap.SetError{Type: "mailboxHasEmail", Description: "mailbox still contains emails"}, nil
 		}
-		return nil, errors.New("mail: onDestroyRemoveEmails cascade is not implemented yet")
+		if err := mailboxRemoveEmails(u, id); err != nil {
+			return nil, err
+		}
 	}
 	return nil, nil
 }
@@ -399,32 +404,34 @@ func (mailboxFilter) ValidateCondition(name string, value json.RawMessage) error
 	return nil
 }
 
-func (mailboxFilter) MatchCondition(obj objectdb.Object, name string, value json.RawMessage) bool {
+// MatchCondition needs no I/O: every Mailbox condition reads the record in
+// hand, so ctx and acct are unused.
+func (mailboxFilter) MatchCondition(_ context.Context, _ jmap.Id, obj objectdb.Object, name string, value json.RawMessage) (bool, error) {
 	switch name {
 	case "parentId", "role":
 		stored := obj[name]
 		if isNullRaw(value) {
-			return stored == nil || isNullRaw(stored)
+			return stored == nil || isNullRaw(stored), nil
 		}
 		want, _ := decodeString(value)
 		got, ok := decodeString(stored)
-		return ok && got == want
+		return ok && got == want, nil
 	case "name":
 		want, _ := decodeString(value)
 		got, _ := decodeString(obj["name"])
-		return strings.Contains(got, want)
+		return strings.Contains(got, want), nil
 	case "hasAnyRole":
 		var want bool
 		json.Unmarshal(value, &want)
 		role := obj["role"]
-		return (role != nil && !isNullRaw(role)) == want
+		return (role != nil && !isNullRaw(role)) == want, nil
 	case "isSubscribed":
 		var want, got bool
 		json.Unmarshal(value, &want)
 		json.Unmarshal(obj["isSubscribed"], &got)
-		return got == want
+		return got == want, nil
 	}
-	return false
+	return false, nil
 }
 
 // mailboxArrange implements the sortAsTree and filterAsTree /query

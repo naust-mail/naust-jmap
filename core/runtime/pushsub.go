@@ -24,30 +24,8 @@ import (
 	"github.com/naust-mail/naust-jmap/core/objectdb"
 	"github.com/naust-mail/naust-jmap/core/providers/notify"
 	"github.com/naust-mail/naust-jmap/core/pushsub"
+	"github.com/naust-mail/naust-jmap/core/tuning"
 	"github.com/naust-mail/naust-jmap/core/webpush"
-)
-
-const (
-	// subMaxLifetime caps a push subscription's expiry. The server sets
-	// it when the client gives none and clamps client values beyond it.
-	// Section 7.2 requires at least 48 hours and recommends at least 7
-	// days for non-time-bounded credentials (Basic auth, API tokens);
-	// this runtime has no view into credential lifetimes, so it always
-	// applies the non-time-bounded policy.
-	subMaxLifetime = 7 * 24 * time.Hour
-	// pushTTL is the RFC 8030 section 5.2 TTL header value, in seconds,
-	// on every POST. A StateChange stays true until the next one - and
-	// the next one replaces it - so a long retention is harmless.
-	pushTTL = 43200
-	// backoff429 is how long delivery pauses after a 429: section 7.2
-	// requires reducing push frequency, and pending changes coalesce
-	// into one minimal StateChange while paused.
-	backoff429 = time.Minute
-	// createRateMax/createRateWindow bound subscription creation per
-	// credential (section 8.6 requires a creation rate limit: every
-	// create sends an unsolicited POST to a client-chosen URL).
-	createRateMax    = 10
-	createRateWindow = time.Hour
 )
 
 type pushSupport struct {
@@ -478,9 +456,9 @@ func (p *pushSupport) decodeTypes(raw json.RawMessage, out *[]string) *jmap.SetE
 }
 
 // clampExpiry applies the section 7.2 expiry policy: no client value
-// (or one beyond the maximum) becomes now+subMaxLifetime.
+// (or one beyond the maximum) becomes now+tuning.PushSubscriptionMaxLifetime.
 func clampExpiry(want string) string {
-	max := time.Now().UTC().Add(subMaxLifetime).Truncate(time.Second)
+	max := time.Now().UTC().Add(tuning.PushSubscriptionMaxLifetime).Truncate(time.Second)
 	if want != "" {
 		if t, err := time.Parse(time.RFC3339, want); err == nil && t.Before(max) {
 			return want
@@ -506,11 +484,11 @@ func (p *pushSupport) allowCreate(credential string) bool {
 	defer p.mu.Unlock()
 	recent := p.rates[credential][:0]
 	for _, t := range p.rates[credential] {
-		if now.Sub(t) < createRateWindow {
+		if now.Sub(t) < tuning.PushSubscriptionCreateRateWindow {
 			recent = append(recent, t)
 		}
 	}
-	if len(recent) >= createRateMax {
+	if len(recent) >= tuning.PushSubscriptionCreateRateMax {
 		p.rates[credential] = recent
 		return false
 	}
@@ -537,7 +515,7 @@ func (p *pushSupport) sendVerification(sub *pushsub.Subscription) {
 		defer p.wg.Done()
 		ctx, cancel := context.WithTimeout(p.ctx, 30*time.Second)
 		defer cancel()
-		_, _ = p.sender.Send(ctx, sub.URL, sub.Keys, payload, pushTTL)
+		_, _ = p.sender.Send(ctx, sub.URL, sub.Keys, payload, tuning.PushDeliveryTTL)
 	}()
 }
 
@@ -604,7 +582,7 @@ func (p *pushSupport) watch(ctx context.Context, w *subWatcher, credential strin
 		if err != nil {
 			continue
 		}
-		status, err := p.sender.Send(ctx, sub.URL, sub.Keys, payload, pushTTL)
+		status, err := p.sender.Send(ctx, sub.URL, sub.Keys, payload, tuning.PushDeliveryTTL)
 		if err != nil {
 			continue // push is lossy by design; the client resyncs
 		}
@@ -612,7 +590,7 @@ func (p *pushSupport) watch(ctx context.Context, w *subWatcher, credential strin
 		// during the pause coalesce into the next StateChange.
 		if status == 429 {
 			select {
-			case <-time.After(backoff429):
+			case <-time.After(tuning.PushDelivery429Backoff):
 			case <-ctx.Done():
 				return
 			}

@@ -19,6 +19,7 @@ import (
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
 	"github.com/naust-mail/naust-jmap/core/providers/auth"
+	"github.com/naust-mail/naust-jmap/core/providers/backend"
 	"github.com/naust-mail/naust-jmap/core/providers/blob"
 )
 
@@ -85,38 +86,78 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.core.MaxSizeUpload))
+	// Stream the body straight into the blob store rather than buffering it
+	// whole: the store computes the content-addressed id from the bytes at
+	// Commit. The size cap is still enforced here (MaxBytesReader) so an
+	// over-limit body is refused with the maxSizeUpload error.
+	bw, err := s.blobs.store.Create(r.Context(), acct)
 	if err != nil {
-		writeProblem(w, jmap.RequestError{
-			Type: jmap.ProblemLimit, Status: http.StatusRequestEntityTooLarge,
-			Limit:  "maxSizeUpload",
-			Detail: "upload exceeds maxSizeUpload",
-		})
-		return
-	}
-	blobID := blob.IdFor(data)
-	if err := s.blobs.store.Put(r.Context(), acct, blobID, data); err != nil {
 		writeProblem(w, jmap.RequestError{
 			Type: "about:blank", Status: http.StatusInternalServerError,
 			Detail: "storing blob failed",
 		})
 		return
 	}
-	// The record makes the blob exist; a reupload of identical content
-	// reuses the blobId (content addressing) and resets its expiry.
-	if err := s.blobs.db.RecordBlobUpload(r.Context(), acct, blobID, ident.Username, time.Now()); err != nil {
+	committed := false
+	defer func() {
+		if !committed {
+			_ = bw.Abort()
+		}
+	}()
+	n, err := io.Copy(bw, http.MaxBytesReader(w, r.Body, s.core.MaxSizeUpload))
+	if err != nil {
+		// The streaming copy surfaces either a body that overran the cap (a
+		// client error, 413) or a backend fault while the bytes were being
+		// stored (a server error); only the former is "too large".
+		var tooLarge *http.MaxBytesError
+		switch {
+		case errors.As(err, &tooLarge):
+			writeProblem(w, jmap.RequestError{
+				Type: jmap.ProblemLimit, Status: http.StatusRequestEntityTooLarge,
+				Limit:  "maxSizeUpload",
+				Detail: "upload exceeds maxSizeUpload",
+			})
+		case errors.Is(err, backend.ErrNoSpace):
+			writeProblem(w, jmap.RequestError{
+				Type: "about:blank", Status: http.StatusInsufficientStorage,
+				Detail: "storage is full",
+			})
+		default:
+			writeProblem(w, jmap.RequestError{
+				Type: "about:blank", Status: http.StatusInternalServerError,
+				Detail: "storing blob failed",
+			})
+		}
+		return
+	}
+	// Record the upload and publish the content as one lease-held step: the
+	// record is written before the content so a crash cannot strand
+	// published bytes that no record covers, and the account lease is held
+	// across both so a concurrent blob sweep cannot delete the content out
+	// from under the finalize. A reupload of identical content reuses the
+	// blobId (content addressing) and resets its expiry.
+	blobID, err := s.blobs.db.FinalizeBlobUpload(r.Context(), acct, bw, ident.Username, time.Now())
+	if err != nil {
+		if errors.Is(err, backend.ErrNoSpace) {
+			writeProblem(w, jmap.RequestError{
+				Type: "about:blank", Status: http.StatusInsufficientStorage,
+				Detail: "storage is full",
+			})
+			return
+		}
 		writeProblem(w, jmap.RequestError{
 			Type: "about:blank", Status: http.StatusInternalServerError,
-			Detail: "recording upload failed",
+			Detail: "storing blob failed",
 		})
 		return
 	}
+	committed = true
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(jmap.UploadResponse{
 		AccountId: acct,
 		BlobId:    blobID,
 		Type:      sanitizeMediaType(r.Header.Get("Content-Type")),
-		Size:      int64(len(data)),
+		Size:      n,
 	})
 }
 
@@ -152,8 +193,8 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	rc, size, err := s.blobs.open(r.Context(), acct, blobID, ident)
-	if errors.Is(err, objectdb.ErrNotFound) || errors.Is(err, blob.ErrNotFound) {
+	rc, size, err := OpenBlob(r.Context(), s.blobs.db, s.blobs.store, acct, blobID, ident)
+	if errors.Is(err, blob.ErrNotFound) {
 		writeProblem(w, jmap.RequestError{
 			Type: "about:blank", Status: http.StatusNotFound,
 			Detail: "blob not found",
@@ -177,24 +218,39 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, rc)
 }
 
-// open fetches a blob's content after the access rule of section 6.1:
-// an unreferenced blob is only accessible to its uploaders, even in
-// shared accounts (referenced blobs follow the account's own access,
-// already checked). Denials read as not-found so probing reveals
-// nothing.
-func (bs *blobSupport) open(ctx context.Context, acct, blobID jmap.Id, ident *auth.Identity) (io.ReadCloser, int64, error) {
-	rec, err := bs.db.BlobUpload(ctx, acct, blobID)
+// OpenBlob fetches a blob's content for a client-supplied blobId, applying
+// the checks every client-facing blob read shares: the id must be a
+// syntactically valid Id (RFC 8620 section 1.2) before it reaches any store,
+// the account must hold an upload record for it (record presence is the
+// existence test for a blob in an account), and an unreferenced blob is only
+// accessible to its uploaders, even in shared accounts (section 6.1;
+// referenced blobs follow the account's own access, already checked). Every
+// denial reads as blob.ErrNotFound so probing reveals nothing: absent,
+// invalid, and not-yours are indistinguishable.
+//
+// The download endpoint and Blob/copy go through it. A custom method that
+// accepts a blobId from the client (Email/parse, Email/import) must open the
+// blob through this function, never through the store directly - ids taken
+// from stored records are the only ones a raw store read is safe for.
+func OpenBlob(ctx context.Context, db *objectdb.DB, store blob.Store, acct, blobID jmap.Id, ident *auth.Identity) (io.ReadCloser, int64, error) {
+	if !blobID.Valid() {
+		return nil, 0, blob.ErrNotFound
+	}
+	rec, err := db.BlobUpload(ctx, acct, blobID)
+	if errors.Is(err, objectdb.ErrNotFound) {
+		return nil, 0, blob.ErrNotFound
+	}
 	if err != nil {
 		return nil, 0, err
 	}
-	referenced, err := bs.db.BlobReferenced(ctx, acct, blobID)
+	referenced, err := db.BlobReferenced(ctx, acct, blobID)
 	if err != nil {
 		return nil, 0, err
 	}
-	if !referenced && !slices.Contains(rec.Uploaders, ident.Username) {
-		return nil, 0, objectdb.ErrNotFound
+	if !referenced && (ident == nil || !slices.Contains(rec.Uploaders, ident.Username)) {
+		return nil, 0, blob.ErrNotFound
 	}
-	return bs.store.Open(ctx, acct, blobID)
+	return store.Open(ctx, acct, blobID)
 }
 
 // sanitizeMediaType parses a client-supplied media type and returns a
@@ -240,7 +296,7 @@ func (bs *blobSupport) copy(ctx context.Context, call *Call) []jmap.Invocation {
 	}
 	resp := blobCopyResponse{FromAccountId: a.FromAccountId, AccountId: a.AccountId}
 	for _, blobID := range a.BlobIds {
-		serr, err := bs.copyOne(ctx, a.FromAccountId, a.AccountId, blobID, call.Identity)
+		newID, serr, err := bs.copyOne(ctx, a.FromAccountId, a.AccountId, blobID, call.Identity)
 		if err != nil {
 			return fail(call.CallID, jmap.ErrServerFail, err.Error())
 		}
@@ -254,35 +310,51 @@ func (bs *blobSupport) copy(ctx context.Context, call *Call) []jmap.Invocation {
 		if resp.Copied == nil {
 			resp.Copied = make(map[jmap.Id]jmap.Id)
 		}
-		// Content addressing keeps the id stable across accounts, so the
-		// copied blob keeps its blobId (the spec lets the server pick).
-		resp.Copied[blobID] = blobID
+		// The target id is recomputed from the copied bytes; content
+		// addressing keeps it equal to the source id (the spec lets the
+		// server pick the id in the target account).
+		resp.Copied[blobID] = newID
 	}
 	return reply("Blob/copy", call.CallID, resp)
 }
 
-func (bs *blobSupport) copyOne(ctx context.Context, from, to, blobID jmap.Id, ident *auth.Identity) (*jmap.SetError, error) {
+func (bs *blobSupport) copyOne(ctx context.Context, from, to, blobID jmap.Id, ident *auth.Identity) (jmap.Id, *jmap.SetError, error) {
 	// Same access rule as download; a source blob the caller may not
 	// read is notFound (section 6.3 defines notFound for missing ids).
-	rc, _, err := bs.open(ctx, from, blobID, ident)
-	if errors.Is(err, objectdb.ErrNotFound) || errors.Is(err, blob.ErrNotFound) {
-		return &jmap.SetError{Type: jmap.SetErrNotFound}, nil
+	rc, _, err := OpenBlob(ctx, bs.db, bs.store, from, blobID, ident)
+	if errors.Is(err, blob.ErrNotFound) {
+		return "", &jmap.SetError{Type: jmap.SetErrNotFound}, nil
 	}
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	defer rc.Close()
-	data, err := io.ReadAll(rc)
+
+	// Stream the source into the target account rather than buffering the
+	// whole blob in memory: a large blob is copied one piece at a time.
+	// The content address is recomputed as the bytes flow, so the copy
+	// keeps the source blobId (RFC 8620 section 6.3).
+	w, err := bs.store.Create(ctx, to)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	if err := bs.store.Put(ctx, to, blobID, data); err != nil {
-		return nil, err
+	committed := false
+	defer func() {
+		if !committed {
+			_ = w.Abort()
+		}
+	}()
+	if _, err := io.Copy(w, rc); err != nil {
+		return "", nil, err
 	}
-	// The copy is an upload into the target account: it exists there
-	// unreferenced, uploader-only, on the GC clock, like any upload.
-	if err := bs.db.RecordBlobUpload(ctx, to, blobID, ident.Username, time.Now()); err != nil {
-		return nil, err
+	// The copy is an upload into the target account: recorded before the
+	// content is published and under the account lease, like handleUpload,
+	// so it exists there unreferenced, uploader-only, on the GC clock
+	// without a finalize-versus-sweep race.
+	newID, err := bs.db.FinalizeBlobUpload(ctx, to, w, ident.Username, time.Now())
+	if err != nil {
+		return "", nil, err
 	}
-	return nil, nil
+	committed = true
+	return newID, nil, nil
 }

@@ -29,11 +29,18 @@ func TestStaticAuthenticate(t *testing.T) {
 		t.Errorf("access = %+v", ident.Accounts)
 	}
 
+	// Wrong passwords are rejected regardless of length: the comparison
+	// hashes both sides to a fixed width first, so a same-length, a shorter,
+	// and a much longer guess all fail the same way (and none can be told
+	// apart from the others by timing).
 	for name, r := range map[string]*http.Request{
-		"no credentials": req("", "", false),
-		"wrong password": req("alice", "nope", true),
-		"unknown user":   req("bob", "pw1", true),
-		"empty password": req("alice", "", true),
+		"no credentials":     req("", "", false),
+		"wrong same length":  req("alice", "pw2", true),
+		"wrong shorter":      req("alice", "p", true),
+		"wrong much longer":  req("alice", "pw1pw1pw1pw1pw1pw1pw1", true),
+		"unknown user":       req("bob", "pw1", true),
+		"empty password":     req("alice", "", true),
+		"empty pass unknown": req("bob", "", true),
 	} {
 		if _, err := s.Authenticate(r); err != ErrUnauthenticated {
 			t.Errorf("%s: err = %v, want ErrUnauthenticated", name, err)

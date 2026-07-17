@@ -43,8 +43,8 @@ type AccountCapability struct {
 }
 
 // DefaultAccountCapability returns the capability object matching what
-// this package enforces. EmailQuerySortOptions stays empty until
-// Email/query lands.
+// this package enforces. EmailQuerySortOptions advertises exactly the
+// Email/query sort properties emailSort implements (RFC 8621 section 4.4.2).
 func DefaultAccountCapability() AccountCapability {
 	depth := int64(maxMailboxDepth)
 	return AccountCapability{
@@ -52,7 +52,7 @@ func DefaultAccountCapability() AccountCapability {
 		MaxMailboxDepth:            &depth,
 		MaxSizeMailboxName:         maxSizeMailboxName,
 		MaxSizeAttachmentsPerEmail: 50_000_000,
-		EmailQuerySortOptions:      []string{},
+		EmailQuerySortOptions:      append([]string(nil), emailSortProps...),
 		MayCreateTopLevelMailbox:   true,
 	}
 }

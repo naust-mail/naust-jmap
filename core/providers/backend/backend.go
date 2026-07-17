@@ -24,6 +24,11 @@ var ErrNotFound = errors.New("backend: key not found")
 // match; the batch must have applied nothing.
 var ErrAssertFailed = errors.New("backend: assertion failed")
 
+// ErrNoSpace is returned by WriteBatch when applying the batch would exceed
+// a backend's configured capacity; like a failed Assert, the batch must have
+// applied nothing. A backend without a capacity limit never returns it.
+var ErrNoSpace = errors.New("backend: capacity exceeded")
+
 // Backend is the six-operation storage contract. Keys are ordered by
 // bytes.Compare; values are opaque.
 type Backend interface {

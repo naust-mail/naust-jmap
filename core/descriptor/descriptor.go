@@ -34,6 +34,15 @@ const (
 	KindDate
 	// KindId is a section 1.2 Id string.
 	KindId
+	// KindObject is a JSON object with opaque contents: the descriptor
+	// validates only that the value is an object (RFC 8620 has these
+	// throughout - PushSubscription.keys, Email's "Id[Boolean]"
+	// mailboxIds). A plugin's Set.Validate hook enforces what the members
+	// mean; a PatchObject pointer may address one member (section 5.3).
+	KindObject
+	// KindArray is a JSON array with opaque contents: validated only as an
+	// array (Email's "EmailAddress[]" from, "String[]" references).
+	KindArray
 )
 
 // Property describes one property of an object type.
@@ -50,6 +59,17 @@ type Property struct {
 	// Indexed properties get an order-preserving index maintained
 	// in-commit, making them cheap /query filters and sorts.
 	Indexed bool
+	// SetIndexed marks a composite property (KindObject or KindArray)
+	// whose members are reverse-indexed in-commit: one index entry per
+	// member, so "which records contain member X" is a range scan
+	// (objectdb.IdsWhereMember). Members are the object's keys for a
+	// KindObject (the Id[Boolean]/String[Boolean] maps: mailboxIds,
+	// keywords) and the string elements for a KindArray (Email's msgid
+	// lists). Unlike Indexed, there is no ordering - membership only -
+	// so it is the composite counterpart of Indexed, not a substitute
+	// for it. The blob reference index is the same shape specialized to
+	// BlobRef properties.
+	SetIndexed bool
 	// BlobRef marks a KindId property whose value is a blobId (RFC 8620
 	// section 6). The runtime rejects creates/updates referencing a blob
 	// that does not exist in the account (a dangling foreign key is
@@ -62,6 +82,15 @@ type Property struct {
 	// A stored null is distinct from an absent property: it appears as
 	// null in /get responses and sorts before every non-null value.
 	Nullable bool
+	// Internal marks a property the runtime maintains for its own use -
+	// typically an Indexed or SetIndexed value a datatype derives to make
+	// a lookup cheap (Email's threadKeys) - that is not part of the type's
+	// public schema. It is invisible to the client-facing method layer:
+	// never returned or requestable in /get, not settable in /set (create
+	// or patch), and not a valid /query filter property. The object
+	// database still indexes and stores it like any other property; only
+	// the protocol surface hides it.
+	Internal bool
 	// Default, if non-nil, is the value used when a create omits the
 	// property and the value restored when a patch sets it to null
 	// (section 5.3). Properties without a default are removed by null.
@@ -91,11 +120,24 @@ func (t *Type) Validate() error {
 		if name == "" {
 			return fmt.Errorf("descriptor: %s has an empty property name", t.Name)
 		}
-		if p.Kind < KindString || p.Kind > KindId {
+		if p.Kind < KindString || p.Kind > KindArray {
 			return fmt.Errorf("descriptor: %s.%s has unknown kind", t.Name, name)
 		}
 		if p.BlobRef && p.Kind != KindId {
 			return fmt.Errorf("descriptor: %s.%s is BlobRef but not KindId", t.Name, name)
+		}
+		if p.Indexed && (p.Kind == KindObject || p.Kind == KindArray) {
+			// Composite values have no order-preserving encoding; the
+			// index machinery would have nothing to sort them by.
+			return fmt.Errorf("descriptor: %s.%s is a composite kind and cannot be Indexed", t.Name, name)
+		}
+		if p.SetIndexed && p.Kind != KindObject && p.Kind != KindArray {
+			// A set index reverse-indexes members; only composite kinds
+			// have members to enumerate.
+			return fmt.Errorf("descriptor: %s.%s is SetIndexed but not a composite kind", t.Name, name)
+		}
+		if p.Indexed && p.SetIndexed {
+			return fmt.Errorf("descriptor: %s.%s cannot be both Indexed and SetIndexed", t.Name, name)
 		}
 		if p.Default != nil {
 			if err := p.CheckValue(p.Default); err != nil {
@@ -150,6 +192,16 @@ func (p Property) CheckValue(raw json.RawMessage) error {
 		var id jmap.Id
 		if err := json.Unmarshal(raw, &id); err != nil || !id.Valid() {
 			return fmt.Errorf("not an Id")
+		}
+	case KindObject:
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return fmt.Errorf("not an object")
+		}
+	case KindArray:
+		var a []json.RawMessage
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return fmt.Errorf("not an array")
 		}
 	default:
 		return fmt.Errorf("unknown kind")

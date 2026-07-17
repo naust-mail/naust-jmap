@@ -19,13 +19,8 @@ import (
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/providers/notify"
+	"github.com/naust-mail/naust-jmap/core/tuning"
 )
-
-// maxPingInterval is the ceiling requested ping intervals are clamped
-// to, in seconds. Section 7.3 forbids a maximum allowed value under
-// 300; there is no floor because the section only forbids a minimum
-// above 30 and this server imposes no minimum at all.
-const maxPingInterval = 3600
 
 func (s *Server) handleEventSource(w http.ResponseWriter, r *http.Request) {
 	if s.push == nil {
@@ -63,8 +58,8 @@ func (s *Server) handleEventSource(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "ping must be a non-negative integer number of seconds", http.StatusBadRequest)
 		return
 	}
-	if ping > maxPingInterval {
-		ping = maxPingInterval
+	if ping > tuning.EventSourceMaxPingInterval {
+		ping = tuning.EventSourceMaxPingInterval
 	}
 
 	flusher, canFlush := w.(http.Flusher)

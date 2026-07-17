@@ -14,13 +14,30 @@ import (
 
 // Store implements backend.Backend over a mutex-guarded map.
 type Store struct {
-	mu   sync.RWMutex
-	data map[string][]byte
+	mu       sync.RWMutex
+	data     map[string][]byte
+	capacity int64 // 0 = unlimited
+	used     int64 // sum of stored value sizes, maintained by WriteBatch
+}
+
+// Option configures a Store.
+type Option func(*Store)
+
+// WithCapacity bounds the total stored value bytes: a WriteBatch that would
+// push the total over n fails with backend.ErrNoSpace and applies nothing,
+// so the in-memory backend rejects rather than growing without limit. n <= 0
+// leaves it unlimited.
+func WithCapacity(n int64) Option {
+	return func(s *Store) { s.capacity = n }
 }
 
 // New returns an empty in-memory backend.
-func New() *Store {
-	return &Store{data: make(map[string][]byte)}
+func New(opts ...Option) *Store {
+	s := &Store{data: make(map[string][]byte)}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // Get implements backend.Backend.
@@ -111,6 +128,26 @@ func (s *Store) WriteBatch(_ context.Context, b *backend.Batch) error {
 			pending[k] = staged{value: backend.EncodeInt64(base + op.Delta)}
 		}
 	}
+	// Capacity check: sum the net change in stored value bytes and reject the
+	// whole batch if it would exceed the limit, so nothing is applied (like a
+	// failed Assert). Only value bytes are counted; keys are small relative to
+	// the blob values this bounds.
+	if s.capacity > 0 {
+		var delta int64
+		for k, st := range pending {
+			old := int64(len(s.data[k]))
+			var next int64
+			if !st.deleted {
+				next = int64(len(st.value))
+			}
+			delta += next - old
+		}
+		if s.used+delta > s.capacity {
+			return backend.ErrNoSpace
+		}
+		s.used += delta
+	}
+
 	for k, st := range pending {
 		if st.deleted {
 			delete(s.data, k)

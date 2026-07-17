@@ -83,10 +83,10 @@ K
 epilogue is discarded
 `
 
-func partContents(parts []*Part) []string {
+func partContents(d *doc, parts []*Part) []string {
 	var out []string
 	for _, p := range parts {
-		s := string(p.Decoded)
+		s := string(d.Content[p])
 		if i := strings.IndexByte(s, '\r'); i >= 0 { // first line marker
 			s = s[:i]
 		}
@@ -99,15 +99,15 @@ func partContents(parts []*Part) []string {
 }
 
 func TestAKDecomposition(t *testing.T) {
-	m := Parse([]byte(crlf(akMessage)))
-	if got, want := strings.Join(partContents(m.TextBody), ""), "ABCDK"; got != want {
-		t.Errorf("textBody = %v, want A B C D K", partContents(m.TextBody))
+	m := parseDoc(t, []byte(crlf(akMessage)))
+	if got, want := strings.Join(partContents(m, m.TextBody), ""), "ABCDK"; got != want {
+		t.Errorf("textBody = %v, want A B C D K", partContents(m, m.TextBody))
 	}
-	if got, want := strings.Join(partContents(m.HTMLBody), ""), "AEK"; got != want {
-		t.Errorf("htmlBody = %v, want A E K", partContents(m.HTMLBody))
+	if got, want := strings.Join(partContents(m, m.HTMLBody), ""), "AEK"; got != want {
+		t.Errorf("htmlBody = %v, want A E K", partContents(m, m.HTMLBody))
 	}
-	if got, want := strings.Join(partContents(m.Attachments), ""), "CFGHJ"; got != want {
-		t.Errorf("attachments = %v, want C F G H J", partContents(m.Attachments))
+	if got, want := strings.Join(partContents(m, m.Attachments), ""), "CFGHJ"; got != want {
+		t.Errorf("attachments = %v, want C F G H J", partContents(m, m.Attachments))
 	}
 	if !m.HasAttachment {
 		t.Error("hasAttachment = false, want true (G, H, J are not inline)")
@@ -122,20 +122,70 @@ func TestAKDecomposition(t *testing.T) {
 	}
 	// Leaf partIds are assigned depth-first.
 	a := root.SubParts[0]
-	if a.PartID != "1" || a.Type != "text/plain" || string(a.Decoded) != "A" {
-		t.Errorf("part A: id=%q type=%q content=%q", a.PartID, a.Type, a.Decoded)
+	if a.PartID != "1" || a.Type != "text/plain" || string(m.Content[a]) != "A" {
+		t.Errorf("part A: id=%q type=%q content=%q", a.PartID, a.Type, m.Content[a])
 	}
 	k := root.SubParts[2]
-	if k.PartID != "10" || string(k.Decoded) != "K" {
-		t.Errorf("part K: id=%q content=%q", k.PartID, k.Decoded)
+	if k.PartID != "10" || string(m.Content[k]) != "K" {
+		t.Errorf("part K: id=%q content=%q", k.PartID, m.Content[k])
 	}
 	// message/rfc822 is a leaf: no recursion into the embedded message.
 	j := root.SubParts[1].SubParts[3]
 	if j.Type != "message/rfc822" || j.SubParts != nil || j.PartID != "9" {
 		t.Errorf("part J: type=%q partId=%q subparts=%v", j.Type, j.PartID, j.SubParts)
 	}
-	if !strings.Contains(string(j.Decoded), "Subject: an attached message") {
-		t.Errorf("part J content lost embedded headers: %q", j.Decoded)
+	if !strings.Contains(string(m.Content[j]), "Subject: an attached message") {
+		t.Errorf("part J content lost embedded headers: %q", m.Content[j])
+	}
+}
+
+// TestMaxPartsCap guards against the memory-amplification DoS: a message may
+// declare far more body parts than maxParts, but the parser must build no more
+// than maxParts of them (one Part struct per part is what blows up the heap).
+func TestMaxPartsCap(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("Content-Type: multipart/mixed; boundary=b\r\n\r\n")
+	declared := maxParts * 3
+	for i := 0; i < declared; i++ {
+		b.WriteString("--b\r\nContent-Type: text/plain\r\n\r\nx\r\n")
+	}
+	b.WriteString("--b--\r\n")
+
+	m := parseDoc(t, []byte(b.String()))
+	// The root plus its children must not exceed the cap, and the surplus is
+	// dropped rather than parsed.
+	total := 1 + len(m.Root.SubParts)
+	if total > maxParts {
+		t.Errorf("parsed %d parts, want <= maxParts (%d)", total, maxParts)
+	}
+	if len(m.Root.SubParts) >= declared {
+		t.Errorf("parser did not cap: built %d of %d declared parts", len(m.Root.SubParts), declared)
+	}
+}
+
+// TestHeaderFoldCap guards against the folding DoS: a field folded across a
+// huge number of continuation lines must parse quickly (a Builder, not
+// repeated string concatenation that is O(n^2)) and its value is capped at
+// maxHeaderValue. A regression to the quadratic form would make this hang.
+func TestHeaderFoldCap(t *testing.T) {
+	raw := "Subject: x\r\n" + strings.Repeat(" x\r\n", 500000) + "\r\nbody\r\n"
+	m := parseDoc(t, []byte(raw))
+	if got := len(m.Headers[0].Value); got > maxHeaderValue {
+		t.Errorf("folded value = %d bytes, want <= maxHeaderValue (%d)", got, maxHeaderValue)
+	}
+}
+
+// TestHeaderCountCap guards header-count breadth: a block declaring far more
+// fields than maxHeaders keeps at most maxHeaders of them.
+func TestHeaderCountCap(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i < maxHeaders*3; i++ {
+		b.WriteString("X-H: v\r\n")
+	}
+	b.WriteString("\r\nbody\r\n")
+	m := parseDoc(t, []byte(b.String()))
+	if len(m.Headers) > maxHeaders {
+		t.Errorf("kept %d headers, want <= maxHeaders (%d)", len(m.Headers), maxHeaders)
 	}
 }
 
@@ -145,7 +195,7 @@ Subject: hi
 
 body text
 `)
-	m := Parse([]byte(raw))
+	m := parseDoc(t, []byte(raw))
 	p := m.Root
 	if p.Type != "text/plain" || p.PartID != "1" || p.SubParts != nil {
 		t.Fatalf("root: type=%q partId=%q", p.Type, p.PartID)
@@ -153,8 +203,8 @@ body text
 	if p.Charset == nil || *p.Charset != "us-ascii" {
 		t.Errorf("implicit charset = %v, want us-ascii", p.Charset)
 	}
-	if string(p.Decoded) != "body text\r\n" || p.Size != 11 {
-		t.Errorf("content = %q size=%d", p.Decoded, p.Size)
+	if string(m.Content[p]) != "body text\r\n" || p.Size != 11 {
+		t.Errorf("content = %q size=%d", m.Content[p], p.Size)
 	}
 	if len(p.Headers) != 2 || p.Headers[0].Name != "From" || p.Headers[1].Value != " hi" {
 		t.Errorf("headers = %#v", p.Headers)
@@ -168,19 +218,19 @@ body text
 }
 
 func TestCharsetRules(t *testing.T) {
-	m := Parse([]byte(crlf(`Content-Type: text/plain; charset=UTF-8
+	m := parseDoc(t, []byte(crlf(`Content-Type: text/plain; charset=UTF-8
 
 x`)))
 	if m.Root.Charset == nil || *m.Root.Charset != "UTF-8" {
 		t.Errorf("explicit charset = %v", m.Root.Charset)
 	}
-	m = Parse([]byte(crlf(`Content-Type: application/pdf
+	m = parseDoc(t, []byte(crlf(`Content-Type: application/pdf
 
 x`)))
 	if m.Root.Charset != nil {
 		t.Errorf("non-text charset = %q, want nil", *m.Root.Charset)
 	}
-	m = Parse([]byte(crlf(`Content-Type: text/html
+	m = parseDoc(t, []byte(crlf(`Content-Type: text/html
 
 x`)))
 	if m.Root.Charset == nil || *m.Root.Charset != "us-ascii" {
@@ -189,27 +239,27 @@ x`)))
 }
 
 func TestTransferDecoding(t *testing.T) {
-	m := Parse([]byte(crlf(`Content-Transfer-Encoding: base64
+	m := parseDoc(t, []byte(crlf(`Content-Transfer-Encoding: base64
 
 aGVsbG8g
 d29ybGQ=
 `)))
-	if string(m.Root.Decoded) != "hello world" || m.Root.EncodingProblem {
-		t.Errorf("base64: %q problem=%v", m.Root.Decoded, m.Root.EncodingProblem)
+	if string(m.Content[m.Root]) != "hello world" || m.Root.EncodingProblem {
+		t.Errorf("base64: %q problem=%v", m.Content[m.Root], m.Root.EncodingProblem)
 	}
-	m = Parse([]byte(crlf(`Content-Transfer-Encoding: quoted-printable
+	m = parseDoc(t, []byte(crlf(`Content-Transfer-Encoding: quoted-printable
 
 caf=C3=A9 says =
 hi
 `)))
-	if got := string(m.Root.Decoded); got != "café says hi\r\n" {
+	if got := string(m.Content[m.Root]); got != "café says hi\r\n" {
 		t.Errorf("quoted-printable: %q", got)
 	}
-	m = Parse([]byte(crlf(`Content-Transfer-Encoding: x-braille
+	m = parseDoc(t, []byte(crlf(`Content-Transfer-Encoding: x-braille
 
 x`)))
-	if !m.Root.EncodingProblem || string(m.Root.Decoded) != "x" {
-		t.Errorf("unknown cte: %q problem=%v", m.Root.Decoded, m.Root.EncodingProblem)
+	if !m.Root.EncodingProblem || string(m.Content[m.Root]) != "x" {
+		t.Errorf("unknown cte: %q problem=%v", m.Content[m.Root], m.Root.EncodingProblem)
 	}
 }
 
@@ -235,7 +285,7 @@ Content-Disposition: attachment; filename="=?utf-8?Q?r=C3=A9sum=C3=A9.pdf?="
 R
 --bb--
 `)
-	m := Parse([]byte(raw))
+	m := parseDoc(t, []byte(raw))
 	p, q, r := m.Root.SubParts[0], m.Root.SubParts[1], m.Root.SubParts[2]
 	if p.Name == nil || *p.Name != "pic.png" {
 		t.Errorf("name from Content-Type name param = %v", p.Name)
@@ -261,43 +311,45 @@ R
 }
 
 func TestMalformedInput(t *testing.T) {
-	// Missing boundary parameter: multipart with no children.
-	m := Parse([]byte(crlf(`Content-Type: multipart/mixed
+	// Missing boundary parameter: a multipart cannot be split without one
+	// (RFC 2046 5.1.1), so it degrades to a single text/plain part rather than a
+	// childless multipart, keeping the body readable instead of discarding it.
+	m := parseDoc(t, []byte(crlf(`Content-Type: multipart/mixed
 
 whatever`)))
-	if m.Root.SubParts == nil || len(m.Root.SubParts) != 0 || m.Root.PartID != "" {
-		t.Errorf("boundary-less multipart: subparts=%v partId=%q", m.Root.SubParts, m.Root.PartID)
+	if m.Root.SubParts != nil || m.Root.Type != "text/plain" || m.Root.PartID == "" {
+		t.Errorf("boundary-less multipart: type=%q subparts=%v partId=%q", m.Root.Type, m.Root.SubParts, m.Root.PartID)
 	}
 	// Header line without a colon ends the header block.
-	m = Parse([]byte(crlf(`Subject: ok
+	m = parseDoc(t, []byte(crlf(`Subject: ok
 this line has no colon
 body`)))
 	if len(m.Headers) != 1 || m.Headers[0].Name != "Subject" {
 		t.Errorf("headers = %#v", m.Headers)
 	}
-	if !strings.HasPrefix(string(m.Root.Decoded), "this line has no colon") {
-		t.Errorf("body = %q", m.Root.Decoded)
+	if !strings.HasPrefix(string(m.Content[m.Root]), "this line has no colon") {
+		t.Errorf("body = %q", m.Content[m.Root])
 	}
 	// NUL dropped and invalid UTF-8 replaced in raw header values.
-	m = Parse([]byte("Subject: a\x00b\xff\r\n\r\n"))
+	m = parseDoc(t, []byte("Subject: a\x00b\xff\r\n\r\n"))
 	if v, _ := m.HeaderLast("subject"); v != " ab�" {
 		t.Errorf("sanitized raw = %q", v)
 	}
 	// Bare LF line endings parse the same as CRLF.
-	m = Parse([]byte("Subject: lf\n\nbody\n"))
+	m = parseDoc(t, []byte("Subject: lf\n\nbody\n"))
 	if v, _ := m.HeaderLast("Subject"); v != " lf" {
 		t.Errorf("bare-lf subject = %q", v)
 	}
-	if string(m.Root.Decoded) != "body\n" {
-		t.Errorf("bare-lf body = %q", m.Root.Decoded)
+	if string(m.Content[m.Root]) != "body\n" {
+		t.Errorf("bare-lf body = %q", m.Content[m.Root])
 	}
 	// Empty input.
-	m = Parse(nil)
+	m = parseDoc(t, nil)
 	if m.Root == nil || m.Root.Type != "text/plain" || m.Preview != "" {
 		t.Errorf("empty message: %#v", m.Root)
 	}
 	// A folded header continues across lines.
-	m = Parse([]byte(crlf(`Subject: part one
+	m = parseDoc(t, []byte(crlf(`Subject: part one
  part two
 
 `)))
@@ -307,7 +359,7 @@ body`)))
 }
 
 func TestHeaderInstances(t *testing.T) {
-	m := Parse([]byte(crlf(`Received: one
+	m := parseDoc(t, []byte(crlf(`Received: one
 received: two
 Subject: s
 
@@ -324,7 +376,7 @@ Subject: s
 }
 
 func TestDigestDefaultType(t *testing.T) {
-	m := Parse([]byte(crlf(`Content-Type: multipart/digest; boundary=dd
+	m := parseDoc(t, []byte(crlf(`Content-Type: multipart/digest; boundary=dd
 
 --dd
 
@@ -341,13 +393,13 @@ hi
 func TestBlobDedupHash(t *testing.T) {
 	// Same decoded octets under different transfer encodings hash the
 	// same, which is what gives them the same blob id (RFC 8621 4.1.4).
-	m1 := Parse([]byte(crlf(`Content-Transfer-Encoding: base64
+	m1 := parseDoc(t, []byte(crlf(`Content-Transfer-Encoding: base64
 
 aGVsbG8=`)))
-	m2 := Parse([]byte(crlf(`Content-Transfer-Encoding: 7bit
+	m2 := parseDoc(t, []byte(crlf(`Content-Transfer-Encoding: 7bit
 
 hello`)))
-	if m1.Root.SHA256 != m2.Root.SHA256 {
+	if m1.Root.Digest != m2.Root.Digest {
 		t.Error("identical decoded content produced different hashes")
 	}
 }

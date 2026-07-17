@@ -113,8 +113,12 @@ type FilterSemantics interface {
 	ValidateCondition(name string, value json.RawMessage) error
 	// MatchCondition reports whether a record matches one condition
 	// property/value pair; a FilterCondition object matches when every
-	// pair does. Called only for pairs ValidateCondition accepted.
-	MatchCondition(obj objectdb.Object, name string, value json.RawMessage) bool
+	// pair does. Called only for pairs ValidateCondition accepted. It
+	// takes ctx and acct because a condition may require I/O to decide
+	// (RFC 8621 Email's *InThreadHaveKeyword read the record's Thread and
+	// the text conditions read the message blob); a non-nil error fails
+	// the whole /query as serverFail.
+	MatchCondition(ctx context.Context, acct jmap.Id, obj objectdb.Object, name string, value json.RawMessage) (bool, error)
 }
 
 // UnsupportedFilterError marks a ValidateCondition failure that maps to
@@ -123,13 +127,73 @@ type UnsupportedFilterError struct{ Description string }
 
 func (e UnsupportedFilterError) Error() string { return e.Description }
 
+// ConditionSetProducer is an OPTIONAL capability a FilterSemantics may
+// also implement to accelerate its conditions with an index. The /query
+// planner (RFC 8620 section 5.5) composes the per-condition sets it returns
+// with the filter's AND/OR/NOT operators (intersection / union / universe)
+// to narrow the candidate set, then verifies every candidate with
+// MatchCondition - so a producer only ever needs to return a SUPERSET of
+// the matching ids, never the exact set. It is the type-specific
+// counterpart of the generic Indexed-property equality producer the planner
+// applies to types without FilterSemantics: for RFC 8621's Email/query
+// (section 4.4.1) it answers inMailbox / hasKeyword by set membership and
+// the thread links from the threadId index. A type that does not implement
+// it, or returns ok=false for a condition, simply has that condition
+// evaluated by a full scan plus MatchCondition - correct, just not
+// narrowed.
+type ConditionSetProducer interface {
+	// ConditionSet returns candidate ids for one condition property/value
+	// pair. ok=false means the producer cannot narrow this condition (treat
+	// as the universe: fall back to scan + predicate). exact=true promises
+	// the returned set is precisely the matching set for this pair, not
+	// merely a superset - it lets the planner count matches without loading
+	// records (the fast-total path); return exact=false whenever unsure.
+	// ids need not be sorted or deduplicated. Called only for pairs
+	// ValidateCondition accepted.
+	ConditionSet(ctx context.Context, acct jmap.Id, name string, value json.RawMessage) (ids []jmap.Id, exact bool, ok bool, err error)
+}
+
+// SortSemantics is a PROVISIONAL type-level override of the RFC 8620
+// section 5.5 sort Comparator parsing and comparison, for types whose
+// sortable values are not plain declared properties - RFC 8621 Email/query
+// (section 4.4.2) sorts on a first-address extraction, an RFC 5256 base
+// subject, and virtual per-query keyword predicates that carry their own
+// "keyword" comparator argument, none of which the core declared-property
+// comparators can express. When a type supplies one, the derived /query
+// uses it instead of the core comparators.
+//
+// PROVISIONAL: single consumer (Email) today, so unlike Filter/Arrange
+// this contract is NOT frozen and may change shape when a second query
+// datatype needs it.
+type SortSemantics interface {
+	// ParseSort validates the sort comparators and returns a total-order
+	// comparison function over stored objects (negative/zero/positive; the
+	// planner appends an id tiebreak so ties stay deterministic). An
+	// undeclared sort property or unusable collation returns
+	// jmap.ErrUnsupportedSort as errType; a malformed comparator returns
+	// jmap.ErrInvalidArguments. An empty sort returns a nil comparator and
+	// no error (the planner then keeps id order).
+	ParseSort(ctx context.Context, acct jmap.Id, sort []json.RawMessage) (less func(a, b objectdb.Object) int, errType, desc string)
+}
+
 // QueryHooks customizes the derived /query for a type.
 type QueryHooks struct {
 	// Filter, when non-nil, supplies the type's FilterCondition
-	// semantics.
+	// semantics. It may also implement ConditionSetProducer to accelerate
+	// its conditions via an index.
 	Filter FilterSemantics
-	// Arrange, when non-nil, runs after filtering and sorting and
-	// before windowing: it receives the full matched set already in
+	// Sort, when non-nil, overrides sort comparator parsing and comparison
+	// (PROVISIONAL; see SortSemantics).
+	Sort SortSemantics
+	// CollapseKey, when non-empty, names the declared property whose value
+	// groups records for the collapseThreads /query argument (RFC 8621
+	// section 4.4.3). It makes the derived /query accept collapseThreads
+	// and, when true, keep only the first record of each distinct key value
+	// in the sorted result. Collapse is core behaviour (RFC 8621 keeps it
+	// out of plugin code); a type supplies only the grouping-key name.
+	CollapseKey string
+	// Arrange, when non-nil, runs after filtering, sorting, and any
+	// collapse and before windowing: it receives the matched set already in
 	// standard sort order plus the comparator chain as a total order
 	// (id tiebreak included), and returns the final ordered ids. It may
 	// drop records, never add (RFC 8621 Mailbox/query's sortAsTree and
@@ -153,6 +217,13 @@ type ResponseExtras struct {
 // for one type. Every field is optional; the zero value derives the
 // plain RFC 8620 behavior.
 type Extensions struct {
+	// Methods, when non-nil, is the allow-list of standard method
+	// suffixes the type actually supports, from get/changes/set/copy/
+	// query/queryChanges. nil (the default) derives all six. A type that
+	// does not support a method omits it: RFC 8621's Thread has only
+	// get+changes, and /copy is defined only for Email. Custom methods
+	// (registered separately with Processor.Register) are unaffected.
+	Methods []string
 	// ExtraArgs declares additional accepted arguments per derived
 	// method, keyed by method suffix ("get", "changes", "set", "copy",
 	// "query", "queryChanges"). Each method's extras must have a hook
@@ -192,11 +263,49 @@ var standardMethodArgs = map[string][]string{
 	"queryChanges": {"accountId", "filter", "sort", "sinceQueryState", "maxChanges", "upToId", "calculateTotal"},
 }
 
+// derives reports whether a type with these extensions registers the
+// given standard method suffix. A nil Extensions or nil Methods derives
+// all six standard methods (the default).
+func (e *Extensions) derives(suffix string) bool {
+	if e == nil || e.Methods == nil {
+		return true
+	}
+	for _, m := range e.Methods {
+		if m == suffix {
+			return true
+		}
+	}
+	return false
+}
+
 // validate checks the extensions against the descriptor at
 // registration time, so misconfiguration fails at startup rather than
 // per request.
 func (e *Extensions) validate(t *descriptor.Type) error {
+	// Methods restricts which standard methods the type derives. Entries
+	// must be known suffixes, and no hook may target a method the type
+	// does not derive - a hook that can never run is a silent config bug.
+	for _, m := range e.Methods {
+		if _, known := standardMethodArgs[m]; !known {
+			return fmt.Errorf("runtime: %s: Methods lists unknown method suffix %q", t.Name, m)
+		}
+	}
+	if e.Set != nil && !e.derives("set") {
+		return fmt.Errorf("runtime: %s: Set hooks declared but /set is not derived", t.Name)
+	}
+	if e.Query != nil && !e.derives("query") {
+		return fmt.Errorf("runtime: %s: Query hooks declared but /query is not derived", t.Name)
+	}
+	if e.Computed != nil && !e.derives("get") {
+		return fmt.Errorf("runtime: %s: Computed hook declared but /get is not derived", t.Name)
+	}
+	if e.ExtraResponse != nil && e.ExtraResponse.Changes != nil && !e.derives("changes") {
+		return fmt.Errorf("runtime: %s: ExtraResponse.Changes declared but /changes is not derived", t.Name)
+	}
 	for suffix, ma := range e.ExtraArgs {
+		if !e.derives(suffix) {
+			return fmt.Errorf("runtime: %s: extra args declared for /%s, which the type does not derive", t.Name, suffix)
+		}
 		std, known := standardMethodArgs[suffix]
 		if !known {
 			return fmt.Errorf("runtime: %s: extra args declared for unknown method suffix %q", t.Name, suffix)
@@ -251,6 +360,11 @@ func (e *Extensions) validate(t *descriptor.Type) error {
 			continue
 		}
 		return fmt.Errorf("runtime: %s: DefaultGetProperties includes unknown property %q", t.Name, name)
+	}
+	if e.Query != nil && e.Query.CollapseKey != "" {
+		if _, declared := t.Properties[e.Query.CollapseKey]; !declared {
+			return fmt.Errorf("runtime: %s: Query.CollapseKey names unknown property %q", t.Name, e.Query.CollapseKey)
+		}
 	}
 	return nil
 }

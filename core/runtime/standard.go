@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
+	"github.com/naust-mail/naust-jmap/core/tuning"
 )
 
 // RegisterStandardType registers a datatype descriptor with the object
@@ -40,12 +42,22 @@ func RegisterStandardTypeExt(p *Processor, db *objectdb.DB, t *descriptor.Type, 
 		return err
 	}
 	st := &stdType{db: db, t: t, core: core, ext: ext}
-	p.Register(t.Name+"/get", t.Capability, st.get)
-	p.Register(t.Name+"/changes", t.Capability, st.changes)
-	p.Register(t.Name+"/set", t.Capability, st.set)
-	p.Register(t.Name+"/copy", t.Capability, st.copy)
-	p.Register(t.Name+"/query", t.Capability, st.query)
-	p.Register(t.Name+"/queryChanges", t.Capability, st.queryChanges)
+	// A type derives only the standard methods its Extensions allow (nil
+	// Extensions or nil Methods = all six). RFC 8621's Thread has only
+	// get+changes, and /copy is defined only for Email.
+	derived := map[string]Handler{
+		"get":          st.get,
+		"changes":      st.changes,
+		"set":          st.set,
+		"copy":         st.copy,
+		"query":        st.query,
+		"queryChanges": st.queryChanges,
+	}
+	for _, suffix := range []string{"get", "changes", "set", "copy", "query", "queryChanges"} {
+		if ext.derives(suffix) {
+			p.Register(t.Name+"/"+suffix, t.Capability, derived[suffix])
+		}
+	}
 	return nil
 }
 
@@ -120,6 +132,12 @@ func (st *stdType) get(ctx context.Context, call *Call) []jmap.Invocation {
 	if errType, desc := checkAccount(call, a.AccountId, false); errType != "" {
 		return fail(call.CallID, errType, desc)
 	}
+	// A client-supplied properties list is bounded: each name is resolved
+	// per returned object (a computed one may reparse the blob), so an
+	// unbounded list is a CPU amplifier. The server default list is exempt.
+	if a.Properties != nil && len(*a.Properties) > tuning.MaxRequestedProperties {
+		return fail(call.CallID, jmap.ErrInvalidArguments, fmt.Sprintf("more than %d properties requested", tuning.MaxRequestedProperties))
+	}
 
 	// properties: omitted or null means all, unless the type overrides
 	// that default with a fixed list (RFC 8621 section 4.2 does for
@@ -130,12 +148,14 @@ func (st *stdType) get(ctx context.Context, call *Call) []jmap.Invocation {
 	if reqProps == nil && st.ext != nil && st.ext.DefaultGetProperties != nil {
 		reqProps = &st.ext.DefaultGetProperties
 	}
-	var props map[string]bool
+	// props is the projection set; it is always built so internal
+	// properties (Internal, e.g. a derived index) never reach the wire,
+	// even when the client omits properties on a type with no default.
+	props := map[string]bool{"id": true}
 	var computed []string
 	if reqProps != nil {
-		props = map[string]bool{"id": true}
 		for _, name := range *reqProps {
-			if _, declared := st.t.Properties[name]; declared || name == "id" {
+			if p, declared := st.t.Properties[name]; (declared && !p.Internal) || name == "id" {
 				props[name] = true
 				continue
 			}
@@ -147,6 +167,14 @@ func (st *stdType) get(ctx context.Context, call *Call) []jmap.Invocation {
 				continue
 			}
 			return fail(call.CallID, jmap.ErrInvalidArguments, fmt.Sprintf("unknown property %q", name))
+		}
+	} else {
+		// properties omitted with no type default: all declared
+		// properties except internal ones.
+		for name, p := range st.t.Properties {
+			if !p.Internal {
+				props[name] = true
+			}
 		}
 	}
 
@@ -252,7 +280,7 @@ func (st *stdType) changes(ctx context.Context, call *Call) []jmap.Invocation {
 	if a.SinceState == nil {
 		return fail(call.CallID, jmap.ErrInvalidArguments, "sinceState is required")
 	}
-	max := 0
+	max := tuning.DefaultMaxChanges
 	if a.MaxChanges != nil {
 		// maxChanges MUST be a positive integer greater than 0 (5.2).
 		if *a.MaxChanges <= 0 || !jmap.ValidUnsignedInt(*a.MaxChanges) {
@@ -405,7 +433,7 @@ func (st *stdType) processCreates(u *objectdb.Update, call *Call, creates map[jm
 				continue
 			}
 			p, declared := st.t.Properties[name]
-			if !declared || p.ServerSet {
+			if !declared || p.ServerSet || p.Internal {
 				bad = append(bad, name)
 			}
 		}
@@ -612,12 +640,21 @@ func applyPatch(t *descriptor.Type, current objectdb.Object, patch map[string]js
 		}
 		segments[i] = parts
 	}
-	for i := range segments {
-		for j := i + 1; j < len(segments); j++ {
-			if segmentPrefix(segments[i], segments[j]) || segmentPrefix(segments[j], segments[i]) {
+	// A pointer overlaps another exactly when one of its proper segment
+	// prefixes is itself a pointer in the patch. Testing each pointer's
+	// prefixes against a set of all pointers is linear in the total
+	// segment count, where the pairwise scan it replaces is quadratic in
+	// the (client-controlled) number of patch keys.
+	present := make(map[string]string, len(segments))
+	for i, segs := range segments {
+		present[pathKey(segs)] = paths[i]
+	}
+	for i, segs := range segments {
+		for n := 1; n < len(segs); n++ {
+			if other, ok := present[pathKey(segs[:n])]; ok {
 				return nil, &jmap.SetError{
 					Type:        jmap.SetErrInvalidPatch,
-					Description: fmt.Sprintf("pointer %q overlaps pointer %q", paths[i], paths[j]),
+					Description: fmt.Sprintf("pointer %q overlaps pointer %q", paths[i], other),
 				}
 			}
 		}
@@ -629,17 +666,45 @@ func applyPatch(t *descriptor.Type, current objectdb.Object, patch map[string]js
 	}
 	var invalid []string
 	for i, path := range paths {
-		if len(segments[i]) > 1 {
-			// Every M0 property kind is a scalar, so all parts prior to the
-			// last can never exist as objects on the record; when compound
-			// kinds arrive this becomes real pointer evaluation (5.3).
-			return nil, &jmap.SetError{
-				Type:        jmap.SetErrInvalidPatch,
-				Description: fmt.Sprintf("pointer %q references inside a non-object property", path),
-			}
-		}
 		name := segments[i][0]
 		val := patch[path]
+		if len(segments[i]) > 1 {
+			// A multi-segment pointer addresses a member of a composite
+			// property (5.3). Only a single member level into a KindObject
+			// property is supported: {name}/{key}. Deeper nesting or a
+			// pointer into any other kind is invalidPatch.
+			p, declared := t.Properties[name]
+			if len(segments[i]) != 2 || !declared || p.Internal || p.Kind != descriptor.KindObject {
+				return nil, &jmap.SetError{
+					Type:        jmap.SetErrInvalidPatch,
+					Description: fmt.Sprintf("pointer %q references inside a non-object property", path),
+				}
+			}
+			key := segments[i][1]
+			members := map[string]json.RawMessage{}
+			if raw, has := newObj[name]; has && !isNull(raw) {
+				if err := json.Unmarshal(raw, &members); err != nil {
+					// A stored non-object under an object property is
+					// corruption, not a client error.
+					return nil, &jmap.SetError{
+						Type:        jmap.SetErrInvalidPatch,
+						Description: fmt.Sprintf("property %q is not an object", name),
+					}
+				}
+			}
+			if isNull(val) {
+				// null removes the member (5.3).
+				delete(members, key)
+			} else {
+				members[key] = val
+			}
+			encoded, err := json.Marshal(members)
+			if err != nil {
+				return nil, &jmap.SetError{Type: jmap.SetErrInvalidPatch, Description: err.Error()}
+			}
+			newObj[name] = encoded
+			continue
+		}
 		if name == "id" {
 			// Left to the unchanged-value check below.
 			if isNull(val) {
@@ -650,7 +715,7 @@ func applyPatch(t *descriptor.Type, current objectdb.Object, patch map[string]js
 			continue
 		}
 		p, declared := t.Properties[name]
-		if !declared {
+		if !declared || p.Internal {
 			invalid = append(invalid, name)
 			continue
 		}
@@ -697,16 +762,18 @@ func applyPatch(t *descriptor.Type, current objectdb.Object, patch map[string]js
 	return newObj, nil
 }
 
-func segmentPrefix(a, b []string) bool {
-	if len(a) >= len(b) {
-		return false
+// pathKey encodes a JSON-Pointer segment slice as a single injective
+// string, so equal keys mean equal segment slices regardless of the
+// bytes a segment contains (each segment is framed by its length). It is
+// the set key for the applyPatch overlap check.
+func pathKey(segs []string) string {
+	var b strings.Builder
+	for _, s := range segs {
+		b.WriteString(strconv.Itoa(len(s)))
+		b.WriteByte(':')
+		b.WriteString(s)
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return b.String()
 }
 
 // resolveIdRefs substitutes "#creationId" references in Id-kind
