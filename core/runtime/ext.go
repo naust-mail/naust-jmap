@@ -90,6 +90,64 @@ type SetHooks struct {
 	// runtime reports notFound whether or not the hook ran. extra
 	// carries the decoded extra /set arguments.
 	Destroy func(u *objectdb.Update, id jmap.Id, extra map[string]json.RawMessage) (*jmap.SetError, error)
+
+	// PrepareCreate and CommitCreate together take over record creation
+	// for a type whose create is not "store the sent properties" - RFC
+	// 8621's Email/set create, whose creation object is the INPUT to
+	// message generation, not the record. They split around the account
+	// lease the same way every heavy ingest path does (Email/import,
+	// Email/copy, delivery): PrepareCreate runs once per create OUTSIDE
+	// the lease - free to do I/O, parse, and stream blobs without
+	// stalling other writers - and returns an opaque prepared value;
+	// CommitCreate stages it UNDER the lease.
+	//
+	// When set, the runtime's own create pipeline is bypassed for this
+	// type: no descriptor property checks, no defaults, no Validate call
+	// for creates (Validate still runs for updates) - the hooks own
+	// create validation entirely. A non-nil SetError from either hook
+	// rejects that record and processing continues; a non-nil error
+	// aborts the method as serverFail. CommitCreate returns the created
+	// id and the response echo: every server-set property the spec wants
+	// in the created response, including "id". The runtime registers the
+	// id in the call's creation-id map.
+	//
+	// PrepareCreate necessarily runs before the /set commit opens, so its
+	// side effects (a stored blob) survive an ifInState mismatch or a
+	// CommitCreate rejection as abandoned uploads - the same fate as any
+	// interrupted client upload, reclaimed by upload expiry.
+	PrepareCreate func(ctx context.Context, call *Call, acct, cid jmap.Id, raw json.RawMessage) (prepared any, serr *jmap.SetError, err error)
+	// CommitCreate stages one prepared create under the account lease.
+	CommitCreate func(u *objectdb.Update, prepared any) (id jmap.Id, echo objectdb.Object, serr *jmap.SetError, err error)
+
+	// AfterSet runs after the derived /set has committed and its response
+	// is built, and returns invocations appended after that response - the
+	// seam for a spec's onSuccess continuation arguments, where a
+	// successful /set triggers a mandatory implicit follow-up answering
+	// under the same method call id (RFC 8621 section 7.5's
+	// onSuccessUpdateEmail/onSuccessDestroyEmail; the /copy equivalent,
+	// RFC 8620 section 5.4's onSuccessDestroyOriginal, is built into the
+	// derived /copy). A hook issues that follow-up through
+	// Processor.ImplicitSet, so it can only continue its own call. It does
+	// not run when the /set itself fails (stateMismatch, serverFail);
+	// per-record rejections are visible through the outcome instead. extra
+	// carries the decoded extra /set arguments.
+	AfterSet func(ctx context.Context, call *Call, outcome *SetOutcome, extra map[string]json.RawMessage) []jmap.Invocation
+}
+
+// SetOutcome summarizes a committed derived /set for the AfterSet hook:
+// which items succeeded, with creation ids resolved to real ids.
+type SetOutcome struct {
+	// AccountId is the account the /set ran against.
+	AccountId jmap.Id
+	// Created maps each successful create's creation id to its real id.
+	Created map[jmap.Id]jmap.Id
+	// Updated lists the successfully updated record ids, sorted.
+	Updated []jmap.Id
+	// Destroyed holds each successfully destroyed record as it was at
+	// destruction, keyed by id: an onSuccess continuation may need values
+	// from a record that no longer exists (RFC 8621 section 7.5's
+	// onSuccessDestroyEmail needs the destroyed submission's emailId).
+	Destroyed map[jmap.Id]objectdb.Object
 }
 
 // QueryRecord is one matched record offered to QueryHooks.Arrange.
@@ -293,6 +351,9 @@ func (e *Extensions) validate(t *descriptor.Type) error {
 	if e.Set != nil && !e.derives("set") {
 		return fmt.Errorf("runtime: %s: Set hooks declared but /set is not derived", t.Name)
 	}
+	if e.Set != nil && (e.Set.PrepareCreate == nil) != (e.Set.CommitCreate == nil) {
+		return fmt.Errorf("runtime: %s: PrepareCreate and CommitCreate must be declared together", t.Name)
+	}
 	if e.Query != nil && !e.derives("query") {
 		return fmt.Errorf("runtime: %s: Query hooks declared but /query is not derived", t.Name)
 	}
@@ -320,7 +381,7 @@ func (e *Extensions) validate(t *descriptor.Type) error {
 				return fmt.Errorf("runtime: %s: extra /changes arguments need an ExtraResponse.Changes hook to consume them", t.Name)
 			}
 		case "set":
-			if e.Set == nil || (e.Set.Validate == nil && e.Set.Destroy == nil) {
+			if e.Set == nil || (e.Set.Validate == nil && e.Set.Destroy == nil && e.Set.AfterSet == nil) {
 				return fmt.Errorf("runtime: %s: extra /set arguments need a Set hook to consume them", t.Name)
 			}
 		case "query":

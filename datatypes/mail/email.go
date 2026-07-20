@@ -98,6 +98,18 @@ var emailDefaultGetProperties = []string{
 	"preview", "bodyValues", "textBody", "htmlBody", "attachments",
 }
 
+// EmailOption configures RegisterEmail.
+type EmailOption func(*genConfig)
+
+// WithMessageIDDomain sets the domain synthesized Message-IDs are scoped
+// to when a creation omits one (RFC 5322 section 3.6.4) - conventionally
+// the host's mail name, the same value an ingest greeting would use.
+// Without it, the domain falls back to the creation's From address, then
+// "localhost".
+func WithMessageIDDomain(domain string) EmailOption {
+	return func(c *genConfig) { c.msgIDDomain = domain }
+}
+
 // RegisterEmail registers the Email type, its method extensions, and
 // SearchSnippet/get. store is where message blobs live; the Email/get computed
 // resolver reads it to derive body properties on demand. cap supplies the
@@ -106,15 +118,21 @@ var emailDefaultGetProperties = []string{
 // searcher is the text-search socket (RFC 8621 section 4.4.1 text conditions
 // and section 5 snippets); a nil searcher installs the naive in-process
 // default.
-func RegisterEmail(p *runtime.Processor, db *objectdb.DB, store blob.Store, core jmap.CoreCapabilities, acctCap AccountCapability, searcher Searcher) error {
+func RegisterEmail(p *runtime.Processor, db *objectdb.DB, store blob.Store, core jmap.CoreCapabilities, acctCap AccountCapability, searcher Searcher, opts ...EmailOption) error {
 	if searcher == nil {
 		searcher = naiveSearcher{store: store}
 	}
+	var cfg genConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	mat := materializer{db: db, store: store, maxMailboxes: acctCap.MaxMailboxesPerEmail}
+	creator := emailCreate{mat: mat, cfg: cfg, maxAttachBytes: acctCap.MaxSizeAttachmentsPerEmail}
 	ext := &runtime.Extensions{
-		// Email/copy is deferred: it is a cross-account ingest that must
-		// run threading, counters, and the mailboxIds invariant through
-		// insertEmail, not the generic derived copy. Messages enter the
-		// store through Email/import and delivery (RFC 8621 section 4.8).
+		// Email/copy is not derived: it is a cross-account ingest that must
+		// run threading, counters, and the mailboxIds invariant through the
+		// materialize seam, not the generic derived copy. It is registered
+		// as a custom method below (emailcopy.go).
 		Methods:              []string{"get", "changes", "set", "query", "queryChanges"},
 		DefaultGetProperties: emailDefaultGetProperties,
 		Computed:             &emailComputed{store: store},
@@ -124,6 +142,12 @@ func RegisterEmail(p *runtime.Processor, db *objectdb.DB, store blob.Store, core
 		Set: &runtime.SetHooks{
 			Validate: emailValidate(acctCap.MaxMailboxesPerEmail),
 			Destroy:  emailDestroy,
+			// Creation is a message generation, not a property store: the
+			// create override runs it through emailgen + the materialize
+			// seam (RFC 8621 section 4.6), preparing outside the account
+			// lease like every other Email producer.
+			PrepareCreate: creator.prepare,
+			CommitCreate:  creator.commit,
 		},
 		// Email/query (RFC 8621 section 4.4): the FilterCondition semantics
 		// (with an index producer for inMailbox/hasKeyword), the mail sort
@@ -146,29 +170,23 @@ func RegisterEmail(p *runtime.Processor, db *objectdb.DB, store blob.Store, core
 	// SearchSnippet/get (RFC 8621 section 5.1) is a custom method: SearchSnippet
 	// is not a stored type, so it is not derived from a descriptor.
 	p.Register("SearchSnippet/get", CapabilityURI, searchSnippet{db: db, searcher: searcher, core: core}.get)
-	// Email/import (section 4.8) and Email/parse (section 4.9) are custom
-	// methods: import ingests an uploaded blob through the shared insertEmail
-	// path, parse renders a blob as an Email without storing it.
-	p.Register("Email/import", CapabilityURI, emailImport{db: db, store: store, core: core, maxMailboxes: acctCap.MaxMailboxesPerEmail}.handle)
+	// Email/import (section 4.8), Email/copy (section 4.7), and Email/parse
+	// (section 4.9) are custom methods: import ingests an uploaded blob
+	// through the materialize seam, copy ingests another account's message
+	// through it, parse renders a blob as an Email without storing it.
+	p.Register("Email/import", CapabilityURI, emailImport{mat: mat, core: core}.handle)
+	p.Register("Email/copy", CapabilityURI, emailCopy{mat: mat, proc: p, core: core}.handle)
 	p.Register("Email/parse", CapabilityURI, emailParse{db: db, store: store, core: core}.handle)
 	return nil
 }
 
-// emailValidate enforces the Email/set rules for M2: creation is not
-// supported (message composition is M3), and updates may only change the
-// mutable mailboxIds/keywords, which the descriptor already restricts;
+// emailValidate enforces the Email/set update rules: only the mutable
+// mailboxIds/keywords change (the descriptor already restricts that);
 // this hook adds the value semantics the descriptor cannot express.
+// Creates never reach it - the create override (emailcreate.go) owns
+// creation entirely.
 func emailValidate(maxMailboxes *int64) func(*objectdb.Update, objectdb.Object, objectdb.Object, map[string]json.RawMessage) (*jmap.SetError, error) {
 	return func(u *objectdb.Update, old, new objectdb.Object, _ map[string]json.RawMessage) (*jmap.SetError, error) {
-		if old == nil {
-			// Create composes a new message, which needs MIME generation
-			// (M3). Delivery and Email/import create records directly, not
-			// through Email/set, so this blocks only client composition.
-			return &jmap.SetError{
-				Type:        jmap.SetErrForbidden,
-				Description: "Email creation is not supported; deliver or import the message instead",
-			}, nil
-		}
 		if serr, err := validateMailboxIds(u, new, maxMailboxes); serr != nil || err != nil {
 			return serr, err
 		}

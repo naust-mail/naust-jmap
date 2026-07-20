@@ -1,8 +1,10 @@
-package auth
+package authtest
 
 import (
 	"net/http"
 	"testing"
+
+	"github.com/naust-mail/naust-jmap/core/providers/auth"
 )
 
 func TestStaticAuthenticate(t *testing.T) {
@@ -42,7 +44,7 @@ func TestStaticAuthenticate(t *testing.T) {
 		"empty password":     req("alice", "", true),
 		"empty pass unknown": req("bob", "", true),
 	} {
-		if _, err := s.Authenticate(r); err != ErrUnauthenticated {
+		if _, err := s.Authenticate(r); err != auth.ErrUnauthenticated {
 			t.Errorf("%s: err = %v, want ErrUnauthenticated", name, err)
 		}
 	}

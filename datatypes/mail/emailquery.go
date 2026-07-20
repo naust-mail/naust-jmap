@@ -115,7 +115,7 @@ func (f emailFilter) ConditionSet(ctx context.Context, acct jmap.Id, name string
 		member, _ = decodeString(value)
 	case "hasKeyword":
 		prop = "keywords"
-		member, _ = decodeString(value)
+		member = keywordArg(value)
 	default:
 		return nil, false, false, nil
 	}
@@ -157,11 +157,9 @@ func (f emailFilter) MatchCondition(ctx context.Context, acct jmap.Id, obj objec
 	case "maxSize":
 		return emailUint(obj, "size") < uintVal(value), nil
 	case "hasKeyword":
-		kw, _ := decodeString(value)
-		return objectKeys(obj["keywords"])[kw], nil
+		return objectKeys(obj["keywords"])[keywordArg(value)], nil
 	case "notKeyword":
-		kw, _ := decodeString(value)
-		return !objectKeys(obj["keywords"])[kw], nil
+		return !objectKeys(obj["keywords"])[keywordArg(value)], nil
 	case "hasAttachment":
 		var want bool
 		json.Unmarshal(value, &want)
@@ -169,8 +167,7 @@ func (f emailFilter) MatchCondition(ctx context.Context, acct jmap.Id, obj objec
 		json.Unmarshal(obj["hasAttachment"], &got)
 		return got == want, nil
 	case "allInThreadHaveKeyword", "someInThreadHaveKeyword", "noneInThreadHaveKeyword":
-		kw, _ := decodeString(value)
-		all, some, err := f.threadKeyword(ctx, acct, obj, kw)
+		all, some, err := f.threadKeyword(ctx, acct, obj, keywordArg(value))
 		if err != nil {
 			return false, err
 		}
@@ -223,7 +220,7 @@ type emailSort struct {
 // "keyword" property. thread-keyword lookups are cached per (thread,
 // keyword) within this query; a lookup failure there (near-impossible on a
 // committed read) degrades to "keyword absent" rather than failing the sort,
-// a naive-M2 limitation acceptable for the PROVISIONAL sort surface.
+// a naive limitation acceptable for the PROVISIONAL sort surface.
 func (s emailSort) ParseSort(ctx context.Context, acct jmap.Id, raws []json.RawMessage) (func(a, b objectdb.Object) int, string, string) {
 	type cmp struct {
 		property   string
@@ -247,7 +244,7 @@ func (s emailSort) ParseSort(ctx context.Context, acct jmap.Id, raws []json.RawM
 		if (c.Property == "hasKeyword" || threadKeywordSorts[c.Property]) && !validKeyword(c.Keyword) {
 			return nil, jmap.ErrInvalidArguments, fmt.Sprintf("sort on %q needs a keyword", c.Property)
 		}
-		cmps = append(cmps, cmp{property: c.Property, keyword: c.Keyword, descending: c.IsAscending != nil && !*c.IsAscending})
+		cmps = append(cmps, cmp{property: c.Property, keyword: strings.ToLower(c.Keyword), descending: c.IsAscending != nil && !*c.IsAscending})
 	}
 
 	cache := map[string]bool{}
@@ -308,6 +305,15 @@ func (s emailSort) ParseSort(ctx context.Context, acct jmap.Id, raws []json.RawM
 }
 
 // ---- value helpers ----
+
+// keywordArg decodes a keyword FilterCondition/sort value and folds its case.
+// Keywords are case-insensitive (section 4.1.1) and stored lowercased, so
+// every keyword comparison - index probe, membership test, thread scan - must
+// fold to match. ValidateCondition/ParseSort have already checked the syntax.
+func keywordArg(raw json.RawMessage) string {
+	s, _ := decodeString(raw)
+	return strings.ToLower(s)
+}
 
 func validId(raw json.RawMessage) bool {
 	var id jmap.Id

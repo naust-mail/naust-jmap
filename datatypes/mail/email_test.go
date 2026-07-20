@@ -1,8 +1,9 @@
 package mail
 
 // Email tests: the stored fast list and its /get shape, on-demand body
-// parts and bodyValues, the header:{name} parsed forms, and the M2-
-// restricted /set (no create, keyword/mailboxId semantics, destroy).
+// parts and bodyValues, the header:{name} parsed forms, and the /set
+// update semantics (keywords/mailboxIds, destroy). Creation is covered
+// by emailcreate_test.go.
 
 import (
 	"context"
@@ -30,7 +31,7 @@ var testReceivedAt = time.Date(2021, 3, 4, 12, 0, 0, 0, time.UTC)
 // for both the advertised capability and the enforced limits.
 func newEmailServer(t *testing.T, acctCap AccountCapability) (*httptest.Server, *objectdb.DB, blob.Store) {
 	t.Helper()
-	a := auth.NewStatic()
+	a := newStaticAuth()
 	a.AddUser("john@example.com", "secret", testAccount)
 	// jane shares the account without having uploaded anything, for the
 	// RFC 8620 section 6.1 unreferenced-blob visibility tests.
@@ -297,19 +298,6 @@ func TestEmailStoredMatchesComputed(t *testing.T) {
 	}
 	if obj["subject"] != obj["header:Subject:asText"] {
 		t.Errorf("subject stored %v vs computed %v", obj["subject"], obj["header:Subject:asText"])
-	}
-}
-
-func TestEmailSetCreateRejected(t *testing.T) {
-	ts, db, store := emailServer(t)
-	_ = putEmail(t, db, store, simpleMessage, map[string]bool{"MBinbox": true}, nil)
-
-	r := callMail(t, ts, inv("Email/set",
-		fmt.Sprintf(`{"accountId":%q,"create":{"c":{"mailboxIds":{"MBinbox":true}}}}`, testAccount), "0"))
-	args := methodArgs(t, r, 0, "Email/set")
-	se := args["notCreated"].(map[string]any)["c"].(map[string]any)
-	if se["type"] != "forbidden" {
-		t.Fatalf("want forbidden, got %v", se)
 	}
 }
 

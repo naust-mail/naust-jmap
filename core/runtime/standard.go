@@ -41,7 +41,7 @@ func RegisterStandardTypeExt(p *Processor, db *objectdb.DB, t *descriptor.Type, 
 	if err := db.RegisterType(t); err != nil {
 		return err
 	}
-	st := &stdType{db: db, t: t, core: core, ext: ext}
+	st := &stdType{db: db, t: t, core: core, ext: ext, p: p}
 	// A type derives only the standard methods its Extensions allow (nil
 	// Extensions or nil Methods = all six). RFC 8621's Thread has only
 	// get+changes, and /copy is defined only for Email.
@@ -66,6 +66,9 @@ type stdType struct {
 	t    *descriptor.Type
 	core jmap.CoreCapabilities
 	ext  *Extensions // nil = no extensions
+	// p is the Processor the type is registered on; /copy runs its
+	// section 5.4 implicit destroy through p.ImplicitSet.
+	p *Processor
 }
 
 // decodeArgs strictly decodes method arguments; unknown or mistyped
@@ -368,6 +371,37 @@ func (st *stdType) set(ctx context.Context, call *Call) []jmap.Invocation {
 	}
 
 	resp := setResponse{AccountId: a.AccountId}
+	// A type with create-override hooks prepares every create before the
+	// commit opens: the expensive half (I/O, parsing, blob streaming) runs
+	// outside the account lease, the same split every heavy ingest path
+	// uses.
+	var prepared map[jmap.Id]any
+	var prepErrs map[jmap.Id]*jmap.SetError
+	if hooks := st.createOverride(); hooks != nil && len(a.Create) > 0 {
+		prepared = make(map[jmap.Id]any, len(a.Create))
+		prepErrs = make(map[jmap.Id]*jmap.SetError)
+		for _, cid := range sortedIds(mapKeys(a.Create)) {
+			prep, serr, err := hooks.PrepareCreate(ctx, call, a.AccountId, cid, a.Create[cid])
+			if err != nil {
+				return fail(call.CallID, jmap.ErrServerFail, err.Error())
+			}
+			if serr != nil {
+				prepErrs[cid] = serr
+				continue
+			}
+			prepared[cid] = prep
+		}
+	}
+	// An AfterSet hook needs the outcome: which items succeeded, and the
+	// destroyed records' last values (only obtainable inside the commit).
+	var outcome *SetOutcome
+	if hooks := st.afterSetHook(); hooks != nil {
+		outcome = &SetOutcome{
+			AccountId: a.AccountId,
+			Created:   make(map[jmap.Id]jmap.Id),
+			Destroyed: make(map[jmap.Id]objectdb.Object),
+		}
+	}
 	// One commit for the whole method call: each record is accepted or
 	// rejected individually (rejections land in notCreated/notUpdated/
 	// notDestroyed and processing continues, 5.3), but everything accepted
@@ -381,13 +415,17 @@ func (st *stdType) set(ctx context.Context, call *Call) []jmap.Invocation {
 		if a.IfInState != nil && *a.IfInState != state {
 			return errStateMismatch
 		}
-		if err := st.processCreates(u, call, a.Create, extra, &resp); err != nil {
+		if st.createOverride() != nil {
+			if err := st.commitPreparedCreates(u, call, a.Create, prepared, prepErrs, &resp); err != nil {
+				return err
+			}
+		} else if err := st.processCreates(u, call, a.Create, extra, &resp); err != nil {
 			return err
 		}
 		if err := st.processUpdates(u, call, a.Update, extra, &resp); err != nil {
 			return err
 		}
-		return st.processDestroys(u, a.Destroy, call.CreatedIds, extra, &resp)
+		return st.processDestroys(u, a.Destroy, call.CreatedIds, extra, &resp, outcome)
 	})
 	if errors.Is(err, errStateMismatch) {
 		return fail(call.CallID, jmap.ErrStateMismatch, "")
@@ -399,7 +437,61 @@ func (st *stdType) set(ctx context.Context, call *Call) []jmap.Invocation {
 	if resp.NewState == "" {
 		resp.NewState = resp.OldState
 	}
-	return reply(st.t.Name+"/set", call.CallID, resp)
+	out := reply(st.t.Name+"/set", call.CallID, resp)
+	if hooks := st.afterSetHook(); hooks != nil {
+		for cid := range resp.Created {
+			outcome.Created[cid] = call.CreatedIds[cid]
+		}
+		outcome.Updated = sortedIds(mapKeys(resp.Updated))
+		out = append(out, hooks.AfterSet(ctx, call, outcome, extra)...)
+	}
+	return out
+}
+
+// afterSetHook returns the type's Set hooks when an AfterSet continuation
+// is declared, else nil.
+func (st *stdType) afterSetHook() *SetHooks {
+	if st.ext != nil && st.ext.Set != nil && st.ext.Set.AfterSet != nil {
+		return st.ext.Set
+	}
+	return nil
+}
+
+// createOverride returns the type's create-override hooks, or nil when
+// creates run through the runtime's own pipeline.
+func (st *stdType) createOverride() *SetHooks {
+	if st.ext != nil && st.ext.Set != nil && st.ext.Set.PrepareCreate != nil {
+		return st.ext.Set
+	}
+	return nil
+}
+
+// commitPreparedCreates stages the creates a type's PrepareCreate hook
+// prepared outside the lease: rejections collected during preparation land
+// in notCreated, everything else is handed to CommitCreate, and the
+// creation-id map is maintained the same way the runtime's own create
+// pipeline maintains it (5.3).
+func (st *stdType) commitPreparedCreates(u *objectdb.Update, call *Call, creates map[jmap.Id]json.RawMessage, prepared map[jmap.Id]any, prepErrs map[jmap.Id]*jmap.SetError, resp *setResponse) error {
+	for _, cid := range sortedIds(mapKeys(creates)) {
+		if serr, rejected := prepErrs[cid]; rejected {
+			resp.notCreated(cid, serr)
+			continue
+		}
+		id, echo, serr, err := st.ext.Set.CommitCreate(u, prepared[cid])
+		if err != nil {
+			return err
+		}
+		if serr != nil {
+			resp.notCreated(cid, serr)
+			continue
+		}
+		call.CreatedIds[cid] = id
+		if resp.Created == nil {
+			resp.Created = make(map[jmap.Id]objectdb.Object)
+		}
+		resp.Created[cid] = echo
+	}
+	return nil
 }
 
 // processCreates validates and stages the create map. Creates are
@@ -559,7 +651,17 @@ func (st *stdType) processUpdates(u *objectdb.Update, call *Call, updates map[jm
 			resp.notUpdated(uid, invalidProperties(bad))
 			continue
 		}
+		// The updated echo is any change the server made beyond what the
+		// patch asked for, or null (5.3). Only a Validate hook can make
+		// such a change (canonicalizing a value, staging a status side
+		// effect), so the diff is taken across the hook call; internal
+		// properties never reach the wire.
+		var side objectdb.Object
 		if st.ext != nil && st.ext.Set != nil && st.ext.Set.Validate != nil {
+			before := make(objectdb.Object, len(newObj))
+			for k, v := range newObj {
+				before[k] = v
+			}
 			serr, err := st.ext.Set.Validate(u, current, newObj, extra)
 			if err != nil {
 				return err
@@ -568,6 +670,7 @@ func (st *stdType) processUpdates(u *objectdb.Update, call *Call, updates map[jm
 				resp.notUpdated(uid, serr)
 				continue
 			}
+			side = st.hookSideEffects(before, newObj)
 		}
 		if err := u.Put(st.t.Name, realId, newObj); err != nil {
 			return err
@@ -575,34 +678,66 @@ func (st *stdType) processUpdates(u *objectdb.Update, call *Call, updates map[jm
 		if resp.Updated == nil {
 			resp.Updated = make(map[jmap.Id]objectdb.Object)
 		}
-		// The value is any change not explicitly requested, or null; no
-		// M0 property changes as a side effect of an update (5.3).
-		resp.Updated[realId] = nil
+		resp.Updated[realId] = side
 	}
 	return nil
 }
 
-func (st *stdType) processDestroys(u *objectdb.Update, destroy []jmap.Id, createdIds map[jmap.Id]jmap.Id, extra map[string]json.RawMessage, resp *setResponse) error {
+// hookSideEffects diffs an object across a Validate hook call: the
+// properties the hook changed, added, or removed (removed ones echo as
+// null), skipping internal properties. nil when the hook changed nothing.
+func (st *stdType) hookSideEffects(before, after objectdb.Object) objectdb.Object {
+	var side objectdb.Object
+	record := func(name string, v json.RawMessage) {
+		if p, declared := st.t.Properties[name]; declared && p.Internal {
+			return
+		}
+		if side == nil {
+			side = make(objectdb.Object)
+		}
+		side[name] = v
+	}
+	for name, v := range after {
+		if !jsonEqual(before[name], v) {
+			record(name, v)
+		}
+	}
+	for name := range before {
+		if _, still := after[name]; !still {
+			record(name, json.RawMessage("null"))
+		}
+	}
+	return side
+}
+
+func (st *stdType) processDestroys(u *objectdb.Update, destroy []jmap.Id, createdIds map[jmap.Id]jmap.Id, extra map[string]json.RawMessage, resp *setResponse, outcome *SetOutcome) error {
 	for _, did := range destroy {
 		realId, ok := resolveIdArg(did, createdIds)
 		if !ok {
 			resp.notDestroyed(did, &jmap.SetError{Type: jmap.SetErrNotFound})
 			continue
 		}
-		if st.ext != nil && st.ext.Set != nil && st.ext.Set.Destroy != nil {
-			// The hook sees only records that exist; a missing one gets
-			// the plain notFound below.
-			if _, err := u.Get(st.t.Name, realId); err == nil {
-				serr, err := st.ext.Set.Destroy(u, realId, extra)
-				if err != nil {
-					return err
-				}
-				if serr != nil {
-					resp.notDestroyed(did, serr)
-					continue
-				}
+		// The record's last value is loaded when a hook needs to see it or
+		// an AfterSet outcome needs to keep it; a missing record gets the
+		// plain notFound below either way.
+		var old objectdb.Object
+		hasDestroyHook := st.ext != nil && st.ext.Set != nil && st.ext.Set.Destroy != nil
+		if hasDestroyHook || outcome != nil {
+			obj, err := u.Get(st.t.Name, realId)
+			if err == nil {
+				old = obj
 			} else if !errors.Is(err, objectdb.ErrNotFound) {
 				return err
+			}
+		}
+		if hasDestroyHook && old != nil {
+			serr, err := st.ext.Set.Destroy(u, realId, extra)
+			if err != nil {
+				return err
+			}
+			if serr != nil {
+				resp.notDestroyed(did, serr)
+				continue
 			}
 		}
 		err := u.Destroy(st.t.Name, realId)
@@ -612,6 +747,9 @@ func (st *stdType) processDestroys(u *objectdb.Update, destroy []jmap.Id, create
 		}
 		if err != nil {
 			return err
+		}
+		if outcome != nil && old != nil {
+			outcome.Destroyed[realId] = old
 		}
 		resp.Destroyed = append(resp.Destroyed, realId)
 	}

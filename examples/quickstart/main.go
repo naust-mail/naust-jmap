@@ -43,12 +43,12 @@ import (
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
-	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/providers/backend/memory"
 	"github.com/naust-mail/naust-jmap/core/providers/blob/kvstore"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/providers/notify"
 	"github.com/naust-mail/naust-jmap/core/runtime"
+	"github.com/naust-mail/naust-jmap/examples/internal/demoauth"
 )
 
 func main() {
@@ -58,9 +58,11 @@ func main() {
 	be := memory.New()
 	db := objectdb.New(be, lease.NewInProcess(be))
 
-	// Authentication: a static user list. Real embedders implement
-	// auth.Authenticator against their own accounts.
-	users := auth.NewStatic()
+	// Authentication: a demo user list with argon2id-hashed passwords.
+	// Real embedders implement auth.Authenticator against their own
+	// credential store (and verify a token per request rather than a
+	// password - see the demoauth package doc).
+	users := demoauth.New(demoauth.Default())
 	users.AddUser("demo@example.com", "demo", "Ademo")
 
 	// The datatype, described as data. Property attributes drive the

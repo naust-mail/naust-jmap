@@ -23,14 +23,12 @@ import (
 	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/message"
 )
 
-// emailImport handles Email/import. db is where records land, store holds
-// the uploaded message blobs, core bounds the batch size, and maxMailboxes
-// is the account's tooManyMailboxes limit.
+// emailImport handles Email/import: the materialize seam plus import's own
+// argument decoding, receivedAt resolution, and response shape. core bounds
+// the batch size.
 type emailImport struct {
-	db           *objectdb.DB
-	store        blob.Store
-	core         jmap.CoreCapabilities
-	maxMailboxes *int64
+	mat  materializer
+	core jmap.CoreCapabilities
 }
 
 // importArgs is the Email/import request (section 4.8).
@@ -49,22 +47,15 @@ type emailImportObj struct {
 	ReceivedAt *string         `json:"receivedAt"`
 }
 
-// importCreated is the created-Email report (section 4.8): id, blobId,
-// threadId, size.
-type importCreated struct {
-	Id       jmap.Id `json:"id"`
-	BlobId   jmap.Id `json:"blobId"`
-	ThreadId jmap.Id `json:"threadId"`
-	Size     uint64  `json:"size"`
-}
-
-// importResponse is the Email/import response (section 4.8). created and
-// notCreated are Id[...]|null: an empty (nil) map marshals to null.
+// importResponse is the Email/import response (section 4.8); the created
+// values are the seam's emailCreated report, which carries exactly the
+// section 4.8 properties. created and notCreated are Id[...]|null: an
+// empty (nil) map marshals to null.
 type importResponse struct {
 	AccountId  jmap.Id                    `json:"accountId"`
 	OldState   string                     `json:"oldState"`
 	NewState   string                     `json:"newState"`
-	Created    map[jmap.Id]importCreated  `json:"created"`
+	Created    map[jmap.Id]emailCreated   `json:"created"`
 	NotCreated map[jmap.Id]*jmap.SetError `json:"notCreated"`
 }
 
@@ -85,11 +76,8 @@ func (h emailImport) handle(ctx context.Context, call *runtime.Call) []jmap.Invo
 	}
 
 	// Preflight every EmailImport BEFORE taking the account write lease:
-	// open its blob and parse the message. MIME parsing is the expensive
-	// step and touches nothing in the store, so keeping it off the per-
-	// account write lock means a large or hostile message no longer stalls
-	// other writers to the account while it parses. Blobs are already size-
-	// bounded by the upload path, so no extra cap is applied here.
+	// open its blob and parse the message (the materialize seam's prepare
+	// half; see materialize.go for why parsing stays off the lease).
 	cids := sortedCreationIds(a.Emails)
 	preps := make([]preparedImport, len(cids))
 	for i, cid := range cids {
@@ -101,8 +89,8 @@ func (h emailImport) handle(ctx context.Context, call *runtime.Call) []jmap.Invo
 	}
 
 	resp := importResponse{AccountId: a.AccountId}
-	states, err := h.db.Update(ctx, a.AccountId, func(u *objectdb.Update) error {
-		state, err := h.db.TypeState(ctx, a.AccountId, TypeEmail)
+	states, err := h.mat.db.Update(ctx, a.AccountId, func(u *objectdb.Update) error {
+		state, err := h.mat.db.TypeState(ctx, a.AccountId, TypeEmail)
 		if err != nil {
 			return err
 		}
@@ -125,6 +113,10 @@ func (h emailImport) handle(ctx context.Context, call *runtime.Call) []jmap.Invo
 				resp.setNotCreated(p.cid, serr)
 				continue
 			}
+			// The request-wide creation-id map covers every newly created
+			// record (RFC 8620 section 5.3), so a later "#cid" in the same
+			// request resolves to the imported Email.
+			call.CreatedIds[p.cid] = created.Id
 			resp.setCreated(p.cid, *created)
 		}
 		return nil
@@ -148,15 +140,15 @@ func (h emailImport) handle(ctx context.Context, call *runtime.Call) []jmap.Invo
 type preparedImport struct {
 	cid      jmap.Id
 	obj      emailImportObj
-	msg      *parsed
-	size     uint64
+	pe       *pendingEmail
 	received time.Time
 	serr     *jmap.SetError
 }
 
 // preflight opens and parses one EmailImport's blob without the account
-// lease. A bad EmailImport (missing/unknown/inaccessible blobId, unparseable
-// receivedAt) yields a SetError; a real store failure aborts the whole call.
+// lease (the seam's prepare half). A bad EmailImport (missing/unknown/
+// inaccessible blobId, unparseable receivedAt) yields a SetError; a real
+// store failure aborts the whole call.
 func (h emailImport) preflight(ctx context.Context, call *runtime.Call, acct, cid jmap.Id, raw json.RawMessage) (preparedImport, error) {
 	p := preparedImport{cid: cid}
 	if err := json.Unmarshal(raw, &p.obj); err != nil {
@@ -167,11 +159,7 @@ func (h emailImport) preflight(ctx context.Context, call *runtime.Call, acct, ci
 		p.serr = invalidProp("blobId", "blobId is required")
 		return p, nil
 	}
-	// The blobId is client-supplied, so the open goes through the checked
-	// path: an id that is invalid, unknown to the account, or unreferenced
-	// and uploaded by someone else (RFC 8620 section 6.1) reads as not
-	// found, indistinguishable from an absent blob.
-	rc, size, err := runtime.OpenBlob(ctx, h.db, h.store, acct, p.obj.BlobId, call.Identity)
+	pe, err := h.mat.prepare(ctx, acct, p.obj.BlobId, call.Identity)
 	if errors.Is(err, blob.ErrNotFound) {
 		p.serr = invalidProp("blobId", "blob not found")
 		return p, nil
@@ -179,18 +167,8 @@ func (h emailImport) preflight(ctx context.Context, call *runtime.Call, acct, ci
 	if err != nil {
 		return p, err
 	}
-	defer rc.Close()
-	// Import stores an Email record, so it needs exactly what delivery does: the
-	// headers and the two content-derived fast fields (section 4.1.4). Only the
-	// preview is captured; no attachment is decoded.
-	c := newCapture()
-	c.preview = true
-	p.msg, err = parseMessage(rc, c)
-	if err != nil {
-		return p, err
-	}
-	p.size = uint64(size)
-	received, serr := importReceivedAt(p.obj.ReceivedAt, p.msg.msg)
+	p.pe = pe
+	received, serr := importReceivedAt(p.obj.ReceivedAt, pe.msg.msg)
 	if serr != nil {
 		p.serr = serr
 		return p, nil
@@ -200,47 +178,16 @@ func (h emailImport) preflight(ctx context.Context, call *runtime.Call, acct, ci
 }
 
 // commitOne validates a preflighted EmailImport and inserts it under the
-// lease. mailboxIds and keywords follow the same rules as Email/set (section
-// 4.1.1): the pure validators check them without touching counters, which
-// insertEmail maintains. validateKeywords lowercases in place.
-func (h emailImport) commitOne(u *objectdb.Update, p preparedImport) (*importCreated, *jmap.SetError, error) {
-	rec := objectdb.Object{"mailboxIds": p.obj.MailboxIds}
-	if p.obj.Keywords != nil {
-		rec["keywords"] = p.obj.Keywords
-	} else {
-		rec["keywords"] = json.RawMessage(`{}`)
-	}
-	if serr, err := validateMailboxIds(u, rec, h.maxMailboxes); serr != nil || err != nil {
-		return nil, serr, err
-	}
-	if serr, err := validateKeywords(rec); serr != nil || err != nil {
-		return nil, serr, err
-	}
-	meta := emailMeta{
-		BlobID:     p.obj.BlobId,
-		MailboxIds: rec["mailboxIds"],
-		Keywords:   rec["keywords"],
-		Size:       p.size,
-		ReceivedAt: p.received,
-	}
-	id, err := insertEmail(u, p.msg, meta)
-	if err != nil {
-		return nil, nil, err
-	}
-	stored, err := u.Get(TypeEmail, id)
-	if err != nil {
-		return nil, nil, err
-	}
-	var tid jmap.Id
-	json.Unmarshal(stored["threadId"], &tid)
-	return &importCreated{Id: id, BlobId: p.obj.BlobId, ThreadId: tid, Size: meta.Size}, nil, nil
+// lease (the seam's commit half).
+func (h emailImport) commitOne(u *objectdb.Update, p preparedImport) (*emailCreated, *jmap.SetError, error) {
+	return h.mat.commit(u, p.pe, p.obj.MailboxIds, p.obj.Keywords, p.received)
 }
 
 // setCreated / setNotCreated lazily build the response maps (Id[...]|null:
 // an empty map marshals to null, section 4.8).
-func (r *importResponse) setCreated(cid jmap.Id, c importCreated) {
+func (r *importResponse) setCreated(cid jmap.Id, c emailCreated) {
 	if r.Created == nil {
-		r.Created = make(map[jmap.Id]importCreated)
+		r.Created = make(map[jmap.Id]emailCreated)
 	}
 	r.Created[cid] = c
 }

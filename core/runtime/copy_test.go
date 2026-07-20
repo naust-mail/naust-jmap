@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/naust-mail/naust-jmap/core/internal/authtest"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
 	"github.com/naust-mail/naust-jmap/core/providers/auth"
@@ -18,7 +19,7 @@ import (
 // can write but john can only read.
 func copyServer(t *testing.T, core jmap.CoreCapabilities) *httptest.Server {
 	t.Helper()
-	a := auth.NewStatic()
+	a := authtest.NewStatic()
 	a.AddUser("john@example.com", "secret", "Atest1")
 	a.AddUser("jane@example.com", "secret2", "Ajane")
 	a.AddAccess("john@example.com", "Ateam", auth.Access{Name: "team"})

@@ -163,3 +163,27 @@ func TestEmailImportEAI(t *testing.T) {
 		t.Errorf("from = %v, want the EAI address preserved", obj["from"])
 	}
 }
+
+// TestEmailImportRegistersCreationIds: an imported Email joins the
+// request-wide creation-id map (RFC 8620 section 5.3), so a later "#cid"
+// in the same request resolves to it - here, a destroy in the following
+// call.
+func TestEmailImportRegistersCreationIds(t *testing.T) {
+	ts, db, store := emailServer(t)
+	inbox := createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
+	blobID := uploadBlob(t, db, store, simpleMessage)
+
+	r := callMail(t, ts,
+		inv("Email/import", fmt.Sprintf(
+			`{"accountId":%q,"emails":{"e1":{"blobId":%q,"mailboxIds":{%q:true}}}}`,
+			testAccount, blobID, inbox), "0"),
+		inv("Email/set", fmt.Sprintf(
+			`{"accountId":%q,"destroy":["#e1"]}`, testAccount), "1"))
+	created := methodArgs(t, r, 0, "Email/import")["created"].(map[string]any)
+	realId := created["e1"].(map[string]any)["id"].(string)
+	set := methodArgs(t, r, 1, "Email/set")
+	destroyed, ok := set["destroyed"].([]any)
+	if !ok || len(destroyed) != 1 || destroyed[0] != realId {
+		t.Fatalf("destroy of #e1: %v", set)
+	}
+}

@@ -32,7 +32,8 @@ func (n *InProcess) Publish(_ context.Context, account jmap.Id, types jmap.TypeS
 	}
 }
 
-// Subscribe implements Notifier.
+// Subscribe implements Notifier. An empty or nil accounts set matches
+// nothing, per the interface contract.
 func (n *InProcess) Subscribe(_ context.Context, accounts []jmap.Id) (Subscription, error) {
 	sub := &inProcessSub{
 		parent:   n,
@@ -49,8 +50,23 @@ func (n *InProcess) Subscribe(_ context.Context, accounts []jmap.Id) (Subscripti
 	return sub, nil
 }
 
+// SubscribeAll implements Notifier: the explicit firehose.
+func (n *InProcess) SubscribeAll(_ context.Context) (Subscription, error) {
+	sub := &inProcessSub{
+		parent:  n,
+		pending: make(Changes),
+		wake:    make(chan struct{}, 1),
+	}
+	n.mu.Lock()
+	n.subs[sub] = struct{}{}
+	n.mu.Unlock()
+	return sub, nil
+}
+
 type inProcessSub struct {
-	parent   *InProcess
+	parent *InProcess
+	// accounts filters add; nil means every account (only SubscribeAll
+	// constructs that).
 	accounts map[jmap.Id]bool
 
 	mu      sync.Mutex
@@ -64,7 +80,7 @@ type inProcessSub struct {
 // add merges one commit's changes into the pending set. States are
 // monotonic, so for a type already pending the newest state wins.
 func (s *inProcessSub) add(account jmap.Id, types jmap.TypeState) {
-	if !s.accounts[account] {
+	if s.accounts != nil && !s.accounts[account] {
 		return
 	}
 	s.mu.Lock()

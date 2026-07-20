@@ -11,9 +11,9 @@ import (
 	"testing"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
+	"github.com/naust-mail/naust-jmap/core/internal/authtest"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
-	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/providers/backend/memory"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 )
@@ -66,12 +66,19 @@ func (c *gadgetComputed) Resolve(_ context.Context, _ jmap.Id, stored objectdb.O
 
 func gadgetServer(t *testing.T, ext *Extensions) *httptest.Server {
 	t.Helper()
-	a := auth.NewStatic()
+	return gadgetServerType(t, gadgetType(), ext)
+}
+
+// gadgetServerType is gadgetServer with a custom descriptor, for tests
+// whose semantics need extra properties (an internal one, say).
+func gadgetServerType(t *testing.T, typ *descriptor.Type, ext *Extensions) *httptest.Server {
+	t.Helper()
+	a := authtest.NewStatic()
 	a.AddUser("john@example.com", "secret", "Atest1")
 	be := memory.New()
 	db := objectdb.New(be, lease.NewInProcess(be))
 	p := NewProcessor()
-	if err := RegisterStandardTypeExt(p, db, gadgetType(), DefaultCoreCapabilities(), ext); err != nil {
+	if err := RegisterStandardTypeExt(p, db, typ, DefaultCoreCapabilities(), ext); err != nil {
 		t.Fatal(err)
 	}
 	srv, err := NewServer(a, p, "https://jmap.example.com", DefaultCoreCapabilities())

@@ -84,4 +84,18 @@ type SetError struct {
 	Properties []string `json:"properties,omitzero"`
 	// ExistingId accompanies alreadyExists on /copy.
 	ExistingId Id `json:"existingId,omitzero"`
+	// NotFound accompanies blobNotFound on Email/set create (RFC 8621
+	// section 4.6): every referenced blobId that could not be found.
+	NotFound []Id `json:"notFound,omitzero"`
+	// MaxSize accompanies tooLarge where the defining spec requires the
+	// limit on the error itself (RFC 8621 section 7.5: the maximum size
+	// of a message that may be sent, in octets).
+	MaxSize uint64 `json:"maxSize,omitzero"`
+	// MaxRecipients accompanies tooManyRecipients on EmailSubmission/set
+	// create (RFC 8621 section 7.5).
+	MaxRecipients uint64 `json:"maxRecipients,omitzero"`
+	// InvalidRecipients accompanies invalidRecipients on
+	// EmailSubmission/set create (RFC 8621 section 7.5): the rcptTo
+	// addresses that are not valid for sending to.
+	InvalidRecipients []string `json:"invalidRecipients,omitzero"`
 }

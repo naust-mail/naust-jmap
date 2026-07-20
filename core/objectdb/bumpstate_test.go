@@ -30,6 +30,9 @@ func (c *captureNotifier) Publish(_ context.Context, _ jmap.Id, types jmap.TypeS
 func (c *captureNotifier) Subscribe(context.Context, []jmap.Id) (notify.Subscription, error) {
 	return nil, nil
 }
+func (c *captureNotifier) SubscribeAll(context.Context) (notify.Subscription, error) {
+	return nil, nil
+}
 
 // TestBumpStateAdvancesOnlyThatType: a commit that both writes a record and
 // bumps a push-only type moves both states, and only those two, to the

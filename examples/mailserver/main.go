@@ -15,6 +15,11 @@
 //
 //	go run ./examples/mailserver
 //
+// Or over Postgres instead of SQLite (-postgres replaces -db entirely,
+// single-node only - see drivers/postgres):
+//
+//	go run ./examples/mailserver -postgres 'postgres://user:pass@localhost:5432/naust'
+//
 // A fresh account has no mailboxes, so first create an Inbox (user
 // demo@example.com, password demo). Delivery to an account with no inbox-role
 // Mailbox tempfails by design, so this step is required once:
@@ -57,12 +62,23 @@
 //
 //	curl -su demo@example.com:demo \
 //	  'http://localhost:8080/eventsource?types=EmailDelivery,Email&closeafter=no&ping=30'
+//
+// Sending is wired too (urn:ietf:params:jmap:submission): demo@example.com
+// has an Identity pre-provisioned (find its id with Identity/get) and may
+// send as itself. With no -relay flag the server runs in loopback mode -
+// "sending" delivers through the local pipeline, so mail addressed to an
+// account this server hosts lands in that inbox and anything else is
+// rejected per recipient, exactly as a relay would report an unknown
+// mailbox. Point -relay at a real smarthost (with -relay-user, -relay-pass,
+// -relay-tls) to relay outbound instead.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -70,6 +86,7 @@ import (
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
 	"github.com/naust-mail/naust-jmap/core/providers/auth"
+	"github.com/naust-mail/naust-jmap/core/providers/backend"
 	"github.com/naust-mail/naust-jmap/core/providers/blob"
 	"github.com/naust-mail/naust-jmap/core/providers/blob/chunkstore"
 	"github.com/naust-mail/naust-jmap/core/providers/blob/fsstore"
@@ -78,7 +95,9 @@ import (
 	"github.com/naust-mail/naust-jmap/core/providers/notify"
 	"github.com/naust-mail/naust-jmap/core/runtime"
 	"github.com/naust-mail/naust-jmap/datatypes/mail"
+	"github.com/naust-mail/naust-jmap/drivers/postgres"
 	"github.com/naust-mail/naust-jmap/drivers/sqlite"
+	"github.com/naust-mail/naust-jmap/examples/internal/demoauth"
 )
 
 // staticResolver maps envelope recipients to accounts. A real deployment
@@ -92,25 +111,122 @@ func (m staticResolver) Resolve(_ context.Context, recipient string) (jmap.Id, b
 	return id, ok
 }
 
+// loopbackSubmitter is the no-relay default: it "sends" by handing the
+// message to the local Deliverer, so the demo works with no smarthost
+// and a submission to a locally hosted address genuinely arrives in that
+// inbox over the same pipeline as LMTP. It implements the same Submitter
+// socket a real embedder plugs (mail.SMTPRelay is the real one), and it
+// is honest about scope: a recipient this server does not host is
+// rejected per recipient, as a relay would report an unknown mailbox.
+type loopbackSubmitter struct {
+	d *mail.Deliverer
+}
+
+func (l loopbackSubmitter) Submit(ctx context.Context, env mail.SubmissionEnvelope, msg io.Reader) ([]mail.RecipientResult, error) {
+	rcpts := make([]string, len(env.Recipients))
+	for i, r := range env.Recipients {
+		rcpts[i] = r.Email
+	}
+	events := l.d.Deliver(ctx, mail.Envelope{MailFrom: env.MailFrom, Recipients: rcpts}, msg)
+	results := make([]mail.RecipientResult, 0, len(events))
+	for _, ev := range events {
+		var reply string
+		switch ev.Outcome {
+		case mail.Accepted:
+			reply = "250 2.0.0 delivered to local mailbox"
+		case mail.Rejected:
+			reply = "550 5.1.1 no such local mailbox (loopback mode delivers to local accounts only)"
+		default:
+			reply = "451 4.3.0 local delivery failed: " + ev.Reason
+		}
+		results = append(results, mail.RecipientResult{Recipient: ev.Recipient, Outcome: ev.Outcome, Reply: reply})
+	}
+	return results, nil
+}
+
+// ensureIdentity provisions one Identity for the account through the
+// normal front door (Identity/set) unless it already has one. There is
+// deliberately no side-door helper API for this: identities are records
+// the client can see, so setup creates them the same way a client would.
+func ensureIdentity(proc *runtime.Processor, acct jmap.Id, email string) error {
+	ident := &auth.Identity{
+		Username: email,
+		Accounts: map[jmap.Id]auth.Access{acct: {Name: email, Personal: true}},
+	}
+	using := []string{jmap.CoreCapability, mail.SubmissionCapabilityURI}
+	call := func(name, args string) (json.RawMessage, error) {
+		resp := proc.Process(context.Background(), &jmap.Request{
+			Using:       using,
+			MethodCalls: []jmap.Invocation{{Name: name, Args: json.RawMessage(args), CallID: "0"}},
+		}, ident, "")
+		if len(resp.MethodResponses) == 0 || resp.MethodResponses[0].Name != name {
+			return nil, fmt.Errorf("%s failed: %v", name, resp.MethodResponses)
+		}
+		return resp.MethodResponses[0].Args, nil
+	}
+	got, err := call("Identity/get", fmt.Sprintf(`{"accountId":%q}`, acct))
+	if err != nil {
+		return err
+	}
+	var list struct {
+		List []json.RawMessage `json:"list"`
+	}
+	if err := json.Unmarshal(got, &list); err != nil {
+		return err
+	}
+	if len(list.List) > 0 {
+		return nil
+	}
+	got, err = call("Identity/set", fmt.Sprintf(
+		`{"accountId":%q,"create":{"i":{"email":%q}}}`, acct, email))
+	if err != nil {
+		return err
+	}
+	var set struct {
+		Created map[string]json.RawMessage `json:"created"`
+	}
+	if err := json.Unmarshal(got, &set); err != nil {
+		return err
+	}
+	if len(set.Created) == 0 {
+		return fmt.Errorf("identity for %s not created: %s", email, got)
+	}
+	return nil
+}
+
 func main() {
 	dbPath := flag.String("db", "./naust-mail.db", "SQLite database file")
+	pgDSN := flag.String("postgres", "", "Postgres DSN (e.g. postgres://user:pass@host:5432/db); when set, replaces the SQLite backend entirely and -db is ignored (single-node only, no cluster)")
 	httpAddr := flag.String("http", "localhost:8080", "JMAP HTTP listen address")
 	lmtpAddr := flag.String("lmtp", "127.0.0.1:2400", "LMTP listen address (never port 25)")
 	blobStore := flag.String("blobs", "chunk", "raw-message blob store: chunk (streaming), kv (whole blob in one value), or fs (one file per message)")
 	blobDir := flag.String("blob-dir", "./naust-blobs", "directory for raw messages, with -blobs fs")
 	accounts := flag.Int("accounts", 0, "also register accounts u1..uN (for benchmarking delivery spread across accounts)")
+	ingestInFlight := flag.Int("ingest-inflight", 64, "max concurrent /ingest requests before 503 (benchmarking)")
+	relay := flag.String("relay", "", "outbound SMTP relay as host:port; empty runs loopback mode (sending delivers to local accounts only)")
+	relayUser := flag.String("relay-user", "", "relay SASL PLAIN username (with -relay-pass)")
+	relayPass := flag.String("relay-pass", "", "relay SASL PLAIN password")
+	relayTLS := flag.String("relay-tls", "starttls", "relay TLS mode: starttls, implicit, or plain")
 	flag.Parse()
 
-	// Persistence: one SQLite file is both the object backend and the
-	// raw-message blob store. Swap sqlite.Open for another driver module and
-	// nothing else changes.
-	store, err := sqlite.Open(*dbPath)
+	// Persistence: one backend is both the object store and the raw-message
+	// blob store. Default is SQLite; -postgres swaps in the Postgres driver
+	// instead - single-node only (lease/notify below stay InProcess either
+	// way; a real cluster deployment also swaps those for store-backed
+	// implementations, which are not built yet).
+	var store backend.Backend
+	var err error
+	if *pgDSN != "" {
+		store, err = postgres.Open(context.Background(), *pgDSN)
+	} else {
+		store, err = sqlite.Open(*dbPath)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
 	db := objectdb.New(store, lease.NewInProcess(store))
 
-	// The raw-message blob store shares the same SQLite file. Both options
+	// The raw-message blob store shares the same backend. Both options
 	// satisfy blob.Store, so nothing downstream changes.
 	//
 	// chunkstore splits each blob into fixed pieces and never holds a whole
@@ -158,7 +274,9 @@ func main() {
 	// the writer lease is per ACCOUNT, so delivering everything to one account
 	// measures lease contention rather than ingest throughput, and the two are
 	// only distinguishable by varying this.
-	users := auth.NewStatic()
+	// Fast argon2id cost: this is a throughput benchmark, so the KDF is
+	// deliberately cheap and not part of what is being measured.
+	users := demoauth.New(demoauth.Fast())
 	users.AddUser("demo@example.com", "demo", "Ademo")
 	resolve := staticResolver{"demo@example.com": "Ademo"}
 	for i := 1; i <= *accounts; i++ {
@@ -184,11 +302,29 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Sending (urn:ietf:params:jmap:submission): Identity and
+	// EmailSubmission gated by a SendPolicy - deny by default, because a
+	// permissive sending default is an open relay. Only demo may send here,
+	// and only as itself.
+	policy := mail.NewStaticSendPolicy()
+	policy.Allow("Ademo", "demo@example.com")
+	limits := mail.DefaultSubmissionLimits()
+	if err := mail.RegisterIdentity(proc, db, policy, core); err != nil {
+		log.Fatal(err)
+	}
+	queue, err := mail.RegisterEmailSubmission(proc, db, blobs, core, policy, limits)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	srv, err := runtime.NewServer(users, proc, "http://"+*httpAddr, core)
 	if err != nil {
 		log.Fatal(err)
 	}
 	if err := srv.RegisterCapability(mail.CapabilityURI, struct{}{}, acctCap); err != nil {
+		log.Fatal(err)
+	}
+	if err := srv.RegisterCapability(mail.SubmissionCapabilityURI, struct{}{}, mail.SubmissionAccountCapabilityFor(limits)); err != nil {
 		log.Fatal(err)
 	}
 	// Binary data (RFC 8620 section 6) and push (section 7): blob
@@ -202,6 +338,49 @@ func main() {
 	// Delivery: the same Deliverer feeds both adapters, so LMTP and HTTP
 	// ingest produce identical Emails and identical per-recipient verdicts.
 	deliverer := mail.NewDeliverer(db, blobs, resolve)
+
+	// The sending worker: real relay when -relay is set, loopback through
+	// the local Deliverer otherwise. Either way it is the same Submitter
+	// socket and the same queue engine.
+	var submitter mail.Submitter
+	if *relay != "" {
+		cfg := mail.SMTPRelayConfig{Addr: *relay}
+		switch *relayTLS {
+		case "starttls":
+			cfg.Mode = mail.RequireSTARTTLS
+		case "implicit":
+			cfg.Mode = mail.ImplicitTLS
+		case "plain":
+			// The operator chose plaintext explicitly, so credentials may
+			// ride on it too (a localhost relay hop, typically).
+			cfg.Mode = mail.Plaintext
+			cfg.AllowPlaintextAuth = true
+		default:
+			log.Fatalf("-relay-tls must be starttls, implicit or plain, got %q", *relayTLS)
+		}
+		if *relayUser != "" {
+			cfg.Auth = &mail.PlainAuth{Username: *relayUser, Password: *relayPass}
+		}
+		submitter, err = mail.NewSMTPRelay(cfg)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("relaying outbound mail via %s (%s)", *relay, *relayTLS)
+	} else {
+		submitter = loopbackSubmitter{d: deliverer}
+		log.Printf("loopback sending: no -relay set, submissions deliver to local accounts only")
+	}
+	worker, err := mail.NewSubmissionWorker(queue, submitter, mail.SubmissionWorkerConfig{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	go worker.Run(context.Background())
+
+	// Sending needs an Identity; provision demo's up front so the demo
+	// works on first login.
+	if err := ensureIdentity(proc, "Ademo", "demo@example.com"); err != nil {
+		log.Fatal(err)
+	}
 
 	// LMTP for an MTA (RFC 2033 requires a channel other than port 25).
 	ln, err := net.Listen("tcp", *lmtpAddr)
@@ -218,7 +397,7 @@ func main() {
 	// adapter, everything else is the JMAP server (/api, /.well-known/jmap,
 	// /eventsource, the blob endpoints).
 	root := http.NewServeMux()
-	root.Handle("/ingest", mail.NewHTTPIngest(deliverer))
+	root.Handle("/ingest", mail.NewHTTPIngest(deliverer, mail.WithMaxIngestInFlight(*ingestInFlight)))
 	root.Handle("/", srv)
 
 	log.Printf("JMAP at http://%s/.well-known/jmap (demo@example.com / demo)", *httpAddr)

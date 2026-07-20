@@ -319,24 +319,40 @@ func (bs *blobSupport) copy(ctx context.Context, call *Call) []jmap.Invocation {
 }
 
 func (bs *blobSupport) copyOne(ctx context.Context, from, to, blobID jmap.Id, ident *auth.Identity) (jmap.Id, *jmap.SetError, error) {
-	// Same access rule as download; a source blob the caller may not
-	// read is notFound (section 6.3 defines notFound for missing ids).
-	rc, _, err := OpenBlob(ctx, bs.db, bs.store, from, blobID, ident)
+	// A source blob the caller may not read is notFound (section 6.3
+	// defines notFound for missing ids).
+	newID, err := CopyBlob(ctx, bs.db, bs.store, from, to, blobID, ident)
 	if errors.Is(err, blob.ErrNotFound) {
 		return "", &jmap.SetError{Type: jmap.SetErrNotFound}, nil
 	}
 	if err != nil {
 		return "", nil, err
 	}
+	return newID, nil, nil
+}
+
+// CopyBlob copies a blob the caller can read in the from account into the
+// to account, returning its id there (the content address is recomputed as
+// the bytes flow, so the copy keeps the source blobId, RFC 8620 section
+// 6.3). The source open applies the same access rule as download (see
+// OpenBlob; a denial reads as blob.ErrNotFound), and the bytes stream one
+// piece at a time - a large blob is never buffered whole. The copy is an
+// upload into the target account: recorded before the content is published
+// and under the account lease, like the upload endpoint, so it exists
+// there unreferenced, uploader-only, on the GC clock without a
+// finalize-versus-sweep race. Blob/copy and RFC 8621 Email/copy (which
+// must bring the message bytes into the target account before creating
+// the Email there) go through it.
+func CopyBlob(ctx context.Context, db *objectdb.DB, store blob.Store, from, to, blobID jmap.Id, ident *auth.Identity) (jmap.Id, error) {
+	rc, _, err := OpenBlob(ctx, db, store, from, blobID, ident)
+	if err != nil {
+		return "", err
+	}
 	defer rc.Close()
 
-	// Stream the source into the target account rather than buffering the
-	// whole blob in memory: a large blob is copied one piece at a time.
-	// The content address is recomputed as the bytes flow, so the copy
-	// keeps the source blobId (RFC 8620 section 6.3).
-	w, err := bs.store.Create(ctx, to)
+	w, err := store.Create(ctx, to)
 	if err != nil {
-		return "", nil, err
+		return "", err
 	}
 	committed := false
 	defer func() {
@@ -345,16 +361,16 @@ func (bs *blobSupport) copyOne(ctx context.Context, from, to, blobID jmap.Id, id
 		}
 	}()
 	if _, err := io.Copy(w, rc); err != nil {
-		return "", nil, err
+		return "", err
 	}
-	// The copy is an upload into the target account: recorded before the
-	// content is published and under the account lease, like handleUpload,
-	// so it exists there unreferenced, uploader-only, on the GC clock
-	// without a finalize-versus-sweep race.
-	newID, err := bs.db.FinalizeBlobUpload(ctx, to, w, ident.Username, time.Now())
+	uploader := ""
+	if ident != nil {
+		uploader = ident.Username
+	}
+	newID, err := db.FinalizeBlobUpload(ctx, to, w, uploader, time.Now())
 	if err != nil {
-		return "", nil, err
+		return "", err
 	}
 	committed = true
-	return newID, nil, nil
+	return newID, nil
 }

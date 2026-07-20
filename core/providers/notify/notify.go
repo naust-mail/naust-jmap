@@ -41,8 +41,16 @@ type Notifier interface {
 	// and a caller that could observe a delivery failure might be
 	// tempted to fail the write over it.
 	Publish(ctx context.Context, account jmap.Id, types jmap.TypeState)
-	// Subscribe registers interest in a set of accounts.
+	// Subscribe registers interest in a set of accounts. An empty or nil
+	// set matches nothing - the firehose is only ever explicit
+	// (SubscribeAll), so an accidentally-empty list fails toward silence,
+	// never toward receiving every account's changes.
 	Subscribe(ctx context.Context, accounts []jmap.Id) (Subscription, error)
+	// SubscribeAll registers interest in every account (the firehose -
+	// e.g. a queue worker watching for commits from any process sharing
+	// the store). A deliberately separate method: subscribing to
+	// everything is an intent a caller must spell out.
+	SubscribeAll(ctx context.Context) (Subscription, error)
 }
 
 // Subscription receives coalesced changes for its accounts. Changes

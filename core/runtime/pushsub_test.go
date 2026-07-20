@@ -15,9 +15,9 @@ import (
 	"time"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
+	"github.com/naust-mail/naust-jmap/core/internal/authtest"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
-	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/providers/backend/memory"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/providers/notify"
@@ -65,7 +65,7 @@ type pushRig struct {
 func newPushRig(t *testing.T, client *http.Client, prior *pushRig) *pushRig {
 	t.Helper()
 	core := DefaultCoreCapabilities()
-	a := auth.NewStatic()
+	a := authtest.NewStatic()
 	a.AddUser("john@example.com", "secret", "Atest1")
 	a.AddUser("jane@example.com", "secret2", "Atest2")
 	rig := &pushRig{}

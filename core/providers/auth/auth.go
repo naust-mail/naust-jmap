@@ -5,8 +5,6 @@
 package auth
 
 import (
-	"crypto/sha256"
-	"crypto/subtle"
 	"errors"
 	"net/http"
 
@@ -60,67 +58,4 @@ var ErrUnauthenticated = errors.New("auth: unauthenticated")
 // caller or reject with ErrUnauthenticated.
 type Authenticator interface {
 	Authenticate(r *http.Request) (*Identity, error)
-}
-
-// Static authenticates HTTP Basic credentials against a fixed in-memory
-// user set. It is for tests and development only: passwords are held in
-// plain text and compared in constant time, but never hashed.
-type Static struct {
-	users map[string]staticUser
-}
-
-type staticUser struct {
-	password string
-	identity Identity
-}
-
-// NewStatic returns an empty Static authenticator.
-func NewStatic() *Static {
-	return &Static{users: make(map[string]staticUser)}
-}
-
-// AddUser registers username/password with a single personal account.
-func (s *Static) AddUser(username, password string, accountID jmap.Id) {
-	s.users[username] = staticUser{
-		password: password,
-		identity: Identity{
-			Username: username,
-			Accounts: map[jmap.Id]Access{accountID: {Name: username, Personal: true}},
-			Primary:  accountID,
-		},
-	}
-}
-
-// AddAccess grants an already-added user access to a further account,
-// e.g. a shared team account. Unknown usernames are ignored.
-func (s *Static) AddAccess(username string, accountID jmap.Id, access Access) {
-	if u, ok := s.users[username]; ok {
-		u.identity.Accounts[accountID] = access
-	}
-}
-
-// Authenticate implements Authenticator.
-func (s *Static) Authenticate(r *http.Request) (*Identity, error) {
-	username, password, ok := r.BasicAuth()
-	if !ok {
-		return nil, ErrUnauthenticated
-	}
-	u, found := s.users[username]
-	// Compare even for unknown users so timing does not reveal existence.
-	expected := u.password
-	if !found {
-		expected = ""
-	}
-	// Compare fixed-width digests, not the raw strings: subtle.ConstantTimeCompare
-	// returns early when its inputs differ in length, so comparing the passwords
-	// directly would leak the expected length through timing. Hashing both sides
-	// to 32 octets first makes the comparison length-independent.
-	got := sha256.Sum256([]byte(password))
-	want := sha256.Sum256([]byte(expected))
-	match := subtle.ConstantTimeCompare(got[:], want[:]) == 1
-	if !found || !match {
-		return nil, ErrUnauthenticated
-	}
-	id := u.identity
-	return &id, nil
 }

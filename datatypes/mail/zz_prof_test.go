@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime/pprof"
 
 	"github.com/naust-mail/naust-jmap/core/providers/blob/fsstore"
@@ -16,6 +17,18 @@ import (
 	"testing"
 	"time"
 )
+
+// profPath returns a stable location for profile output, creating the
+// directory on first use. Profiles must outlive the test run for
+// go tool pprof, so t.TempDir (removed at cleanup) is not usable.
+func profPath(t *testing.T, name string) string {
+	t.Helper()
+	dir := filepath.Join(os.TempDir(), "naust-prof")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(dir, name)
+}
 
 func benchMessage(seq int) string {
 	payload := make([]byte, 1<<20) // 1 MiB, as the ingest benchmark uses
@@ -62,7 +75,7 @@ func TestZZProfileDelivery(t *testing.T) {
 	}
 	wire := len(msgs[0])
 
-	f, err := os.Create("/tmp/claude-1000/deliver.prof")
+	f, err := os.Create(profPath(t, "deliver.prof"))
 	if err != nil {
 		t.Fatal(err)
 	}

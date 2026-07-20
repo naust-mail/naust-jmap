@@ -8,13 +8,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/naust-mail/naust-jmap/core/internal/authtest"
 	"github.com/naust-mail/naust-jmap/core/jmap"
-	"github.com/naust-mail/naust-jmap/core/providers/auth"
 )
 
 func testServer(t *testing.T, core jmap.CoreCapabilities) *httptest.Server {
 	t.Helper()
-	a := auth.NewStatic()
+	a := authtest.NewStatic()
 	a.AddUser("john@example.com", "secret", "Atest1")
 	srv, err := NewServer(a, NewProcessor(), "https://jmap.example.com", core)
 	if err != nil {

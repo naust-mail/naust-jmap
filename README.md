@@ -150,7 +150,7 @@ from its descriptor, not written per type.
 <summary>Design decisions worth knowing about</summary>
 
 Where the RFCs leave a behavior to the server, the choice is recorded here so
-embedders know what to expect. Both entries below concern the mail module
+embedders know what to expect. The entries below concern the mail module
 (RFC 8621); see Mail below.
 
 **Threads never merge.** Emails are grouped into Threads by their
@@ -175,18 +175,47 @@ switching semantics would require a full recount, and one correct behavior
 beats two switchable ones. Accounts with no trash-role Mailbox naturally get
 the simple behavior.
 
+**Composing rejects, never repairs.** `Email/set` create generates the RFC
+5322 message exactly from the properties given: anything the generator cannot
+represent faithfully is an `invalidProperties` SetError, not a silent fix-up.
+The server adds only what the spec assigns it, including missing `Date` and
+`Message-ID` headers; the domain synthesized Message-IDs live under is
+configuration (`mail.WithMessageIDDomain`), never guessed from a hostname.
+
+**The submission records are the queue.** There is no separate outbound queue
+store: an `EmailSubmission` with work remaining carries a due-time index
+entry, and the sending worker is a reader of that index. The database is the
+coordination point - any process sharing the store discovers queued work
+through a periodic scan of a tag worklist (worst case one scan interval,
+default a minute), an in-process bell is only a latency optimization, and
+claims are wall-clock stamps verified under the account lease, so workers
+never double-send and a crashed claim is reclaimed after a window. Retries
+follow a backoff schedule; abandonment requires both an age past
+`GiveUpAfter` and at least `MinAttempts` real attempts, so a long worker
+outage cannot instantly bounce stale mail. `ProcessDue` is the manual crank
+over the same engine (a queue flush, a pacer, a deterministic test).
+
+**Undo send is cancellation before relay.** `undoStatus` stays `pending`
+until a recipient is irrevocably handed to the smarthost, so a client can
+cancel any queued submission - including one held by FUTURERELEASE (RFC
+4865), which this module implements natively: the hold is `sendAt` in the
+queue, nothing is parked on the smarthost. Holds beyond `maxDelayedSend` are
+rejected, not clamped.
+
 </details>
 
 ## Mail (RFC 8621)
 
-The first datatype module, `datatypes/mail`, implements RFC 8621's read model:
-Mailbox, Thread and Email as descriptor types over the derived RFC 8620
-machinery, plus message delivery (which sits below the JMAP protocol) through
-LMTP and HTTP ingest adapters. Composing and sending mail is the next
-milestone; see the Roadmap.
+The first datatype module, `datatypes/mail`, implements RFC 8621: Mailbox,
+Thread, Email, Identity and EmailSubmission as descriptor types over the
+derived RFC 8620 machinery - reading, composing and sending - plus message
+delivery (which sits below the JMAP protocol) through LMTP and HTTP ingest
+adapters, and a sending worker that relays queued submissions through a
+`Submitter` socket (a reference SMTP relay ships; sending is gated by a
+deny-by-default `SendPolicy`).
 
-A complete, persistent mail server - the sqlite driver, all three types, both
-delivery adapters, and push - is in
+A complete, persistent mail server - the sqlite driver, all five types, both
+delivery adapters, sending, and push - is in
 [`examples/mailserver`](examples/mailserver/main.go):
 
 ```sh
@@ -195,7 +224,9 @@ go run ./examples/mailserver
 
 It serves JMAP on `:8080`, accepts LMTP on `127.0.0.1:2400`, and takes an HTTP
 ingest `POST` on `/ingest`; the file's header walks through creating an Inbox,
-delivering a message both ways, and reading it back over JMAP.
+delivering a message both ways, and reading it back over JMAP. With no
+`-relay` flag it "sends" by delivering to local accounts (loopback mode);
+`-relay host:port` relays outbound through a real smarthost.
 
 <details>
 <summary>RFC 8621 support matrix</summary>
@@ -209,14 +240,17 @@ delivering a message both ways, and reading it back over JMAP.
 | `Email/get`                                 | Yes    | stored fast fields + on-demand MIME parse; `header:{name}:as{Form}:all` parsed forms      |
 | `Email/query`                               | Yes    | every section 4.4.1 condition, section 4.4.2 sort, `collapseThreads`, fast total          |
 | `Email/set` (keywords, mailboxIds, destroy) | Yes    | flag and file existing mail; per-record atomic                                            |
-| `Email/set` (create / compose)              | M3     | building a message from parts is the write slice                                          |
+| `Email/set` (create / compose)              | Yes    | strict-reject message generation from parts (see Design decisions)                        |
 | `Email/import`, `Email/parse`               | Yes    | ingest an uploaded blob; parse a blob without storing an Email                            |
-| `Email/copy`                                | M3     | cross-account copy lands with the write slice                                             |
+| `Email/copy`                                | Yes    | cross-account copy with `onSuccessDestroyOriginal`                                        |
 | `SearchSnippet/get`                         | Yes    | highlighted subject and body preview                                                      |
 | Delivery (LMTP, HTTP ingest)                | Yes    | transport-agnostic `Deliverer`; RFC 2033 LMTP; host-provided recipient `Resolver`         |
 | `EmailDelivery` push type                   | Yes    | section 1.5 method-less push; state advances on new mail only                             |
-| `EmailSubmission`, `Identity`               | M3     | outbound mail                                                                             |
-| `VacationResponse`                          | M3     |                                                                                           |
+| `Identity/get`, `/changes`, `/set`          | Yes    | section 6 defaults, `SendPolicy`-gated creation, immutable `email`                        |
+| `EmailSubmission` (all methods)             | Yes    | section 7 envelope derivation, section 7.5 error taxonomy, `onSuccessUpdateEmail/Destroy` |
+| Sending worker + SMTP relay                 | Yes    | records-as-queue worker (see Design decisions); reference `Submitter` over SMTP, RFC 3461 |
+| FUTURERELEASE (RFC 4865)                    | Yes    | native holds via `sendAt`; over-limit or conflicting holds rejected, not clamped          |
+| `VacationResponse`                          | Planned | own capability (section 8), a later module                                               |
 
 Search is a swappable interface (`mail.Searcher`); the built-in implementation
 is case-insensitive substring matching. MDN (RFC 9007), S/MIME verification
@@ -226,11 +260,11 @@ is case-insensitive substring matching. MDN (RFC 9007), S/MIME verification
 
 ## Roadmap
 
-naust-jmap is pre-release: no tagged versions yet. The mail read model (see
-Mail above) is implemented. Coming next, in order:
+naust-jmap is pre-release: no tagged versions yet. The mail module (see Mail
+above) reads, composes and sends. Coming next, in order:
 
-- Mail write: composing an `Email` (`Email/set` create, `Email/copy`) and
-  sending it (`EmailSubmission`, `Identity`)
+- DSN/MDN ingestion into `EmailSubmission` (`dsnBlobIds`, final
+  `deliveryStatus`), and `VacationResponse`
 - MDN, S/MIME verification, and quotas as further RFC 8621-family modules
 - A Postgres driver and multi-node cluster testing
 

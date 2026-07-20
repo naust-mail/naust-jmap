@@ -49,7 +49,7 @@ func TestImportPreflightHoldsNoLease(t *testing.T) {
 	call := &runtime.Call{Identity: &auth.Identity{Username: "john@example.com"}}
 
 	bs := &blockingStore{Store: store, entered: make(chan struct{}), release: make(chan struct{})}
-	h := emailImport{db: db, store: bs, core: runtime.DefaultCoreCapabilities()}
+	h := emailImport{mat: materializer{db: db, store: bs}, core: runtime.DefaultCoreCapabilities()}
 	importObj := json.RawMessage(fmt.Sprintf(`{"blobId":%q,"mailboxIds":{"MBx":true}}`, blobID))
 
 	done := make(chan struct{})

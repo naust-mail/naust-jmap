@@ -141,3 +141,45 @@ func TestClose(t *testing.T) {
 		t.Fatalf("live subscriber after peer close: %v, %v", got, err)
 	}
 }
+
+// TestFirehoseSubscription: SubscribeAll receives every account's
+// changes (what a queue worker uses to wake on commits from any process
+// sharing the store), while Subscribe with an empty OR nil set receives
+// nothing - an accidentally-empty list fails toward silence, never
+// toward the firehose.
+func TestFirehoseSubscription(t *testing.T) {
+	n := NewInProcess()
+	ctx := context.Background()
+	fire, err := n.SubscribeAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fire.Close()
+	none, err := n.Subscribe(ctx, []jmap.Id{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer none.Close()
+	nilNone, err := n.Subscribe(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nilNone.Close()
+
+	n.Publish(ctx, "Aone", jmap.TypeState{"Email": "5"})
+	n.Publish(ctx, "Atwo", jmap.TypeState{"EmailSubmission": "9"})
+
+	got, err := waitFor(t, fire, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Changes{
+		"Aone": jmap.TypeState{"Email": "5"},
+		"Atwo": jmap.TypeState{"EmailSubmission": "9"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("firehose Changes = %v, want %v", got, want)
+	}
+	mustTimeOut(t, none)
+	mustTimeOut(t, nilNone)
+}

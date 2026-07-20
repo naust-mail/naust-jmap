@@ -116,6 +116,28 @@ func TestEmailQueryKeywords(t *testing.T) {
 	}
 }
 
+// TestEmailQueryKeywordCaseFold checks that keyword conditions and sorts
+// match case-insensitively (section 4.1.1): a mixed-case filter value must
+// find an Email whose stored keyword is lowercased.
+func TestEmailQueryKeywordCaseFold(t *testing.T) {
+	ts, db, store := emailServer(t)
+	inbox := createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
+	seen := putEmail(t, db, store, threadMsg("Seen", map[string]string{"Message-ID": "<a@x>"}), mset(inbox), mset("$seen"))
+
+	has := qIds(t, emailQuery(t, ts, fmt.Sprintf(`{"accountId":%q,"filter":{"hasKeyword":"$Seen"}}`, testAccount)))
+	if len(has) != 1 || has[0] != seen {
+		t.Errorf("hasKeyword $Seen = %v, want {%s}", has, seen)
+	}
+	not := qIds(t, emailQuery(t, ts, fmt.Sprintf(`{"accountId":%q,"filter":{"notKeyword":"$SEEN"}}`, testAccount)))
+	if len(not) != 0 {
+		t.Errorf("notKeyword $SEEN = %v, want none", not)
+	}
+	sorted := qIds(t, emailQuery(t, ts, fmt.Sprintf(`{"accountId":%q,"sort":[{"property":"hasKeyword","keyword":"$Seen"}]}`, testAccount)))
+	if len(sorted) != 1 || sorted[0] != seen {
+		t.Errorf("sort hasKeyword $Seen = %v, want {%s}", sorted, seen)
+	}
+}
+
 // TestEmailQueryThreadKeywords covers the section 4.4.1 thread-scoped
 // conditions on a two-Email Thread where only one Email is flagged.
 func TestEmailQueryThreadKeywords(t *testing.T) {

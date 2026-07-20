@@ -124,19 +124,11 @@ func (st *stdType) copy(ctx context.Context, call *Call) []jmap.Invocation {
 				destroy = append(destroy, id)
 			}
 		}
-		raw, err := json.Marshal(setArgs{
+		out = append(out, st.p.ImplicitSet(ctx, st.t.Name, setArgs{
 			AccountId: a.FromAccountId,
 			IfInState: a.DestroyFromIfInState,
 			Destroy:   destroy,
-		})
-		if err != nil {
-			return append(out, fail(call.CallID, jmap.ErrServerFail, err.Error())...)
-		}
-		implicit := &Call{
-			Name: st.t.Name + "/set", Args: raw, CallID: call.CallID,
-			Identity: call.Identity, CreatedIds: call.CreatedIds,
-		}
-		out = append(out, st.set(ctx, implicit)...)
+		}, call)...)
 	}
 	return out
 }

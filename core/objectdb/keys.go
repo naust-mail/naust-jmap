@@ -29,8 +29,9 @@ import (
 // segment). The "B" tag is reserved: the KV blob store (blob/kvstore)
 // keeps blob content under {acct} B {blobId} when sharing a backend.
 // The top-level "!P" range is reserved for push subscription records
-// (package pushsub); "!" is outside the jmap.Id alphabet, so that
-// range can never be an account's.
+// (package pushsub), and "!tag" holds the account-tag sets (tagKey
+// below); "!" is outside the jmap.Id alphabet, so those ranges can
+// never be an account's.
 
 // key concatenates encoded segments.
 func key(segs ...[]byte) []byte { return keyenc.Key(segs...) }
@@ -59,6 +60,21 @@ func seqKey(acct jmap.Id) []byte { return key(seg(string(acct)), seg("q")) }
 
 func typeStateKey(acct jmap.Id, typeName string) []byte {
 	return key(seg(string(acct)), seg("s"), seg(typeName))
+}
+
+// tagExists is the built-in account tag every commit sets: its tag set
+// is the account registry (see DB.Accounts).
+const tagExists = "exists"
+
+// tagKey is an account's entry in one account-tag set. Tags are named
+// sets of account ids ("!tag" {tag} {acct}, value empty): "exists" is
+// the registry every commit maintains, and datatypes maintain worklist
+// tags of their own through Update.SetAccountTag/ClearAccountTag. The
+// range starts with "!", a byte outside the RFC 8620 section 1.2 Id
+// alphabet, so it can never collide with a key of an account's own
+// range (whose first segment is the account id).
+func tagKey(tag string, acct jmap.Id) []byte {
+	return key(seg("!tag"), seg(tag), seg(string(acct)))
 }
 
 func uploadKey(acct, blobID jmap.Id) []byte {

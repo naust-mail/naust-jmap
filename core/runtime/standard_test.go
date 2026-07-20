@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
+	"github.com/naust-mail/naust-jmap/core/internal/authtest"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
 	"github.com/naust-mail/naust-jmap/core/providers/auth"
@@ -16,7 +17,7 @@ import (
 	"github.com/naust-mail/naust-jmap/core/tuning"
 )
 
-// TestNote is the boring M0 datatype: one property of each interesting
+// TestNote is the boring baseline datatype: one property of each interesting
 // attribute so every RFC 8620 section 5.3 rule has a target.
 func testNoteType() *descriptor.Type {
 	return &descriptor.Type{
@@ -37,7 +38,7 @@ func testNoteType() *descriptor.Type {
 
 func noteServer(t *testing.T, core jmap.CoreCapabilities) *httptest.Server {
 	t.Helper()
-	a := auth.NewStatic()
+	a := authtest.NewStatic()
 	a.AddUser("john@example.com", "secret", "Atest1")
 	be := memory.New()
 	db := objectdb.New(be, lease.NewInProcess(be))

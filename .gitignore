@@ -11,3 +11,6 @@
 # hidden folders
 .[a-zA-Z0-9]*/
 .[a-zA-Z0-9]*/**/*
+# Example binaries (go build output in-place)
+/examples/mailserver/mailserver
+/examples/quickstart/quickstart

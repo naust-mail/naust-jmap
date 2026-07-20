@@ -15,7 +15,6 @@ import (
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
-	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/providers/backend/memory"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/runtime"
@@ -28,7 +27,7 @@ const testAccount = "Atest1"
 // server-side changes (counter updates) the API cannot express yet.
 func mailServer(t *testing.T) (*httptest.Server, *objectdb.DB) {
 	t.Helper()
-	a := auth.NewStatic()
+	a := newStaticAuth()
 	a.AddUser("john@example.com", "secret", testAccount)
 	be := memory.New()
 	db := objectdb.New(be, lease.NewInProcess(be))

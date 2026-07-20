@@ -10,9 +10,9 @@ import (
 	"testing"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
+	"github.com/naust-mail/naust-jmap/core/internal/authtest"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
-	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/providers/backend/memory"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/tuning"
@@ -119,7 +119,7 @@ func TestInternalPropertyHidden(t *testing.T) {
 			"secret":  {Kind: descriptor.KindArray, ServerSet: true, Immutable: true, SetIndexed: true, Internal: true},
 		},
 	}
-	a := auth.NewStatic()
+	a := authtest.NewStatic()
 	a.AddUser("john@example.com", "secret", "Atest1")
 	be := memory.New()
 	db := objectdb.New(be, lease.NewInProcess(be))

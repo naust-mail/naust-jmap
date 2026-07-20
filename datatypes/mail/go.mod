@@ -1,6 +1,6 @@
 module github.com/naust-mail/naust-jmap/datatypes/mail
 
-go 1.24.0
+go 1.25.0
 
 require (
 	github.com/naust-mail/naust-jmap/core v0.0.0-00010101000000-000000000000

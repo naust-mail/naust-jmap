@@ -1,8 +1,9 @@
-go 1.24.0
+go 1.25.0
 
 use (
 	./core
 	./datatypes/mail
+	./drivers/postgres
 	./drivers/sqlite
 	./examples
 )

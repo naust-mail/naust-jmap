@@ -17,7 +17,7 @@ import (
 	"github.com/naust-mail/naust-jmap/core/tuning"
 )
 
-// Foo/query (RFC 8620 section 5.5), M0 edition: the filter language
+// Foo/query (RFC 8620 section 5.5), initial edition: the filter language
 // derived from a descriptor is property equality (a FilterCondition's
 // keys are declared property names, matched under the type's comparison
 // rules) composed with AND/OR/NOT. The planner is rule-based and dumb:
@@ -241,7 +241,9 @@ func (st *stdType) queryChanges(ctx context.Context, call *Call) []jmap.Invocati
 	if _, errType, desc := parseFilter(st.t, st.filterSemantics(), a.Filter); errType != "" {
 		return fail(call.CallID, errType, desc)
 	}
-	if _, errType, desc := parseComparators(st.t, a.Sort); errType != "" {
+	// Sort validation goes through the same path as /query, so a type's
+	// SortSemantics answers identically on both methods.
+	if _, errType, desc := st.buildCompare(ctx, a.AccountId, a.Sort); errType != "" {
 		return fail(call.CallID, errType, desc)
 	}
 	return fail(call.CallID, jmap.ErrCannotCalculateChanges, "")
@@ -741,8 +743,10 @@ func parseComparators(t *descriptor.Type, raws []json.RawMessage) ([]comparator,
 		if err := json.Unmarshal(raw, &c); err != nil || c.Property == "" {
 			return nil, jmap.ErrInvalidArguments, "each Comparator needs a property"
 		}
+		// Internal properties are invisible to the method layer: not
+		// sortable, exactly as they are not filterable.
 		p, declared := t.Properties[c.Property]
-		if !declared {
+		if !declared || p.Internal {
 			return nil, jmap.ErrUnsupportedSort, fmt.Sprintf("cannot sort on %q", c.Property)
 		}
 		cmp := comparator{prop: p, name: c.Property, descending: c.IsAscending != nil && !*c.IsAscending}
