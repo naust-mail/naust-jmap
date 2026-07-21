@@ -128,8 +128,18 @@ func adjustCounters(u *objectdb.Update, old, new objectdb.Object) error {
 		if err != nil {
 			return err
 		}
-		before := substitute(base, eid, old)
-		after := substitute(base, eid, new)
+		baseViews := threadMemberViews(base)
+		var oldView, newView *threadMemberView
+		if old != nil {
+			v := newThreadMemberView(old)
+			oldView = &v
+		}
+		if new != nil {
+			v := newThreadMemberView(new)
+			newView = &v
+		}
+		before := substituteView(baseViews, eid, oldView)
+		after := substituteView(baseViews, eid, newView)
 		for mb := range affectedMailboxes(before, after) {
 			d := at(mb)
 			d.totalThreads += b2i(threadInMailbox(after, mb)) - b2i(threadInMailbox(before, mb))
@@ -176,40 +186,60 @@ func threadEmails(u *objectdb.Update, tid jmap.Id) (map[jmap.Id]objectdb.Object,
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[jmap.Id]objectdb.Object, len(ids))
-	for _, id := range ids {
-		obj, err := u.Get(TypeEmail, id)
-		if err != nil {
-			return nil, err
-		}
-		out[id] = obj
-	}
-	return out, nil
+	return u.GetMany(TypeEmail, ids)
 }
 
-// substitute copies view with eid forced to obj (removed when obj is
+// threadMemberView is one Thread member's mailbox membership and unread
+// state, decoded once from its Email record. Without this, adjustCounters
+// re-decodes the same Email's mailboxIds and keywords JSON on every
+// Mailbox it is checked against - threadInMailbox and threadUnread each
+// look at both the before and after picture, so a Thread with N members
+// and M affected Mailboxes redecoded up to 4*M*N times for a single
+// insert. threadMemberViews below decodes each member exactly once
+// instead.
+type threadMemberView struct {
+	mailboxes map[jmap.Id]bool
+	unread    bool
+}
+
+func newThreadMemberView(obj objectdb.Object) threadMemberView {
+	return threadMemberView{mailboxes: mailboxIdsOf(obj), unread: isUnread(obj)}
+}
+
+// threadMemberViews decodes every member of a threadEmails result once,
+// up front, for substituteView to build the before/after pictures from
+// without any further JSON decoding.
+func threadMemberViews(view map[jmap.Id]objectdb.Object) map[jmap.Id]threadMemberView {
+	out := make(map[jmap.Id]threadMemberView, len(view))
+	for id, obj := range view {
+		out[id] = newThreadMemberView(obj)
+	}
+	return out
+}
+
+// substituteView copies base with eid forced to v (removed when v is
 // nil): the before/after picture of the Thread for the changing Email.
-func substitute(view map[jmap.Id]objectdb.Object, eid jmap.Id, obj objectdb.Object) map[jmap.Id]objectdb.Object {
-	out := make(map[jmap.Id]objectdb.Object, len(view)+1)
-	for id, o := range view {
+func substituteView(base map[jmap.Id]threadMemberView, eid jmap.Id, v *threadMemberView) map[jmap.Id]threadMemberView {
+	out := make(map[jmap.Id]threadMemberView, len(base)+1)
+	for id, mv := range base {
 		if id == eid {
 			continue
 		}
-		out[id] = o
+		out[id] = mv
 	}
-	if obj != nil {
-		out[eid] = obj
+	if v != nil {
+		out[eid] = *v
 	}
 	return out
 }
 
 // affectedMailboxes is the set of Mailboxes any Email in either picture
 // belongs to: the only Mailboxes whose Thread counters can move.
-func affectedMailboxes(before, after map[jmap.Id]objectdb.Object) map[jmap.Id]bool {
+func affectedMailboxes(before, after map[jmap.Id]threadMemberView) map[jmap.Id]bool {
 	out := map[jmap.Id]bool{}
-	for _, view := range []map[jmap.Id]objectdb.Object{before, after} {
-		for _, obj := range view {
-			for mb := range mailboxIdsOf(obj) {
+	for _, view := range []map[jmap.Id]threadMemberView{before, after} {
+		for _, mv := range view {
+			for mb := range mv.mailboxes {
 				out[mb] = true
 			}
 		}
@@ -220,9 +250,9 @@ func affectedMailboxes(before, after map[jmap.Id]objectdb.Object) map[jmap.Id]bo
 // threadInMailbox reports whether the Thread counts toward totalThreads
 // for mb: at least one Email in it is in mb (section 2.1, no trash
 // adjustment).
-func threadInMailbox(view map[jmap.Id]objectdb.Object, mb jmap.Id) bool {
-	for _, obj := range view {
-		if mailboxIdsOf(obj)[mb] {
+func threadInMailbox(view map[jmap.Id]threadMemberView, mb jmap.Id) bool {
+	for _, mv := range view {
+		if mv.mailboxes[mb] {
 			return true
 		}
 	}
@@ -235,33 +265,32 @@ func threadInMailbox(view map[jmap.Id]objectdb.Object, mb jmap.Id) bool {
 // The unread Email need not be the one in mb. Trash handling: for the
 // trash Mailbox only its own Emails are considered; for any other Mailbox
 // Emails that are only in the trash are ignored.
-func threadUnread(view map[jmap.Id]objectdb.Object, mb, trash jmap.Id) bool {
+func threadUnread(view map[jmap.Id]threadMemberView, mb, trash jmap.Id) bool {
 	inMailbox, anyUnread := false, false
-	for _, obj := range view {
-		if !consideredForUnread(obj, mb, trash) {
+	for _, mv := range view {
+		if !consideredForUnread(mv, mb, trash) {
 			continue
 		}
-		if mailboxIdsOf(obj)[mb] {
+		if mv.mailboxes[mb] {
 			inMailbox = true
 		}
-		if isUnread(obj) {
+		if mv.unread {
 			anyUnread = true
 		}
 	}
 	return inMailbox && anyUnread
 }
 
-// consideredForUnread applies the trash rules to decide whether obj
+// consideredForUnread applies the trash rules to decide whether mv
 // counts when computing unreadThreads for mb. With no trash Mailbox the
 // rules are inert and every Email is considered (the count degrades to
 // the simple definition naturally).
-func consideredForUnread(obj objectdb.Object, mb, trash jmap.Id) bool {
-	mbs := mailboxIdsOf(obj)
+func consideredForUnread(mv threadMemberView, mb, trash jmap.Id) bool {
 	if trash != "" && mb == trash {
 		// Trash Mailbox: ignore Emails that are not in the trash (rule 2).
-		return mbs[trash]
+		return mv.mailboxes[trash]
 	}
-	if trash != "" && len(mbs) == 1 && mbs[trash] {
+	if trash != "" && len(mv.mailboxes) == 1 && mv.mailboxes[trash] {
 		// Other Mailbox: ignore Emails only in the trash (rule 1).
 		return false
 	}

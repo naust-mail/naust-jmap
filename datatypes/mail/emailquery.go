@@ -275,20 +275,67 @@ func (s emailSort) ParseSort(ctx context.Context, acct jmap.Id, raws []json.RawM
 		return res
 	}
 
+	// A comparison sort calls its comparator O(N log N) times, but each of
+	// these per-record values only ever depends on the record itself: without
+	// memoizing them, a Thread or Email visited by many comparisons (any N
+	// large enough for the sort to matter) redecodes and recomputes its date,
+	// address, subject, or keyword set from scratch every single time it is
+	// compared. Caching by id turns that into one computation per record.
+	dateCache := map[string]time.Time{}
+	addrCache := map[string]string{}
+	subjectCache := map[string]string{}
+	kwCache := map[string]map[string]bool{}
+	getDate := func(obj objectdb.Object, name string) time.Time {
+		key := string(obj["id"]) + "\x00" + name
+		if v, ok := dateCache[key]; ok {
+			return v
+		}
+		v := emailDate(obj, name)
+		dateCache[key] = v
+		return v
+	}
+	getAddr := func(obj objectdb.Object, field string) string {
+		key := string(obj["id"]) + "\x00" + field
+		if v, ok := addrCache[key]; ok {
+			return v
+		}
+		v := foldKey(firstAddr(obj, field))
+		addrCache[key] = v
+		return v
+	}
+	getSubject := func(obj objectdb.Object) string {
+		id := string(obj["id"])
+		if v, ok := subjectCache[id]; ok {
+			return v
+		}
+		v := foldKey(baseSubject(storedSubject(obj)))
+		subjectCache[id] = v
+		return v
+	}
+	getKeywords := func(obj objectdb.Object) map[string]bool {
+		id := string(obj["id"])
+		if v, ok := kwCache[id]; ok {
+			return v
+		}
+		v := objectKeys(obj["keywords"])
+		kwCache[id] = v
+		return v
+	}
+
 	return func(a, b objectdb.Object) int {
 		for _, c := range cmps {
 			r := 0
 			switch c.property {
 			case "receivedAt", "sentAt":
-				r = compareTime(emailDate(a, c.property), emailDate(b, c.property))
+				r = compareTime(getDate(a, c.property), getDate(b, c.property))
 			case "size":
 				r = compareUint(emailUint(a, "size"), emailUint(b, "size"))
 			case "from", "to":
-				r = strings.Compare(foldKey(firstAddr(a, c.property)), foldKey(firstAddr(b, c.property)))
+				r = strings.Compare(getAddr(a, c.property), getAddr(b, c.property))
 			case "subject":
-				r = strings.Compare(foldKey(baseSubject(storedSubject(a))), foldKey(baseSubject(storedSubject(b))))
+				r = strings.Compare(getSubject(a), getSubject(b))
 			case "hasKeyword":
-				r = compareBool(objectKeys(a["keywords"])[c.keyword], objectKeys(b["keywords"])[c.keyword])
+				r = compareBool(getKeywords(a)[c.keyword], getKeywords(b)[c.keyword])
 			case "allInThreadHaveKeyword", "someInThreadHaveKeyword":
 				all := c.property == "allInThreadHaveKeyword"
 				r = compareBool(threadHas(a, c.keyword, all), threadHas(b, c.keyword, all))

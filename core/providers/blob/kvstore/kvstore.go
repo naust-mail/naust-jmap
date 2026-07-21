@@ -7,6 +7,30 @@
 // Values are whole blobs in single keys, which is fine at JMAP upload
 // sizes (maxSizeUpload); a store for very large blobs should implement
 // blob.Store over object storage instead.
+//
+// Choose this over chunkstore when blobs are reliably small: one value
+// written once beats a manifest plus pieces, and nothing is streamed, so
+// there is less to do per blob. It gives that back as blobs grow, because
+// an arriving blob is held whole in memory and the peak scales with blob
+// size times concurrent writers, where chunkstore's stays flat. Where the
+// two cross over depends on the backend and the write concurrency, so it
+// is worth measuring rather than assuming.
+//
+// "Reliably small" is a requirement, not a preference, and it is the one
+// thing to get right before choosing this store. Both factors in that peak
+// are normally set by the CLIENT: blob size up to maxSizeUpload, and
+// concurrency up to whatever the ingress allows. Peak memory is therefore
+// attacker-controlled, which makes an unbounded pairing a denial-of-service
+// vector rather than a performance question. Measured at 16 concurrent
+// deliveries of a 16 MiB message: about 162 MiB peak RSS on chunkstore
+// against about 1.1 GiB here. With the shipped mail defaults (64 concurrent
+// LMTP connections, a 50 MB size cap) the same arithmetic reaches several
+// gigabytes.
+//
+// So an embedder choosing this store owns that product: cap blob size well
+// below maxSizeUpload's default, cap ingress concurrency, or size the host
+// for size x concurrency. An embedder who cannot bound BOTH wants
+// chunkstore, whose peak does not depend on either.
 package kvstore
 
 import (

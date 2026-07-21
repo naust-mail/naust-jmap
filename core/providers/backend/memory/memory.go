@@ -54,6 +54,22 @@ func (s *Store) Get(_ context.Context, key []byte) ([]byte, error) {
 	return bytes.Clone(v), nil
 }
 
+// MultiGet implements backend.MultiGetter. There is no round trip to save
+// in-process, but one lock acquisition for the whole batch instead of one
+// per key is still cheaper, and every backend needs to satisfy the same
+// differential tests (backendtest) regardless of what it has to gain.
+func (s *Store) MultiGet(_ context.Context, keys [][]byte) ([][]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([][]byte, len(keys))
+	for i, key := range keys {
+		if v, ok := s.data[string(key)]; ok {
+			out[i] = bytes.Clone(v)
+		}
+	}
+	return out, nil
+}
+
 // Scan implements backend.Backend: binary-search to the range edge,
 // then walk only the keys actually yielded. The lock is never held
 // while fn runs (fn may re-enter the store), so the walk copies a

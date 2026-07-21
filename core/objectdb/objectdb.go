@@ -148,6 +148,65 @@ func (db *DB) Get(ctx context.Context, acct jmap.Id, typeName string, id jmap.Id
 	return obj, nil
 }
 
+// GetMany returns one record per id, in the same order, nil for an id Get
+// would report ErrNotFound for. On a backend implementing
+// backend.MultiGetter (Postgres) this is one round trip regardless of
+// len(ids) instead of one per id - loadAndMatch (query.go) and the generic
+// /get method (standard.go) are the two callers this exists for, both of
+// which read a batch of ids and already distinguish found from missing
+// themselves. On a backend without MultiGetter it falls back to sequential
+// Get calls, so it is always correct, just not always faster.
+func (db *DB) GetMany(ctx context.Context, acct jmap.Id, typeName string, ids []jmap.Id) ([]Object, error) {
+	if db.types[typeName] == nil {
+		return nil, ErrUnknownType
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	mg, ok := db.be.(backend.MultiGetter)
+	if !ok {
+		out := make([]Object, len(ids))
+		for i, id := range ids {
+			obj, err := db.Get(ctx, acct, typeName, id)
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			out[i] = obj
+		}
+		return out, nil
+	}
+	out := make([]Object, len(ids))
+	for start := 0; start < len(ids); start += tuning.MaxMultiGetBatch {
+		end := start + tuning.MaxMultiGetBatch
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		keys := make([][]byte, len(chunk))
+		for i, id := range chunk {
+			keys[i] = objKey(acct, typeName, id)
+		}
+		raws, err := mg.MultiGet(ctx, keys)
+		if err != nil {
+			return nil, err
+		}
+		for i, raw := range raws {
+			if raw == nil {
+				continue
+			}
+			var obj Object
+			if err := json.Unmarshal(raw, &obj); err != nil {
+				return nil, err
+			}
+			out[start+i] = obj
+		}
+	}
+	return out, nil
+}
+
 // AllIds lists every record id of a type, in id order. If max > 0 and
 // more than max exist, it returns max+1 ids so the caller can detect
 // the overflow (RFC 8620 section 5.1: /get with ids null is subject to
@@ -308,6 +367,38 @@ func (u *Update) Get(typeName string, id jmap.Id) (Object, error) {
 		return st.new, nil
 	}
 	return u.db.Get(u.ctx, u.acct, typeName, id)
+}
+
+// GetMany reads several records as this Update sees it: staged changes
+// first, then one batched read (DB.GetMany) for whatever ids are not
+// staged - the same read-your-own-writes semantics as Get, without a
+// backend round trip per id. Not-found ids (staged as destroyed, or absent
+// from the store) are simply missing from the returned map.
+func (u *Update) GetMany(typeName string, ids []jmap.Id) (map[jmap.Id]Object, error) {
+	out := make(map[jmap.Id]Object, len(ids))
+	remaining := make([]jmap.Id, 0, len(ids))
+	for _, id := range ids {
+		if st, ok := u.staged[stagedKey(typeName, id)]; ok {
+			if st.new != nil {
+				out[id] = st.new
+			}
+			continue
+		}
+		remaining = append(remaining, id)
+	}
+	if len(remaining) == 0 {
+		return out, nil
+	}
+	objs, err := u.db.GetMany(u.ctx, u.acct, typeName, remaining)
+	if err != nil {
+		return nil, err
+	}
+	for i, obj := range objs {
+		if obj != nil {
+			out[remaining[i]] = obj
+		}
+	}
+	return out, nil
 }
 
 // newId assigns the id for one record under the DB's configured scheme

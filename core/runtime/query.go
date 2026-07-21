@@ -587,17 +587,21 @@ type RecordScoper interface {
 
 // loadAndMatch loads each candidate and keeps the ones the predicate tree
 // accepts (the authoritative verification of the narrowed superset).
+//
+// GetMany, not one Get per id: on a backend fronted by a network database
+// this is one round trip for the whole candidate set instead of one per
+// candidate - see objectdb.DB.GetMany and backend.MultiGetter.
 func (st *stdType) loadAndMatch(ctx context.Context, acct jmap.Id, root *filterNode, ids []jmap.Id) ([]QueryRecord, error) {
 	sem := st.filterSemantics()
 	scoper, _ := sem.(RecordScoper)
+	objs, err := st.db.GetMany(ctx, acct, st.t.Name, ids)
+	if err != nil {
+		return nil, err
+	}
 	matched := make([]QueryRecord, 0, len(ids))
-	for _, id := range ids {
-		obj, err := st.db.Get(ctx, acct, st.t.Name, id)
-		if errors.Is(err, objectdb.ErrNotFound) {
-			continue
-		}
-		if err != nil {
-			return nil, err
+	for i, obj := range objs {
+		if obj == nil {
+			continue // not found: GetMany's nil-slot convention, same as Get's ErrNotFound
 		}
 		rctx := ctx
 		if scoper != nil {
@@ -608,7 +612,7 @@ func (st *stdType) loadAndMatch(ctx context.Context, acct jmap.Id, root *filterN
 			return nil, err
 		}
 		if ok {
-			matched = append(matched, QueryRecord{Id: id, Obj: obj})
+			matched = append(matched, QueryRecord{Id: ids[i], Obj: obj})
 		}
 	}
 	return matched, nil

@@ -93,10 +93,7 @@ import (
 	"github.com/naust-mail/naust-jmap/core/objectdb"
 	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/providers/backend"
-	"github.com/naust-mail/naust-jmap/core/providers/blob"
 	"github.com/naust-mail/naust-jmap/core/providers/blob/chunkstore"
-	"github.com/naust-mail/naust-jmap/core/providers/blob/fsstore"
-	"github.com/naust-mail/naust-jmap/core/providers/blob/kvstore"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/providers/notify"
 	"github.com/naust-mail/naust-jmap/core/pushsub"
@@ -207,10 +204,6 @@ func main() {
 	pgDSN := flag.String("postgres", "", "Postgres DSN (e.g. postgres://user:pass@host:5432/db); when set, replaces the SQLite backend entirely and -db is ignored (instances sharing one database form a fleet: store lease + cross-instance push)")
 	httpAddr := flag.String("http", "localhost:8080", "JMAP HTTP listen address")
 	lmtpAddr := flag.String("lmtp", "127.0.0.1:2400", "LMTP listen address (never port 25)")
-	blobStore := flag.String("blobs", "chunk", "raw-message blob store: chunk (streaming), kv (whole blob in one value), or fs (one file per message)")
-	blobDir := flag.String("blob-dir", "./naust-blobs", "directory for raw messages, with -blobs fs")
-	accounts := flag.Int("accounts", 0, "also register accounts u1..uN (for benchmarking delivery spread across accounts)")
-	ingestInFlight := flag.Int("ingest-inflight", 64, "max concurrent /ingest requests before 503 (benchmarking)")
 	relay := flag.String("relay", "", "outbound SMTP relay as host:port; empty runs loopback mode (sending delivers to local accounts only)")
 	relayUser := flag.String("relay-user", "", "relay SASL PLAIN username (with -relay-pass)")
 	relayPass := flag.String("relay-pass", "", "relay SASL PLAIN password")
@@ -254,44 +247,21 @@ func main() {
 	}
 	db := objectdb.New(store, leases)
 
-	// The raw-message blob store shares the same backend. Both options
-	// satisfy blob.Store, so nothing downstream changes.
+	// The raw-message blob store shares the same backend. chunkstore splits
+	// each blob into fixed pieces and never holds a whole blob in memory, which
+	// makes an arriving message cost the same whether it is 4 KiB or 32 MiB.
 	//
-	// chunkstore splits each blob into fixed pieces and never holds a whole
-	// blob in memory, at the cost of a few writes per blob. It is the default
-	// because the alternative's cost is not a constant factor: kvstore keeps
-	// each blob in a SINGLE value, so an arriving message is materialised whole
-	// in memory, and the peak scales with message size TIMES concurrent
-	// deliveries. Measured on a real-LMTP ingest benchmark, a
-	// 32 MiB attachment cost ~158 MB of heap under kvstore and stayed flat
-	// under chunkstore. kvstore remains the cheaper choice when messages are
-	// known to be small.
+	// It is one of three stores that ship, and this server names it by
+	// IMPORTING it: a store it does not import is absent from the binary and
+	// from the dependency graph, which is how every choice in this library is
+	// meant to be made. See core/providers/blob for kvstore and fsstore, and
+	// for what each one trades away - the right answer depends on the backend
+	// and the message sizes, so it is a deployment decision, not a default.
 	//
-	// fsstore is the third option and the only one that leaves the database:
-	// each message is a file, written tmp-then-rename. It is the fastest, since
-	// a transactional store has to journal every byte it takes, but it gives up
-	// having blobs commit in the same transaction as the objects referencing
-	// them - see its package doc for what that costs and why it is safe.
-	var blobs blob.Store
-	switch *blobStore {
-	case "chunk":
-		// Returns an error: it reclaims crash-orphaned pieces at startup.
-		cs, err := chunkstore.New(store)
-		if err != nil {
-			log.Fatal(err)
-		}
-		blobs = cs
-	case "kv":
-		blobs = kvstore.New(store)
-	case "fs":
-		// Returns an error: it reclaims crashed uploads' temporary files.
-		fs, err := fsstore.New(*blobDir)
-		if err != nil {
-			log.Fatal(err)
-		}
-		blobs = fs
-	default:
-		log.Fatalf("-blobs must be chunk, kv or fs, got %q", *blobStore)
+	// Returns an error: it reclaims crash-orphaned pieces at startup.
+	blobs, err := chunkstore.New(store)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	// Authentication models the production split: POST /login (registered on
@@ -301,20 +271,9 @@ func main() {
 	// auth.Authenticator against their own accounts, or verify tokens issued
 	// by an external identity provider.
 	//
-	// demo@example.com is always present. -accounts additionally registers
-	// u1..uN, which exists so a benchmark can spread delivery across accounts:
-	// the writer lease is per ACCOUNT, so delivering everything to one account
-	// measures lease contention rather than ingest throughput, and the two are
-	// only distinguishable by varying this.
 	users := tokenauth.New()
 	users.AddUser("demo@example.com", "demo", "Ademo")
 	resolve := staticResolver{"demo@example.com": "Ademo"}
-	for i := 1; i <= *accounts; i++ {
-		addr := fmt.Sprintf("u%d@example.com", i)
-		acct := jmap.Id(fmt.Sprintf("Au%d", i))
-		users.AddUser(addr, "demo", acct)
-		resolve[addr] = acct
-	}
 
 	// The mail plugin: Mailbox, Thread and Email registered on the processor,
 	// enforcing (and advertising) the same AccountCapability limits. A nil
@@ -454,7 +413,7 @@ func main() {
 	// adapter, everything else is the JMAP server (/api, /.well-known/jmap,
 	// /eventsource, the blob endpoints).
 	root := http.NewServeMux()
-	root.Handle("/ingest", mail.NewHTTPIngest(deliverer, mail.WithMaxIngestInFlight(*ingestInFlight)))
+	root.Handle("/ingest", mail.NewHTTPIngest(deliverer))
 	root.Handle("/login", users.LoginHandler())
 	root.Handle("/", srv)
 

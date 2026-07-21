@@ -36,6 +36,105 @@ func Run(t *testing.T, cfg Config) {
 	t.Run("Add", func(t *testing.T) { testAdd(t, cfg) })
 	t.Run("Persistence", func(t *testing.T) { testPersistence(t, cfg) })
 	t.Run("CompareAndSwap", func(t *testing.T) { testCompareAndSwap(t, cfg) })
+	t.Run("MultiGet", func(t *testing.T) { testMultiGet(t, cfg) })
+	t.Run("MultiGetConcurrent", func(t *testing.T) { testMultiGetConcurrent(t, cfg) })
+}
+
+// testMultiGet exercises the optional backend.MultiGetter for basic
+// correctness against Get: present keys, an absent key (nil, not an error),
+// and a duplicate key in one call (both slots must carry its value).
+// Backends that do not implement it are skipped - objectdb.DB.GetMany falls
+// back to sequential Get calls on those, so there is nothing of this
+// capability's own to verify.
+func testMultiGet(t *testing.T, cfg Config) {
+	b := cfg.Open(t)
+	defer b.Close()
+	mg, ok := b.(backend.MultiGetter)
+	if !ok {
+		t.Skip("backend does not implement MultiGetter")
+	}
+	ctx := context.Background()
+	set(t, b, "mg-a", "val-a")
+	set(t, b, "mg-b", "val-b")
+
+	keys := [][]byte{[]byte("mg-a"), []byte("mg-missing"), []byte("mg-b"), []byte("mg-a")}
+	got, err := mg.MultiGet(ctx, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(keys) {
+		t.Fatalf("MultiGet returned %d results, want %d", len(got), len(keys))
+	}
+	want := [][]byte{[]byte("val-a"), nil, []byte("val-b"), []byte("val-a")}
+	for i := range keys {
+		if !bytes.Equal(got[i], want[i]) {
+			t.Errorf("key %d (%q): MultiGet = %q, want %q", i, keys[i], got[i], want[i])
+		}
+	}
+	if got, err := mg.MultiGet(ctx, nil); err != nil || len(got) != 0 {
+		t.Errorf("MultiGet(empty) = %v, %v, want (empty, nil)", got, err)
+	}
+}
+
+// testMultiGetConcurrent is specifically for a reuse or locking bug in a
+// MultiGetter implementation that a single-goroutine test cannot show: many
+// goroutines call MultiGet on overlapping keys at once, each checking every
+// returned value against that key's known fingerprint - a bug that mixed up
+// which result belongs to which key (a pooled buffer, a map race, an
+// off-by-one in matching results back to input order) surfaces as a
+// mismatched fingerprint, not just a crash -race would already catch.
+func testMultiGetConcurrent(t *testing.T, cfg Config) {
+	b := cfg.Open(t)
+	defer b.Close()
+	mg, ok := b.(backend.MultiGetter)
+	if !ok {
+		t.Skip("backend does not implement MultiGetter")
+	}
+	ctx := context.Background()
+
+	const nKeys = 40
+	keys := make([][]byte, nKeys)
+	want := make(map[string][]byte, nKeys)
+	for i := 0; i < nKeys; i++ {
+		k := []byte(fmt.Sprintf("mgc-key-%d", i))
+		v := []byte(fmt.Sprintf("fingerprint-%d-%x", i, i*104729))
+		set(t, b, string(k), string(v))
+		keys[i] = k
+		want[string(k)] = v
+	}
+
+	const goroutines = 32
+	const itersPerGoroutine = 50
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < itersPerGoroutine; i++ {
+				got, err := mg.MultiGet(ctx, keys)
+				if err != nil {
+					errs <- fmt.Errorf("goroutine %d iter %d: %w", g, i, err)
+					return
+				}
+				if len(got) != len(keys) {
+					errs <- fmt.Errorf("goroutine %d iter %d: got %d results, want %d", g, i, len(got), len(keys))
+					return
+				}
+				for j, k := range keys {
+					if !bytes.Equal(got[j], want[string(k)]) {
+						errs <- fmt.Errorf("goroutine %d iter %d: key %q = %q, want %q (fingerprint mismatch)", g, i, k, got[j], want[string(k)])
+						return
+					}
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
 }
 
 // testCompareAndSwap exercises the optional backend.CompareAndSwapper: under

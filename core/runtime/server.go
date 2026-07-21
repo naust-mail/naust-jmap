@@ -269,7 +269,12 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := s.proc.Process(r.Context(), req, ident, s.session(ident).State)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
+	// WriteJSON, not json.NewEncoder(w).Encode(resp): the response body is
+	// almost entirely already-compact JSON assembled by reply()/
+	// ErrorInvocation (see their comments), so re-marshaling through
+	// reflection would re-validate and re-compact content that has already
+	// passed through encoding/json once. See core/jmap/compact.go.
+	if err := resp.WriteJSON(w); err != nil {
 		http.Error(w, "encoding failed", http.StatusInternalServerError)
 	}
 }

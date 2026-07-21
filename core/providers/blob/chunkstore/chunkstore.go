@@ -34,6 +34,15 @@
 // store's concern (they live in objectdb, in-commit with the referencing
 // objects); the store only holds bytes and cleans up its own partial
 // writes.
+//
+// Against the alternatives: kvstore is cheaper while blobs stay small
+// (one value, no manifest, no pieces) but holds each arriving blob whole
+// in memory, so it does not stay cheap as they grow; fsstore is faster
+// still on large blobs but gives up committing blobs in the same
+// transaction as the objects referencing them. This store is the one that
+// costs the same at any blob size, which is why it is the default for
+// mail, where an attachment's size is the client's choice and not the
+// server's.
 package chunkstore
 
 import (

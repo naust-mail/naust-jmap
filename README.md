@@ -72,6 +72,7 @@ runtime.RegisterStandardType(proc, db, todo, core)
 srv, _ := runtime.NewServer(users, proc, "http://localhost:8080", core)
 srv.RegisterCapability("urn:example:todo", struct{}{}, struct{}{})
 srv.EnableBlobs(db, kvstore.New(be))                     // uploads, downloads, Blob/copy
+                                                         // (one of three stores; see below)
 srv.EnablePush(db, notify.NewInProcess(), nil, nil)      // event-source push
 http.ListenAndServe("localhost:8080", srv)
 ```
@@ -111,10 +112,8 @@ The core protocol (RFC 8620) is implemented end to end:
 - The six derived standard methods over any registered datatype: `/get`,
   `/changes`, `/set`, `/copy`, `/query`, `/queryChanges`.
 - Binary data (`Server.EnableBlobs`): streaming upload/download endpoints and
-  `Blob/copy`, with reference tracking and unreferenced-blob sweeping. Two blob
-  stores ship: a whole-value store for the small-blob common case, and a chunked
-  streaming store that never holds a whole blob in memory, for content larger than
-  a comfortable in-memory value.
+  `Blob/copy`, with reference tracking and unreferenced-blob sweeping. Three blob
+  stores ship, all behind `blob.Store` (see [choosing one](#choosing-a-blob-store)).
 - Push (`Server.EnablePush`): the event-source endpoint, plus verified
   `PushSubscription` webhooks with RFC 8291 encryption when given a
   subscription store and sender.
@@ -204,6 +203,37 @@ queue, nothing is parked on the smarthost. Holds beyond `maxDelayedSend` are
 rejected, not clamped.
 
 </details>
+
+### Choosing a blob store
+
+Three implementations of `blob.Store` ship. Nothing above the interface can tell
+them apart, so this is an operational choice, not an architectural one - pick by
+importing, since a store you do not import is absent from the binary and from
+the dependency graph.
+
+| Store | Shape | Choose it when |
+|---|---|---|
+| `kvstore` | Each blob is one value in the backend | Blobs are reliably small **and you can bound both blob size and ingress concurrency**. Fewest writes per blob, and blobs commit in the same transaction as the objects referencing them. Cost: an arriving blob is held whole in memory, so peak scales with blob size times concurrent writers - see the warning below. |
+| `chunkstore` | Fixed-size pieces plus a manifest | Blobs can be large or the size is not known in advance. Memory stays flat regardless of blob size, still transactional, at the cost of several writes per blob. The default for mail. |
+| `fsstore` | One file per blob, tmp-then-rename | Throughput on large blobs matters more than transactional coupling. A transactional store has to journal every byte it takes; this does not. Cost: blobs no longer commit with the objects referencing them (the ordering is chosen so the survivable inconsistency is an unreferenced blob, which the sweeper reclaims). |
+
+> **`kvstore`'s memory is attacker-controlled.** It holds each arriving blob whole
+> in memory, and both factors in `size x concurrency` are normally chosen by the
+> client: blob size up to `maxSizeUpload`, concurrency up to whatever the ingress
+> allows. Measured at 16 concurrent deliveries of a 16 MiB message, peak RSS was
+> about **162 MiB** with `chunkstore` and about **1.1 GiB** with `kvstore`; at the
+> shipped mail defaults (64 concurrent LMTP connections, a 50 MB size cap) the
+> same arithmetic reaches several gigabytes. That is a denial-of-service vector,
+> not a tuning preference. Choose `kvstore` only where you can bound both factors
+> - `chunkstore`'s peak depends on neither.
+
+The crossover between `kvstore` and `chunkstore` is real but not a fixed number:
+it moves with the backend's per-row overhead and its own out-of-line policy
+(Postgres already moves large values out of line via TOAST), with blob size, and
+with write concurrency. As one data point, on SQLite at 32 concurrent writers
+`kvstore` ingested roughly 40% faster at 4 KiB, the two were level around 64 KiB,
+and `chunkstore` was roughly 3x faster at 1 MiB. Measure on your own backend
+before treating any threshold as settled.
 
 ## Mail (RFC 8621)
 

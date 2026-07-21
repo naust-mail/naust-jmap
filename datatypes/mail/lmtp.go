@@ -63,6 +63,15 @@ const (
 // delivery agent (Postfix's default destination concurrency is around 20), so
 // this is generous for the intended caller and still a ceiling against a local
 // process that is not one.
+//
+// "Costs a buffer and not a message" is a property of the blob.Store, not of
+// this package. It holds for chunkstore and fsstore, which stream. It does NOT
+// hold for kvstore, which materialises each blob whole before writing it: there
+// a connection in flight costs a whole message, so this bound multiplies by the
+// size cap instead of by a buffer. Measured at 16 concurrent deliveries of a
+// 16 MiB message: about 162 MiB peak RSS on chunkstore against about 1.1 GiB on
+// kvstore. An embedder pairing kvstore with a large maxSizeUpload should lower
+// this bound to match; see the kvstore package doc.
 const defaultMaxLMTPConns = 64
 
 // LMTPOption configures an LMTP server.

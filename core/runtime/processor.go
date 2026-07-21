@@ -66,7 +66,19 @@ func (p *Processor) Register(name, capability string, h Handler) {
 func (p *Processor) Supports(capability string) bool { return p.capabilities[capability] }
 
 func echo(_ context.Context, call *Call) []jmap.Invocation {
-	return []jmap.Invocation{{Name: "Core/echo", Args: call.Args, CallID: call.CallID}}
+	// call.Args is the client's own request bytes: CheckIJSON already proved
+	// it's syntactically valid JSON before ParseRequest ran, but not that it's
+	// compact - a client is free to send pretty-printed args. Response.WriteJSON
+	// assumes every response Invocation's Args is compact (see reply()'s
+	// comment in standard.go), so this goes through the same MarshalCompactJSON
+	// every other construction site uses - json.RawMessage implements
+	// json.Marshaler, so Marshal(json.RawMessage(x)) compacts x the same way
+	// Marshal(anyOtherValue) would, with no separate code path needed.
+	args, err := jmap.MarshalCompactJSON(json.RawMessage(call.Args))
+	if err != nil {
+		return []jmap.Invocation{jmap.ErrorInvocation(call.CallID, jmap.MethodError{Type: jmap.ErrServerFail})}
+	}
+	return []jmap.Invocation{{Name: "Core/echo", Args: json.RawMessage(args), CallID: call.CallID}}
 }
 
 // CheckUsing validates the request's capability opt-ins, returning a

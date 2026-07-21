@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"sync"
 )
 
 // readChunk is how much of the message the line reader holds at once. A message
@@ -32,17 +33,60 @@ type lineReader struct {
 	// scratch backs a line that straddles fills or exceeds its limit, reused
 	// across calls so those lines do not allocate either.
 	scratch []byte
+	// pool is where br came from, so release can return it; nil for a reader
+	// built at a size neither pool holds.
+	pool *sync.Pool
+}
+
+// topLineReaderPool and partLineReaderPool recycle the bufio.Reader behind a
+// message's own line reader and a multipart child's, the only two sizes
+// newLineReaderSize is ever called with. A message is read part by part, one
+// reader at a time, so pooling turns what would be a fresh 32KB or 4KB
+// allocation per part into a reused buffer once a few messages have been
+// parsed.
+var topLineReaderPool = sync.Pool{
+	New: func() any { return bufio.NewReaderSize(nil, readChunk) },
+}
+
+var partLineReaderPool = sync.Pool{
+	New: func() any { return bufio.NewReaderSize(nil, partChunk) },
 }
 
 func newLineReader(r io.Reader) *lineReader {
-	return newLineReaderSize(r, readChunk)
+	br := topLineReaderPool.Get().(*bufio.Reader)
+	br.Reset(r)
+	return &lineReader{br: br, pool: &topLineReaderPool}
 }
 
 // newLineReaderSize is newLineReader with the buffer named. A part of a message
 // is read through one reader per multipart enclosing it, so those hold less than
 // the message's own reader: what the nesting depth multiplies must stay small.
 func newLineReaderSize(r io.Reader, size int) *lineReader {
-	return &lineReader{br: bufio.NewReaderSize(r, size)}
+	pool := &partLineReaderPool
+	if size != partChunk {
+		if size == readChunk {
+			pool = &topLineReaderPool
+		} else {
+			// Not one of the two pooled sizes: no pool recycles this one.
+			return &lineReader{br: bufio.NewReaderSize(r, size)}
+		}
+	}
+	br := pool.Get().(*bufio.Reader)
+	br.Reset(r)
+	return &lineReader{br: br, pool: pool}
+}
+
+// release returns br to its pool once the caller is done with this reader -
+// walkEntity has fully drained it (including reading past whatever content no
+// sink asked for), so nothing still points into its buffer. A reader built at
+// an unpooled size is simply dropped, as before pooling existed.
+func (lr *lineReader) release() {
+	if lr.pool == nil {
+		return
+	}
+	lr.br.Reset(nil) // don't keep the drained source (a segment, a part's body) alive in the pool
+	lr.pool.Put(lr.br)
+	lr.br, lr.pool = nil, nil
 }
 
 // fill makes pending non-empty, or returns the reader's error (io.EOF at the

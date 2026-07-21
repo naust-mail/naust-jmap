@@ -2,6 +2,9 @@ package message
 
 import (
 	"bytes"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -120,3 +123,76 @@ type closeCounter struct{ n *int }
 
 func (c closeCounter) Write(b []byte) (int, error) { return len(b), nil }
 func (c closeCounter) Close() error                { *c.n++; return nil }
+
+// TestParseConcurrentNoContamination is specifically for the pooled
+// bufio.Reader behind newLineReader/newLineReaderSize (lines.go): a reuse
+// bug there would not necessarily be a data race -race can catch (it can be
+// a pure logic error - handing a pooled buffer to a second parse before the
+// first is truly done with it) - it would surface as one message's decoded
+// body content containing another message's bytes. Every goroutine parses a
+// message whose subject, headers, and body all carry a unique marker,
+// repeatedly, checking the captured body content against that exact marker
+// every time - not just checking the parse succeeds.
+func TestParseConcurrentNoContamination(t *testing.T) {
+	const goroutines = 64
+	const itersPerGoroutine = 200
+
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			marker := fmt.Sprintf("goroutine-%d-marker-%x", g, g*7919+104729)
+			// body includes the trailing CRLF: the leaf's decoded content is
+			// everything after the header block to the end of the message,
+			// line ending included, since there is no further boundary to
+			// stop it short.
+			body := marker + " body content, repeated so it spans more than one read chunk: " + strings.Repeat(marker+" ", 200) + "\r\n"
+			raw := "From: " + marker + "@example.com\r\n" +
+				"Subject: " + marker + "\r\n" +
+				"Content-Type: text/plain\r\n\r\n" + body
+
+			for i := 0; i < itersPerGoroutine; i++ {
+				sink := &captureSink{}
+				factory := func(*Part) LeafSinks { return LeafSinks{Sinks: []Sink{sink}} }
+				m, err := Parse(strings.NewReader(raw), factory)
+				if err != nil {
+					errs <- fmt.Errorf("goroutine %d iter %d: parse error: %w", g, i, err)
+					return
+				}
+				// Value is the raw octets after the colon (message.go), which
+				// keeps the single space the "Name: value" syntax always has.
+				if got, want := headerValue(m.Headers, "Subject"), " "+marker; got != want {
+					errs <- fmt.Errorf("goroutine %d iter %d: pooled-buffer contamination in headers\n got:  %q\nwant: %q", g, i, got, want)
+					return
+				}
+				if got := string(sink.buf); got != body {
+					errs <- fmt.Errorf("goroutine %d iter %d: pooled-buffer contamination in body\n got:  %q\nwant: %q", g, i, truncateForLog(got), truncateForLog(body))
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
+func headerValue(headers []HeaderField, name string) string {
+	for _, h := range headers {
+		if h.Name == name {
+			return h.Value
+		}
+	}
+	return ""
+}
+
+func truncateForLog(s string) string {
+	if len(s) > 80 {
+		return s[:80] + "..."
+	}
+	return s
+}

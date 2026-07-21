@@ -110,6 +110,19 @@ var DefaultMaxChanges = 2048
 // one is rejected as unsupportedFilter (RFC 8620 section 5.5).
 var MaxFilterNodes = 1024
 
+// MaxMultiGetBatch bounds how many keys one backend.MultiGetter call carries
+// (objectdb.DB.GetMany chunks larger requests). Without it, an unnarrowed
+// Foo/query's uncapped AllIds candidate set would become one backend call
+// with that many array elements - trading a self-throttling loop of small
+// round trips for one large, resource-spiky one. Chosen from measurement
+// against real Postgres (drivers/postgres's benchmarks), not guessed: it is
+// the size the round-trip win was directly verified at, not extrapolated
+// past it, and keeps a batch's worst-case result-set size (record count x
+// real record size, which can run several KB each - far more than the small
+// synthetic payload those benchmarks used) in the low single-digit MB range
+// rather than growing unbounded with account size.
+var MaxMultiGetBatch = 200
+
 // MaxRequestedProperties bounds how many properties a client may name in one
 // Foo/get. A type's real property set is small; the open-ended part is
 // computed forms (Email's header:{name}), each resolved for every returned

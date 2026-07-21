@@ -115,6 +115,31 @@ func (f *base64Filter) flushFinal() {
 	f.group = f.group[:0]
 }
 
+// base64Class classifies each input octet for base64Filter.Read: 0 is a
+// base64-alphabet character, 1 is line-folding white space (ignored), 2 is
+// the padding character '=', and 3 is anything else (a foreign octet).
+// Classifying by table lookup lets Read scan a whole run of alphabet
+// characters at once instead of branching per byte.
+var base64Class = func() [256]byte {
+	var c [256]byte
+	for i := range c {
+		c[i] = 3
+	}
+	for r := 'A'; r <= 'Z'; r++ {
+		c[r] = 0
+	}
+	for r := 'a'; r <= 'z'; r++ {
+		c[r] = 0
+	}
+	for r := '0'; r <= '9'; r++ {
+		c[r] = 0
+	}
+	c['+'], c['/'] = 0, 0
+	c[' '], c['\t'], c['\r'], c['\n'] = 1, 1, 1, 1
+	c['='] = 2
+	return c
+}()
+
 func (f *base64Filter) Read(p []byte) (int, error) {
 	for f.off == len(f.out) {
 		if f.done {
@@ -122,31 +147,47 @@ func (f *base64Filter) Read(p []byte) (int, error) {
 		}
 		f.out, f.off = f.out[:0], 0
 		n, err := f.src.Read(f.chunk[:])
-		for _, c := range f.chunk[:n] {
-			switch {
-			case c == '=':
-				// Padding marks the end of the encoded data (RFC 2045 6.8). The
-				// group in hand is the last one; anything after it is trailing
-				// content, handled below.
-				if !f.padded {
-					f.padded = true
-					f.flushFinal()
+		chunk := f.chunk[:n]
+		for len(chunk) > 0 {
+			if f.padded {
+				// Padding marks the end of the encoded data (RFC 2045 6.8):
+				// everything from here on is trailing content. White space and
+				// further padding are ignored; any other octet - alphabet or
+				// foreign - flags the part, matching the per-byte behavior this
+				// replaces.
+				for _, c := range chunk {
+					if class := base64Class[c]; class == 0 || class == 3 {
+						*f.problem = true
+					}
 				}
-			case c == ' ', c == '\t', c == '\r', c == '\n':
+				break
+			}
+			// Consume the run of consecutive base64-alphabet bytes starting
+			// here in one slice append, instead of one append per byte.
+			i := 0
+			for i < len(chunk) && base64Class[chunk[i]] == 0 {
+				i++
+			}
+			if i > 0 {
+				f.group = append(f.group, chunk[:i]...)
+				chunk = chunk[i:]
+				if whole := len(f.group) - len(f.group)%4; whole > 0 {
+					f.out = append(f.out, f.group[:whole]...)
+					copy(f.group, f.group[whole:])
+					f.group = f.group[:len(f.group)-whole]
+				}
+				continue
+			}
+			switch base64Class[chunk[0]] {
+			case 2:
+				f.padded = true
+				f.flushFinal()
+			case 1:
 				// The white space that folds the lines: not content.
-			case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '+', c == '/':
-				if f.padded {
-					*f.problem = true // base64 data after the padding: malformed
-					continue
-				}
-				f.group = append(f.group, c)
-				if len(f.group) == 4 {
-					f.out = append(f.out, f.group...)
-					f.group = f.group[:0]
-				}
 			default:
 				*f.problem = true // a foreign octet in a base64 body
 			}
+			chunk = chunk[1:]
 		}
 		if err == io.EOF {
 			f.done = true

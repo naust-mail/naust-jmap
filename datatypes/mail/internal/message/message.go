@@ -96,6 +96,7 @@ func Parse(r io.Reader, factory SinkFactory) (*Message, error) {
 	}
 	st := &walkState{budget: maxParts, factory: factory}
 	root, err := walkEntity(st, lr, headers, "text/plain", 0)
+	lr.release()
 	if err != nil {
 		return nil, err
 	}

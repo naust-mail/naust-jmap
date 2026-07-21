@@ -103,11 +103,16 @@ func checkAccount(call *Call, acct jmap.Id, needWrite bool) (errType, descriptio
 }
 
 func reply(name, callID string, args any) []jmap.Invocation {
-	raw, err := json.Marshal(args)
+	// MarshalCompactJSON, not json.Marshal directly: Response.WriteJSON embeds
+	// Args verbatim on the assumption every response Invocation's Args passed
+	// through here (or an equally-audited construction site - see
+	// wire_test.go's TestResponseConstructionSitesAreAudited), so this is the
+	// one place that guarantee must hold.
+	raw, err := jmap.MarshalCompactJSON(args)
 	if err != nil {
 		return fail(callID, jmap.ErrServerFail, err.Error())
 	}
-	return []jmap.Invocation{{Name: name, Args: raw, CallID: callID}}
+	return []jmap.Invocation{{Name: name, Args: json.RawMessage(raw), CallID: callID}}
 }
 
 // ---- Foo/get (section 5.1) ----
@@ -213,14 +218,18 @@ func (st *stdType) get(ctx context.Context, call *Call) []jmap.Invocation {
 		List:      make([]objectdb.Object, 0, len(ids)),
 		NotFound:  make([]jmap.Id, 0),
 	}
-	for _, id := range ids {
-		obj, err := st.db.Get(ctx, a.AccountId, st.t.Name, id)
-		if errors.Is(err, objectdb.ErrNotFound) {
+	// GetMany, not one Get per id: see loadAndMatch's identical comment in
+	// query.go - one round trip for the whole requested id list on a backend
+	// fronted by a network database, instead of one per id.
+	objs, err := st.db.GetMany(ctx, a.AccountId, st.t.Name, ids)
+	if err != nil {
+		return fail(call.CallID, jmap.ErrServerFail, err.Error())
+	}
+	for i, obj := range objs {
+		id := ids[i]
+		if obj == nil {
 			resp.NotFound = append(resp.NotFound, id)
 			continue
-		}
-		if err != nil {
-			return fail(call.CallID, jmap.ErrServerFail, err.Error())
 		}
 		var resolved map[string]json.RawMessage
 		if len(computed) > 0 {

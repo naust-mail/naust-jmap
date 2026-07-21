@@ -37,6 +37,14 @@ const (
 	sqlSet = `INSERT INTO kv (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = excluded.v`
 	sqlDel = `DELETE FROM kv WHERE k = $1`
 	sqlGet = `SELECT v FROM kv WHERE k = $1`
+	// sqlMultiGet returns exactly len(keys) rows, in input order (including
+	// repeats for a duplicated key), NULL for a key with no match - unnest
+	// WITH ORDINALITY carries each input key's original position, and the
+	// LEFT JOIN keeps a row for every one of them regardless of a match, so
+	// Postgres does the correlation (it already has to sort/join for the
+	// lookup) instead of the caller needing a map keyed by string(k).
+	sqlMultiGet = `SELECT kv.v FROM unnest($1::bytea[]) WITH ORDINALITY AS u(k, ord)
+		LEFT JOIN kv ON kv.k = u.k ORDER BY u.ord`
 )
 
 // Store implements backend.Backend on a Postgres database.
@@ -74,6 +82,35 @@ func (s *Store) Get(ctx context.Context, key []byte) ([]byte, error) {
 		return nil, backend.ErrNotFound
 	}
 	return v, err
+}
+
+// MultiGet implements backend.MultiGetter: one query for the whole batch
+// instead of one round trip per key (see multiget.go's doc comment for why -
+// loadAndMatch and the generic /get method are the two callers this exists
+// for). sqlMultiGet already returns rows in keys' order with a row for every
+// key (nil for a miss), so there is nothing left to correlate client-side -
+// no map, no string(k) conversion, just append what comes back.
+func (s *Store) MultiGet(ctx context.Context, keys [][]byte) ([][]byte, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, sqlMultiGet, keys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([][]byte, 0, len(keys))
+	for rows.Next() {
+		var v []byte
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // CompareAndSwap sets key to newValue only if its current value equals expected

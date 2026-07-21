@@ -324,6 +324,7 @@ func walkMultipart(st *walkState, lr *lineReader, p *Part, typ, boundary string,
 			return err
 		}
 		child, err := walkEntity(st, partLR, headers, childDefault, depth+1)
+		partLR.release()
 		if err != nil {
 			return err
 		}

@@ -52,13 +52,15 @@ type MethodError struct {
 }
 
 // ErrorInvocation builds the ["error", {...}, callID] response for a
-// failed method call (section 3.6.2).
+// failed method call (section 3.6.2). Built via MarshalCompactJSON, not
+// json.Marshal directly: see reply()'s comment in core/runtime/standard.go
+// for why response Args must come from an audited construction site.
 func ErrorInvocation(callID string, e MethodError) Invocation {
-	args, err := json.Marshal(e)
+	args, err := MarshalCompactJSON(e)
 	if err != nil {
-		args = []byte(`{"type":"serverFail"}`)
+		args = CompactJSON(`{"type":"serverFail"}`)
 	}
-	return Invocation{Name: "error", Args: args, CallID: callID}
+	return Invocation{Name: "error", Args: json.RawMessage(args), CallID: callID}
 }
 
 // SetError types (RFC 8620 section 5.3 plus /copy's alreadyExists).
