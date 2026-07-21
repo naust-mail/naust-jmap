@@ -23,6 +23,53 @@ var (
 	errUploadReclaimed = errors.New("chunkstore: upload run was reclaimed before commit")
 )
 
+// initialBufSize is the capacity a piece buffer starts at, before append grows
+// it toward the current piece's target size. It is deliberately not a tunable:
+// it changes no stored format and no backend write pattern, only how much
+// capacity a writer holds on the way to a piece it may never fill.
+const initialBufSize = 64 << 10
+
+// firstPieceSize is the target size of a blob's FIRST piece. Pieces double from
+// here up to tuning.BlobPieceSize (see pieceSize).
+const firstPieceSize = 256 << 10
+
+// pieceSize returns the target size of piece number `index`, doubling from
+// firstPieceSize up to tuning.BlobPieceSize.
+//
+// Pieces need not be uniform: a manifest records only the run, the piece COUNT
+// and the total size, and reads walk the pieces in order (there is no offset
+// table and no ranged read), so nothing downstream can observe how the bytes
+// were divided. Ramping uses that freedom to escape a real bind in a single
+// fixed size, where the only thing that decides peak memory is whether a blob
+// exceeds one piece:
+//
+//   - Sized for few round trips (a large piece), every blob smaller than one
+//     piece is buffered WHOLE, which is what the whole-value store does. Peak
+//     then tracks blob size times concurrent writers.
+//   - Sized to cap that memory (a small piece), a large blob pays a backend
+//     round trip per piece all the way up.
+//
+// Neither is a compromise, because a fixed size cannot be: its effect is a step
+// at "blob exceeds one piece", so a value between two others behaves exactly
+// like the larger one for every blob that still fits. Ramping makes the two
+// ends independent - a small blob is one piece and one round trip, a mid-size
+// blob's buffer is capped well below its own length, and a large blob still
+// reaches full-size pieces so its round trips stay proportional to
+// BlobPieceSize rather than to the first piece.
+func pieceSize(index uint32) int {
+	size := firstPieceSize
+	for i := uint32(0); i < index; i++ {
+		if size >= tuning.BlobPieceSize {
+			return tuning.BlobPieceSize
+		}
+		size *= 2
+	}
+	if size > tuning.BlobPieceSize {
+		return tuning.BlobPieceSize
+	}
+	return size
+}
+
 // Create begins a streaming write. A random run id is chosen and a marker,
 // stamped with the current time, is recorded before any content, so every
 // piece this writer goes on to store is covered by a marker Sweep can age and
@@ -79,15 +126,27 @@ func (w *writer) Write(p []byte) (int, error) {
 	w.size += int64(total)
 	for len(p) > 0 {
 		if w.buf == nil {
-			w.buf = make([]byte, 0, tuning.BlobPieceSize)
+			// Start small and let append grow it, rather than reserving a
+			// whole BlobPieceSize up front. A blob shorter than one piece -
+			// which most mail is - would otherwise hold the full piece size
+			// for its whole write while using a fraction of it, and that
+			// reservation is per CONCURRENT WRITER, so it is the term that
+			// decides peak RSS under load rather than anything about blob
+			// size. It buys nothing even in principle: a blob that never
+			// fills a piece is flushed once at Commit either way.
+			//
+			// Growth is capped at BlobPieceSize below, so a large blob still
+			// reaches full-size pieces and the same number of backend writes.
+			w.buf = make([]byte, 0, min(initialBufSize, pieceSize(w.count)))
 		}
-		take := tuning.BlobPieceSize - len(w.buf)
+		target := pieceSize(w.count)
+		take := target - len(w.buf)
 		if take > len(p) {
 			take = len(p)
 		}
 		w.buf = append(w.buf, p[:take]...)
 		p = p[take:]
-		if len(w.buf) == tuning.BlobPieceSize {
+		if len(w.buf) == target {
 			if err := w.flush(); err != nil {
 				return 0, err
 			}
