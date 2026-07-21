@@ -575,7 +575,11 @@ func (m *textMatcher) scan(text string) {
 	// previous feed, so nothing is counted twice. base is the body offset the
 	// combined buffer starts at.
 	base := m.total - len(m.tail)
-	buf := make([]byte, 0, len(m.tail)+len(text))
+	n := len(m.tail) + len(text)
+	if n < len(m.tail) { // overflow: the sum wrapped past int's range
+		n = 0 // fall back to growth-by-append, no bad capacity hint
+	}
+	buf := make([]byte, 0, n)
 	buf = append(buf, m.tail...)
 	buf = append(buf, text...)
 	scan := asciiLower(string(buf))
