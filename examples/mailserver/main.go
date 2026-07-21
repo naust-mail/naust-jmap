@@ -15,16 +15,22 @@
 //
 //	go run ./examples/mailserver
 //
-// Or over Postgres instead of SQLite (-postgres replaces -db entirely,
-// single-node only - see drivers/postgres):
+// Or over Postgres instead of SQLite (-postgres replaces -db entirely; several
+// instances may share one database as a fleet - see drivers/postgres):
 //
 //	go run ./examples/mailserver -postgres 'postgres://user:pass@localhost:5432/naust'
 //
-// A fresh account has no mailboxes, so first create an Inbox (user
-// demo@example.com, password demo). Delivery to an account with no inbox-role
-// Mailbox tempfails by design, so this step is required once:
+// JMAP requests carry a bearer token, not the password directly: log in once
+// to mint one (the argon2id password check runs only here, never per request),
+// then send the token on every call:
 //
-//	curl -su demo@example.com:demo http://localhost:8080/api \
+//	TOKEN=$(curl -s -X POST -u demo@example.com:demo http://localhost:8080/login)
+//
+// A fresh account has no mailboxes, so first create an Inbox. Delivery to an
+// account with no inbox-role Mailbox tempfails by design, so this step is
+// required once:
+//
+//	curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api \
 //	  -H 'Content-Type: application/json' -d '{
 //	    "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
 //	    "methodCalls": [["Mailbox/set", {"accountId": "Ademo",
@@ -48,7 +54,7 @@
 // Then read it back over JMAP, and watch the EmailDelivery push type advance
 // on new mail alone (RFC 8621 section 1.5) while you deliver more:
 //
-//	curl -su demo@example.com:demo http://localhost:8080/api \
+//	curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api \
 //	  -H 'Content-Type: application/json' -d '{
 //	    "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
 //	    "methodCalls": [
@@ -60,7 +66,7 @@
 //	    ]
 //	  }'
 //
-//	curl -su demo@example.com:demo \
+//	curl -s -H "Authorization: Bearer $TOKEN" \
 //	  'http://localhost:8080/eventsource?types=EmailDelivery,Email&closeafter=no&ping=30'
 //
 // Sending is wired too (urn:ietf:params:jmap:submission): demo@example.com
@@ -93,11 +99,13 @@ import (
 	"github.com/naust-mail/naust-jmap/core/providers/blob/kvstore"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/providers/notify"
+	"github.com/naust-mail/naust-jmap/core/pushsub"
 	"github.com/naust-mail/naust-jmap/core/runtime"
+	"github.com/naust-mail/naust-jmap/core/webpush"
 	"github.com/naust-mail/naust-jmap/datatypes/mail"
 	"github.com/naust-mail/naust-jmap/drivers/postgres"
 	"github.com/naust-mail/naust-jmap/drivers/sqlite"
-	"github.com/naust-mail/naust-jmap/examples/internal/demoauth"
+	"github.com/naust-mail/naust-jmap/examples/internal/tokenauth"
 )
 
 // staticResolver maps envelope recipients to accounts. A real deployment
@@ -196,7 +204,7 @@ func ensureIdentity(proc *runtime.Processor, acct jmap.Id, email string) error {
 
 func main() {
 	dbPath := flag.String("db", "./naust-mail.db", "SQLite database file")
-	pgDSN := flag.String("postgres", "", "Postgres DSN (e.g. postgres://user:pass@host:5432/db); when set, replaces the SQLite backend entirely and -db is ignored (single-node only, no cluster)")
+	pgDSN := flag.String("postgres", "", "Postgres DSN (e.g. postgres://user:pass@host:5432/db); when set, replaces the SQLite backend entirely and -db is ignored (instances sharing one database form a fleet: store lease + cross-instance push)")
 	httpAddr := flag.String("http", "localhost:8080", "JMAP HTTP listen address")
 	lmtpAddr := flag.String("lmtp", "127.0.0.1:2400", "LMTP listen address (never port 25)")
 	blobStore := flag.String("blobs", "chunk", "raw-message blob store: chunk (streaming), kv (whole blob in one value), or fs (one file per message)")
@@ -211,20 +219,40 @@ func main() {
 
 	// Persistence: one backend is both the object store and the raw-message
 	// blob store. Default is SQLite; -postgres swaps in the Postgres driver
-	// instead - single-node only (lease/notify below stay InProcess either
-	// way; a real cluster deployment also swaps those for store-backed
-	// implementations, which are not built yet).
+	// instead.
 	var store backend.Backend
+	var pgStore *postgres.Store
 	var err error
 	if *pgDSN != "" {
-		store, err = postgres.Open(context.Background(), *pgDSN)
+		pgStore, err = postgres.Open(context.Background(), *pgDSN)
+		store = pgStore
 	} else {
 		store, err = sqlite.Open(*dbPath)
 	}
 	if err != nil {
 		log.Fatal(err)
 	}
-	db := objectdb.New(store, lease.NewInProcess(store))
+
+	// Coordination. With -postgres the deployment can be a fleet sharing one
+	// database: a single LISTEN/NOTIFY hint transport per process accelerates
+	// lease handoff and carries change notifications across instances, and the
+	// writer lease becomes the store-backed one, so instances exclude each
+	// other at Acquire instead of only fencing at commit. A single node (and
+	// every non-Postgres backend) runs the in-process lease and notifier.
+	var leases lease.Manager
+	var notifier notify.Notifier
+	if pgStore != nil {
+		hints, err := postgres.OpenHints(context.Background(), pgStore)
+		if err != nil {
+			log.Fatal(err)
+		}
+		leases = lease.NewStoreLease(store, lease.StoreLeaseConfig{Waker: hints.Waker()})
+		notifier = hints.Notifier()
+	} else {
+		leases = lease.NewInProcess(store)
+		notifier = notify.NewInProcess()
+	}
+	db := objectdb.New(store, leases)
 
 	// The raw-message blob store shares the same backend. Both options
 	// satisfy blob.Store, so nothing downstream changes.
@@ -266,17 +294,19 @@ func main() {
 		log.Fatalf("-blobs must be chunk, kv or fs, got %q", *blobStore)
 	}
 
-	// Authentication: a static user list. Real embedders implement
-	// auth.Authenticator against their own accounts.
+	// Authentication models the production split: POST /login (registered on
+	// the mux below) runs the password KDF once and mints a bearer token, and
+	// the per-request path only verifies that token - so the argon2id cost is
+	// paid at login, never on every JMAP call. Real embedders implement
+	// auth.Authenticator against their own accounts, or verify tokens issued
+	// by an external identity provider.
 	//
 	// demo@example.com is always present. -accounts additionally registers
 	// u1..uN, which exists so a benchmark can spread delivery across accounts:
 	// the writer lease is per ACCOUNT, so delivering everything to one account
 	// measures lease contention rather than ingest throughput, and the two are
 	// only distinguishable by varying this.
-	// Fast argon2id cost: this is a throughput benchmark, so the KDF is
-	// deliberately cheap and not part of what is being measured.
-	users := demoauth.New(demoauth.Fast())
+	users := tokenauth.New()
 	users.AddUser("demo@example.com", "demo", "Ademo")
 	resolve := staticResolver{"demo@example.com": "Ademo"}
 	for i := 1; i <= *accounts; i++ {
@@ -331,7 +361,34 @@ func main() {
 	// upload/download for Email/import, and live StateChange events - the
 	// path by which EmailDelivery reaches subscribed clients.
 	srv.EnableBlobs(db, blobs)
-	if err := srv.EnablePush(db, notify.NewInProcess(), nil, nil); err != nil {
+	if pgStore != nil {
+		// A fleet delivers webpush (RFC 8620 section 7.2): the hint Notifier
+		// carries changes across instances, and exactly one elected instance
+		// POSTs, so N nodes do not each hit the push service (which rate-limits).
+		subStore := pushsub.NewStore(store, leases)
+		if err := srv.EnablePush(db, notifier, subStore, &webpush.Sender{}); err != nil {
+			log.Fatal(err)
+		}
+		// A booting node is passive until elected, so it does not duplicate
+		// another node's POSTs. The window between EnablePush (which starts
+		// active) and here can cost one duplicate POST, which section 7.2 makes
+		// harmless.
+		if err := srv.SetWebpushActive(context.Background(), false); err != nil {
+			log.Fatal(err)
+		}
+		// Elect one webpush sender fleet-wide. The holder sends; if it crashes,
+		// another node takes over once the election claim expires.
+		go lease.RunSingleton(context.Background(), store, "webpush/0", lease.SingletonConfig{}, func(ctx context.Context) {
+			if err := srv.SetWebpushActive(ctx, true); err != nil {
+				log.Printf("webpush activate: %v", err)
+				return
+			}
+			<-ctx.Done()
+			_ = srv.SetWebpushActive(context.Background(), false)
+		})
+	} else if err := srv.EnablePush(db, notifier, nil, nil); err != nil {
+		// Single node: event source only (no webpush subscriptions or sender),
+		// webpush trivially active, no election.
 		log.Fatal(err)
 	}
 
@@ -398,9 +455,10 @@ func main() {
 	// /eventsource, the blob endpoints).
 	root := http.NewServeMux()
 	root.Handle("/ingest", mail.NewHTTPIngest(deliverer, mail.WithMaxIngestInFlight(*ingestInFlight)))
+	root.Handle("/login", users.LoginHandler())
 	root.Handle("/", srv)
 
-	log.Printf("JMAP at http://%s/.well-known/jmap (demo@example.com / demo)", *httpAddr)
+	log.Printf("JMAP at http://%s/.well-known/jmap (POST /login as demo@example.com / demo for a bearer token)", *httpAddr)
 	log.Printf("LMTP at %s, HTTP ingest at http://%s/ingest", *lmtpAddr, *httpAddr)
 	log.Fatal(http.ListenAndServe(*httpAddr, root))
 }

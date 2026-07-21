@@ -36,7 +36,7 @@ runtime.
 |-------------------|--------------------------------------------------------------------------------------------------------------------------------|---------------------------|
 | `core/`           | The runtime library, one Go module, stdlib-only forever                                                                        | import always             |
 | `core/providers/` | The interfaces the runtime needs (storage, blobs, leases, notifications, auth), each with a built-in in-process implementation | pick or implement         |
-| `drivers/`        | Provider implementations that need third-party dependencies (sqlite today), each its own module                                | import at most one or two |
+| `drivers/`        | Provider implementations that need third-party dependencies (sqlite, postgres), each its own module                            | import at most one or two |
 | `datatypes/`      | JMAP datatypes served on top of the runtime (mail arrives here first), each its own module                                     | import what you serve     |
 | `examples/`       | Runnable servers: the quickstart below and a full mail server (`examples/mailserver`)                                          | read                      |
 
@@ -125,24 +125,25 @@ The core protocol (RFC 8620) is implemented end to end:
 `Foo` below stands for any registered datatype; the methods are derived
 from its descriptor, not written per type.
 
-| Category   | Feature                                | Status   | Notes                                                                                         |
-|------------|----------------------------------------|----------|-----------------------------------------------------------------------------------------------|
-| Session    | Session resource (`/.well-known/jmap`) | Yes      | Accounts, capabilities, URLs, `sessionState` on every response                                |
-| Session    | HTTP Basic authentication              | Yes      | Pluggable via the `providers/auth` interface                                                  |
-| Core       | Capability negotiation (`using`)       | Yes      | Non-opted capabilities behave as absent                                                       |
-| Core       | `Core/echo`                            | Yes      |                                                                                               |
-| API        | Request envelope (`/api`)              | Yes      | Batched method calls, strict I-JSON, request limits                                           |
-| API        | Request- and method-level errors       | Yes      | Full RFC 8620 error catalog                                                                   |
-| References | Back-references (`#arg`)               | Yes      | JSON Pointer evaluation with `*` array flattening                                             |
-| References | Creation-id references (`#creationId`) | Yes      | Request-wide `createdIds` map                                                                 |
-| Methods    | `Foo/get`, `Foo/changes`, `Foo/set`    | Yes      | PatchObject validation, change coalescing, per-record atomicity                               |
-| Methods    | `Foo/copy`                             | Yes      | Cross-account copy with `onSuccessDestroyOriginal`                                            |
-| Methods    | `Foo/query`                            | Yes      | Indexed range scans, in-memory residual, anchors, windowing                                   |
-| Methods    | `Foo/queryChanges`                     | Fallback | Always answers `cannotCalculateChanges` (permitted by section 5.6); clients refetch the query |
-| State      | State strings and `ifInState`          | Yes      | Optimistic concurrency with `stateMismatch`                                                   |
-| Blobs      | Upload/download endpoints, `Blob/copy` | Yes      | Reference tracking and unreferenced-blob sweeping                                             |
-| Push       | EventSource (`/eventsource`)           | Yes      | `types`, `closeafter`, `ping` arguments                                                       |
-| Push       | `PushSubscription` webhooks            | Yes      | Verification flow, RFC 8291 payload encryption                                                |
+| Category   | Feature                                | Status   | Notes                                                                                                                 |
+|------------|----------------------------------------|----------|-----------------------------------------------------------------------------------------------------------------------|
+| Session    | Session resource (`/.well-known/jmap`) | Yes      | Accounts, capabilities, URLs, `sessionState` on every response                                                        |
+| Session    | Authentication                         | Yes      | Pluggable via the `providers/auth` interface; quickstart uses Basic, mailserver uses bearer tokens                    |
+| Session    | Advertised limits                      | Yes      | `maxSizeUpload`, `maxSizeRequest`, `maxCallsInRequest`, `maxObjectsInGet/Set`, etc. (section 2), enforced server-side |
+| Core       | Capability negotiation (`using`)       | Yes      | Non-opted capabilities behave as absent                                                                               |
+| Core       | `Core/echo`                            | Yes      |                                                                                                                       |
+| API        | Request envelope (`/api`)              | Yes      | Batched method calls, strict I-JSON, request limits                                                                   |
+| API        | Request- and method-level errors       | Yes      | Full RFC 8620 error catalog                                                                                           |
+| References | Back-references (`#arg`)               | Yes      | JSON Pointer evaluation with `*` array flattening                                                                     |
+| References | Creation-id references (`#creationId`) | Yes      | Request-wide `createdIds` map                                                                                         |
+| Methods    | `Foo/get`, `Foo/changes`, `Foo/set`    | Yes      | PatchObject validation, change coalescing, per-record atomicity                                                       |
+| Methods    | `Foo/copy`                             | Yes      | Cross-account copy with `onSuccessDestroyOriginal`                                                                    |
+| Methods    | `Foo/query`                            | Yes      | Indexed range scans, in-memory residual, anchors, windowing                                                           |
+| Methods    | `Foo/queryChanges`                     | Fallback | Always answers `cannotCalculateChanges` (permitted by section 5.6); clients refetch the query                         |
+| State      | State strings and `ifInState`          | Yes      | Optimistic concurrency with `stateMismatch`                                                                           |
+| Blobs      | Upload/download endpoints, `Blob/copy` | Yes      | Reference tracking and unreferenced-blob sweeping                                                                     |
+| Push       | EventSource (`/eventsource`)           | Yes      | `types`, `closeafter`, `ping` arguments                                                                               |
+| Push       | `PushSubscription` webhooks            | Yes      | Verification flow, RFC 8291 payload encryption                                                                        |
 
 </details>
 
@@ -231,26 +232,27 @@ delivering a message both ways, and reading it back over JMAP. With no
 <details>
 <summary>RFC 8621 support matrix</summary>
 
-| Object / method                             | Status | Notes                                                                                     |
-|---------------------------------------------|--------|-------------------------------------------------------------------------------------------|
-| `Mailbox/get`, `/query`, `/changes`         | Yes    | 18 IANA roles, tree with a depth limit, computed `myRights`                               |
-| `Mailbox/set`                               | Yes    | create/update/destroy, `onDestroyRemoveEmails` cascade                                    |
-| Mailbox counters                            | Yes    | `totalEmails`, `unreadEmails`, `totalThreads`, `unreadThreads` (section 2.1, trash-aware) |
-| `Thread/get`, `/changes`                    | Yes    | References + subject grouping; Threads never merge (see Design decisions)                 |
-| `Email/get`                                 | Yes    | stored fast fields + on-demand MIME parse; `header:{name}:as{Form}:all` parsed forms      |
-| `Email/query`                               | Yes    | every section 4.4.1 condition, section 4.4.2 sort, `collapseThreads`, fast total          |
-| `Email/set` (keywords, mailboxIds, destroy) | Yes    | flag and file existing mail; per-record atomic                                            |
-| `Email/set` (create / compose)              | Yes    | strict-reject message generation from parts (see Design decisions)                        |
-| `Email/import`, `Email/parse`               | Yes    | ingest an uploaded blob; parse a blob without storing an Email                            |
-| `Email/copy`                                | Yes    | cross-account copy with `onSuccessDestroyOriginal`                                        |
-| `SearchSnippet/get`                         | Yes    | highlighted subject and body preview                                                      |
-| Delivery (LMTP, HTTP ingest)                | Yes    | transport-agnostic `Deliverer`; RFC 2033 LMTP; host-provided recipient `Resolver`         |
-| `EmailDelivery` push type                   | Yes    | section 1.5 method-less push; state advances on new mail only                             |
-| `Identity/get`, `/changes`, `/set`          | Yes    | section 6 defaults, `SendPolicy`-gated creation, immutable `email`                        |
-| `EmailSubmission` (all methods)             | Yes    | section 7 envelope derivation, section 7.5 error taxonomy, `onSuccessUpdateEmail/Destroy` |
-| Sending worker + SMTP relay                 | Yes    | records-as-queue worker (see Design decisions); reference `Submitter` over SMTP, RFC 3461 |
-| FUTURERELEASE (RFC 4865)                    | Yes    | native holds via `sendAt`; over-limit or conflicting holds rejected, not clamped          |
-| `VacationResponse`                          | Planned | own capability (section 8), a later module                                               |
+| Object / method                             | Status  | Notes                                                                                               |
+|---------------------------------------------|---------|-----------------------------------------------------------------------------------------------------|
+| `Mailbox/get`, `/query`, `/changes`         | Yes     | 18 IANA roles, tree with a depth limit, computed `myRights`                                         |
+| `Mailbox/set`                               | Yes     | create/update/destroy, `onDestroyRemoveEmails` cascade                                              |
+| Mailbox counters                            | Yes     | `totalEmails`, `unreadEmails`, `totalThreads`, `unreadThreads` (section 2.1, trash-aware)           |
+| `Thread/get`, `/changes`                    | Yes     | References + subject grouping; Threads never merge (see Design decisions)                           |
+| `Email/get`                                 | Yes     | stored fast fields + on-demand MIME parse; `header:{name}:as{Form}:all` parsed forms                |
+| `Email/query`                               | Yes     | every section 4.4.1 condition, section 4.4.2 sort, `collapseThreads`, fast total                    |
+| `Email/set` (keywords, mailboxIds, destroy) | Yes     | flag and file existing mail; per-record atomic                                                      |
+| `Email/set` (create / compose)              | Yes     | strict-reject message generation from parts (see Design decisions)                                  |
+| `Email/import`, `Email/parse`               | Yes     | ingest a blob; parse without storing (`notParsable`, section 4.9, not yet split from serverFail)    |
+| `Email/copy`                                | Yes     | cross-account copy with `onSuccessDestroyOriginal`                                                  |
+| `SearchSnippet/get`                         | Yes     | highlighted subject and body preview                                                                |
+| Delivery (LMTP, HTTP ingest)                | Yes     | transport-agnostic `Deliverer`; RFC 2033 LMTP; host-provided recipient `Resolver`                   |
+| `EmailDelivery` push type                   | Yes     | section 1.5 method-less push; state advances on new mail only                                       |
+| `Identity/get`, `/changes`, `/set`          | Yes     | section 6 defaults, `SendPolicy`-gated creation, immutable `email`                                  |
+| `EmailSubmission` (all methods)             | Yes     | section 7 envelope derivation, section 7.5 error taxonomy, `onSuccessUpdateEmail/Destroy`           |
+| Sending worker + SMTP relay                 | Yes     | records-as-queue worker (see Design decisions); reference `Submitter` over SMTP, RFC 3461           |
+| FUTURERELEASE (RFC 4865)                    | Yes     | native holds via `sendAt`; over-limit or conflicting holds rejected, not clamped                    |
+| `VacationResponse`                          | Planned | own capability (section 8), a later module                                                          |
+| Mail/Submission capability objects          | Yes     | `maxMailboxesPerEmail`, `maxSizeAttachmentsPerEmail`, `maxDelayedSend`, etc. (sections 1.3.1/1.3.2) |
 
 Search is a swappable interface (`mail.Searcher`); the built-in implementation
 is case-insensitive substring matching. MDN (RFC 9007), S/MIME verification
@@ -261,12 +263,13 @@ is case-insensitive substring matching. MDN (RFC 9007), S/MIME verification
 ## Roadmap
 
 naust-jmap is pre-release: no tagged versions yet. The mail module (see Mail
-above) reads, composes and sends. Coming next, in order:
+above) reads, composes and sends, over either the sqlite or postgres driver
+(the latter including a multi-node cluster hint layer). Coming next, in
+order:
 
 - DSN/MDN ingestion into `EmailSubmission` (`dsnBlobIds`, final
   `deliveryStatus`), and `VacationResponse`
 - MDN, S/MIME verification, and quotas as further RFC 8621-family modules
-- A Postgres driver and multi-node cluster testing
 
 ## License
 

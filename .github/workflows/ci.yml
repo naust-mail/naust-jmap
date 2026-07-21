@@ -1,0 +1,103 @@
+name: CI
+
+# Builds, vets, and tests every module in the workspace on each push and pull
+# request that touches Go code or the build files. This is a go.work
+# multi-module workspace, so `go build ./...` from the root fails by design:
+# each module is built and tested in its own directory, which is exactly how
+# the modules are developed. A matrix runs the modules in parallel and reports
+# per-module signal.
+#
+# A Postgres service is attached to every job and its DSN exported as
+# PG_TEST_DSN. The Postgres driver and the cluster suite read it and exercise a
+# real server (a shared database, LISTEN/NOTIFY, the store lease); every other
+# module ignores it. Tests that need it SKIP rather than fail when it is
+# absent, so this is the only place they actually run.
+
+on:
+  push:
+    paths:
+      - '**.go'
+      - '**/go.mod'
+      - '**/go.sum'
+      - 'go.work'
+      - 'go.work.sum'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - '**.go'
+      - '**/go.mod'
+      - '**/go.sum'
+      - 'go.work'
+      - 'go.work.sum'
+      - '.github/workflows/ci.yml'
+
+# Read-only CI: build, vet, and test. No writes to the repo or releases.
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - core
+          - datatypes/mail
+          - drivers/sqlite
+          - drivers/postgres
+          - examples
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        # Hold the job until the server accepts connections, so the first
+        # test does not race the container's startup.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PG_TEST_DSN: postgres://postgres:test@localhost:5432/postgres
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # One toolchain for every module: the workspace's go directive is the
+      # single source of truth and satisfies each module's own (a module may
+      # ask for an older Go, never a newer one than the workspace pins).
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+
+      - name: Build
+        working-directory: ${{ matrix.module }}
+        run: go build ./...
+
+      - name: Vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
+
+      - name: gofmt check
+        working-directory: ${{ matrix.module }}
+        run: |
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "The following files are not gofmt'd:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      # -race across every module: it is the whole point of the concurrency
+      # here (the store lease, the hint transport, the submission worker, and
+      # the cluster suite all run goroutines that contend), and it is what the
+      # local development gate runs.
+      - name: Test
+        working-directory: ${{ matrix.module }}
+        run: go test ./... -race

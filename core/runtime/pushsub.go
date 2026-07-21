@@ -39,8 +39,16 @@ type pushSupport struct {
 	stop context.CancelFunc
 	wg   sync.WaitGroup
 
-	mu       sync.Mutex
-	watchers map[jmap.Id]*subWatcher
+	mu sync.Mutex
+	// active reports whether this instance sends webpush StateChange objects.
+	// When false, startWatcher is a no-op and the watchers map stays empty, so
+	// the instance delivers nothing over webpush while the event source and
+	// verification paths keep running.
+	active bool
+	// relistStop cancels the active sender's re-list goroutine; nil while
+	// inactive.
+	relistStop context.CancelFunc
+	watchers   map[jmap.Id]*subWatcher
 	// rates holds recent creation times per credential.
 	rates map[string][]time.Time
 }
@@ -74,9 +82,89 @@ func (s *Server) EnablePush(db *objectdb.DB, n notify.Notifier, subs *pushsub.St
 	}
 	s.proc.Register("PushSubscription/get", jmap.CoreCapability, p.getSubs)
 	s.proc.Register("PushSubscription/set", jmap.CoreCapability, p.setSubs)
-	// Deliveries survive restarts: resume watching every verified,
+	// Send by default: a single-node deployment and the existing callers are
+	// active from the start. A fleet turns this off right after EnablePush and
+	// lets exactly one elected instance turn it back on (SetWebpushActive).
+	// Deliveries also survive restarts: resume watching every verified,
 	// unexpired subscription.
-	all, err := subs.All(ctx)
+	p.active = true
+	return p.relistOnce(ctx)
+}
+
+// Close stops push delivery goroutines and waits for them. The HTTP
+// handler itself needs no shutdown.
+func (s *Server) Close() {
+	if s.push != nil {
+		s.push.stop()
+		s.push.wg.Wait()
+	}
+}
+
+// SetWebpushActive starts (true) or stops (false) webpush StateChange delivery
+// on this instance. In a deployment where several instances share one store,
+// exactly one should POST to push services: RFC 8620 section 7.2 makes a
+// duplicate push harmless, but push services rate-limit and a 429 obliges the
+// server to slow down, so N instances each POSTing wastes that budget. The
+// elected instance calls SetWebpushActive(true); the rest stay passive.
+//
+// The event source and PushVerification paths are never gated: section 7.2.2
+// requires the verification POST immediately upon create, so whichever instance
+// handles the create always sends it, and each event-source stream is served by
+// the instance holding it. EnablePush starts active, so single-node deployments
+// and the existing callers are unchanged.
+func (s *Server) SetWebpushActive(ctx context.Context, active bool) error {
+	p := s.push
+	if p == nil || p.subs == nil || p.sender == nil {
+		return errors.New("runtime: webpush is not enabled")
+	}
+	p.mu.Lock()
+	if active == p.active {
+		p.mu.Unlock()
+		return nil
+	}
+	p.active = active
+	if !active {
+		// Cancel every watcher (per-watcher, not p.stop: the event source and
+		// verification paths keep running) and stop re-listing.
+		cancels := make([]context.CancelFunc, 0, len(p.watchers))
+		for id, w := range p.watchers {
+			cancels = append(cancels, w.cancel)
+			delete(p.watchers, id)
+		}
+		if p.relistStop != nil {
+			p.relistStop()
+			p.relistStop = nil
+		}
+		p.mu.Unlock()
+		for _, cancel := range cancels {
+			cancel()
+		}
+		return nil
+	}
+	relistCtx, relistStop := context.WithCancel(p.ctx)
+	p.relistStop = relistStop
+	p.mu.Unlock()
+
+	// Watch every current verified, unexpired subscription now, then keep
+	// re-listing so subscriptions created through other instances are picked up.
+	if err := p.relistOnce(ctx); err != nil {
+		p.mu.Lock()
+		p.active = false
+		p.relistStop = nil
+		p.mu.Unlock()
+		relistStop()
+		return err
+	}
+	p.wg.Add(1)
+	go p.relistLoop(relistCtx)
+	return nil
+}
+
+// relistOnce starts a watcher for every stored verified, unexpired
+// subscription. startWatcher dedupes through the watchers map, so re-running it
+// only adds subscriptions not already being watched.
+func (p *pushSupport) relistOnce(ctx context.Context) error {
+	all, err := p.subs.All(ctx)
 	if err != nil {
 		return err
 	}
@@ -89,12 +177,21 @@ func (s *Server) EnablePush(db *objectdb.DB, n notify.Notifier, subs *pushsub.St
 	return nil
 }
 
-// Close stops push delivery goroutines and waits for them. The HTTP
-// handler itself needs no shutdown.
-func (s *Server) Close() {
-	if s.push != nil {
-		s.push.stop()
-		s.push.wg.Wait()
+// relistLoop re-lists subscriptions every tuning.PushRelistInterval while this
+// instance is the active sender, so a subscription created through another
+// instance is eventually picked up. A transient listing error is skipped; the
+// next tick retries.
+func (p *pushSupport) relistLoop(ctx context.Context) {
+	defer p.wg.Done()
+	t := time.NewTicker(tuning.PushRelistInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			_ = p.relistOnce(ctx)
+		}
 	}
 }
 
@@ -523,6 +620,11 @@ func (p *pushSupport) sendVerification(sub *pushsub.Subscription) {
 func (p *pushSupport) startWatcher(sub *pushsub.Subscription) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// A passive instance sends nothing over webpush; it will pick this
+	// subscription up from the store if it is later elected the sender.
+	if !p.active {
+		return
+	}
 	if _, running := p.watchers[sub.Id]; running {
 		return
 	}

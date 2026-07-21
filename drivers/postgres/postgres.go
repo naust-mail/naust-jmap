@@ -44,6 +44,10 @@ type Store struct {
 	pool *pgxpool.Pool
 }
 
+// Postgres has independent concurrent connection-level writers, so it provides
+// the atomic claim swap the store lease needs (see CompareAndSwap).
+var _ backend.CompareAndSwapper = (*Store)(nil)
+
 // Open connects to the Postgres database at dsn and ensures the kv table
 // exists.
 //
@@ -70,6 +74,36 @@ func (s *Store) Get(ctx context.Context, key []byte) ([]byte, error) {
 		return nil, backend.ErrNotFound
 	}
 	return v, err
+}
+
+// CompareAndSwap sets key to newValue only if its current value equals expected
+// (expected == nil means the key must be absent), atomically across concurrent
+// connections at READ COMMITTED, and reports whether the swap happened.
+//
+// This is the atomic claim primitive the store lease needs. A bare Assert
+// followed by a Set in a READ COMMITTED batch is NOT a compare-and-swap across
+// connections: two sessions can each read the old value before either writes,
+// so both pass their Assert and both write. A single conditional statement has
+// no such window - the unique index (absent case) or the row lock and
+// READ COMMITTED re-check (value case) lets exactly one writer win.
+func (s *Store) CompareAndSwap(ctx context.Context, key, expected, newValue []byte) (bool, error) {
+	// nil and empty are one value to the Backend contract; the NOT NULL column
+	// stores empty, never SQL NULL.
+	if newValue == nil {
+		newValue = []byte{}
+	}
+	if expected == nil {
+		tag, err := s.pool.Exec(ctx, `INSERT INTO kv (k, v) VALUES ($1, $2) ON CONFLICT (k) DO NOTHING`, key, newValue)
+		if err != nil {
+			return false, err
+		}
+		return tag.RowsAffected() == 1, nil
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE kv SET v = $2 WHERE k = $1 AND v = $3`, key, newValue, expected)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // Scan visits keys in [start, end) in order, stopping early when fn

@@ -59,3 +59,13 @@ var ErrUnauthenticated = errors.New("auth: unauthenticated")
 type Authenticator interface {
 	Authenticate(r *http.Request) (*Identity, error)
 }
+
+// Challenger is an optional Authenticator extension that names the scheme
+// a 401 response should challenge for (RFC 7235 section 4.1's
+// WWW-Authenticate). Authenticators that don't implement it get the
+// runtime's "Basic" default, so existing embedders are unaffected.
+type Challenger interface {
+	// Challenge returns the WWW-Authenticate header value to send on a
+	// failed Authenticate, e.g. `Bearer realm="jmap"`.
+	Challenge() string
+}

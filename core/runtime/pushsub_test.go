@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/base64"
@@ -613,4 +614,50 @@ func TestPushWatcherRestart(t *testing.T) {
 	if changed := decodeStateChange(t, h.body); changed["Atest1"]["TestNote"] != "1" {
 		t.Fatalf("changed: %v", changed)
 	}
+}
+
+// TestWebpushActiveToggle exercises the sender-election seam: deactivating stops
+// StateChange delivery without touching the event source or verification, and
+// reactivating re-lists the store and resumes delivery - including for a
+// subscription verified while the instance was passive, the cross-instance case
+// the elected sender must pick up.
+func TestWebpushActiveToggle(t *testing.T) {
+	ctx := context.Background()
+	endpoint, hits := newPushEndpoint(t)
+	rig := newPushRig(t, endpoint.Client(), nil)
+	ts := rig.ts
+
+	// Active by default: a verified subscription delivers.
+	id1, code1 := createPushSub(t, ts, hits, fmt.Sprintf(`{"deviceClientId":"d1","url":%q}`, endpoint.URL))
+	verifyPushSub(t, ts, id1, code1)
+	createNote(t, ts, `{"subject":"one"}`)
+	nextHit(t, hits)
+
+	// Deactivate: StateChange delivery stops.
+	if err := rig.srv.SetWebpushActive(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	createNote(t, ts, `{"subject":"two"}`)
+	noHit(t, hits)
+
+	// A subscription created and verified while passive still gets its
+	// verification POST (never gated), but starts no watcher yet.
+	id2, code2 := createPushSub(t, ts, hits, fmt.Sprintf(`{"deviceClientId":"d2","url":%q}`, endpoint.URL))
+	verifyPushSub(t, ts, id2, code2)
+	createNote(t, ts, `{"subject":"three"}`)
+	noHit(t, hits)
+
+	// Reactivate: the re-list resumes delivery for both subscriptions, so a
+	// single change now produces two StateChange POSTs.
+	if err := rig.srv.SetWebpushActive(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	createNote(t, ts, `{"subject":"four"}`)
+	for i := 0; i < 2; i++ {
+		h := nextHit(t, hits)
+		if decodeStateChange(t, h.body)["Atest1"]["TestNote"] == "" {
+			t.Fatalf("expected a TestNote StateChange, got %s", h.body)
+		}
+	}
+	noHit(t, hits)
 }

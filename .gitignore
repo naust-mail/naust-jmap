@@ -8,6 +8,9 @@
 *.swp
 .DS_Store
 
+# Private agent instructions (auto-loaded locally, never committed)
+/[A-Z]*.md
+
 # hidden folders
 .[a-zA-Z0-9]*/
 .[a-zA-Z0-9]*/**/*

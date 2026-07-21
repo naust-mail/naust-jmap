@@ -154,6 +154,13 @@ var PushDeliveryTTL = 43200
 // changes coalesce into one minimal StateChange while paused.
 var PushDelivery429Backoff = time.Minute
 
+// PushRelistInterval is how often the active webpush sender re-lists stored
+// subscriptions, so an instance elected to send picks up subscriptions created
+// through other instances sharing the store. The per-subscription watch loop
+// already re-reads its own record on every wake, so this only needs to catch
+// wholly new subscriptions, and a minute is prompt enough for that.
+var PushRelistInterval = time.Minute
+
 // Validate reports every tunable currently set below a floor the spec fixes or
 // below an internal invariant the module relies on, as human-readable warnings.
 // It never returns an error and a caller never blocks on it: a deployment that

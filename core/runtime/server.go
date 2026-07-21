@@ -119,11 +119,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) *auth.Identity {
 	ident, err := s.authn.Authenticate(r)
 	if err != nil {
-		w.Header().Set("WWW-Authenticate", `Basic realm="jmap"`)
+		w.Header().Set("WWW-Authenticate", s.challenge())
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return nil
 	}
 	return ident
+}
+
+// challenge returns the WWW-Authenticate value for a failed authentication,
+// per the authenticator's auth.Challenger if it implements one, else the
+// "Basic" default (RFC 7235 section 4.1).
+func (s *Server) challenge() string {
+	if c, ok := s.authn.(auth.Challenger); ok {
+		return c.Challenge()
+	}
+	return `Basic realm="jmap"`
 }
 
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {

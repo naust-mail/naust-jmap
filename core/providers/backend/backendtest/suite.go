@@ -7,6 +7,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/naust-mail/naust-jmap/core/providers/backend"
@@ -32,6 +35,68 @@ func Run(t *testing.T, cfg Config) {
 	t.Run("Assert", func(t *testing.T) { testAssert(t, cfg) })
 	t.Run("Add", func(t *testing.T) { testAdd(t, cfg) })
 	t.Run("Persistence", func(t *testing.T) { testPersistence(t, cfg) })
+	t.Run("CompareAndSwap", func(t *testing.T) { testCompareAndSwap(t, cfg) })
+}
+
+// testCompareAndSwap exercises the optional backend.CompareAndSwapper: under
+// concurrent contention on one key, exactly one CompareAndSwap succeeds per
+// round and the stored value ends as that winner's. Backends that do not
+// implement the capability are skipped - their globally serialized writes make
+// an Assert+Set batch an effective compare-and-swap already, so a lease built on
+// them is safe without it. A backend with genuinely concurrent connection-level
+// writers (where an Assert and a Set can interleave with another writer) must
+// implement it, and only a real concurrent run against such a backend catches a
+// non-atomic claim: a globally serialized backend cannot reproduce the race, so
+// this coverage lives with the driver that has real concurrency.
+func testCompareAndSwap(t *testing.T, cfg Config) {
+	b := cfg.Open(t)
+	defer b.Close()
+	cas, ok := b.(backend.CompareAndSwapper)
+	if !ok {
+		t.Skip("backend does not implement CompareAndSwapper")
+	}
+	ctx := context.Background()
+	key := []byte("cas/contended")
+
+	const racers = 8
+	const rounds = 100
+	var expected []byte // nil for the first round: the key must be absent
+	for r := 0; r < rounds; r++ {
+		var winners int64
+		var winner atomic.Value // []byte
+		var wg sync.WaitGroup
+		for i := 0; i < racers; i++ {
+			token := []byte(fmt.Sprintf("r%d-w%d", r, i))
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				swapped, err := cas.CompareAndSwap(ctx, key, expected, token)
+				if err != nil {
+					t.Errorf("round %d: CompareAndSwap: %v", r, err)
+					return
+				}
+				if swapped {
+					atomic.AddInt64(&winners, 1)
+					winner.Store(token)
+				}
+			}()
+		}
+		wg.Wait()
+		if winners != 1 {
+			t.Fatalf("round %d: %d concurrent swaps succeeded, want exactly 1", r, winners)
+		}
+		won := winner.Load().([]byte)
+		got, err := b.Get(ctx, key)
+		if err != nil {
+			t.Fatalf("round %d: Get: %v", r, err)
+		}
+		if !bytes.Equal(got, won) {
+			t.Fatalf("round %d: stored %q, want the winner's %q", r, got, won)
+		}
+		// The next round contends against the value this round settled on, so
+		// every round after the first exercises the present->present swap.
+		expected = won
+	}
 }
 
 func set(t *testing.T, b backend.Backend, key, value string) {
