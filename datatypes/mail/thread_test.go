@@ -146,6 +146,24 @@ func TestThreadEmailIdsOrdering(t *testing.T) {
 	}
 }
 
+// TestThreadEmailIdsTiebreak checks Emails sharing one receivedAt come
+// back in a stable order with id as the tiebreak (section 3: the sort
+// "MUST be stable", "sorting by id is recommended").
+func TestThreadEmailIdsTiebreak(t *testing.T) {
+	ts, db, store := emailServer(t)
+	at := time.Date(2021, 1, 1, 9, 0, 0, 0, time.UTC)
+	a := putEmailAt(t, db, store, threadMsg("T", map[string]string{"Message-ID": "<a@x>"}), mbInbox, nil, at)
+	b := putEmailAt(t, db, store, threadMsg("Re: T", map[string]string{"Message-ID": "<b@x>", "In-Reply-To": "<a@x>"}), mbInbox, nil, at)
+	want := []string{a, b}
+	if b < a {
+		want = []string{b, a}
+	}
+	ids := threadGet(t, ts, threadOf(t, ts, a))["list"].([]any)[0].(map[string]any)["emailIds"].([]any)
+	if len(ids) != 2 || ids[0] != want[0] || ids[1] != want[1] {
+		t.Errorf("emailIds = %v, want id-order %v", ids, want)
+	}
+}
+
 // TestThreadChanges checks Thread/changes reports a Thread created, then
 // updated as an Email joins, then destroyed as its last Email is removed.
 func TestThreadChanges(t *testing.T) {

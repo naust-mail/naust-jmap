@@ -14,9 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
-	"time"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
 	"github.com/naust-mail/naust-jmap/core/jmap"
@@ -73,53 +71,29 @@ func (tc threadComputed) Resolve(ctx context.Context, acct jmap.Id, stored objec
 			return nil, fmt.Errorf("thread record has no valid id")
 		}
 		tid := jmap.Id(s)
+		// The threadId index is declared OrderBy receivedAt, so this
+		// scan returns the members already in the section 3 order -
+		// receivedAt oldest first, id as the stable tiebreak - with no
+		// record loads and nothing to sort.
 		ids, err := tc.db.IdsWhereEqual(ctx, acct, TypeEmail, "threadId", mustJSON(tid))
 		if err != nil {
 			return nil, err
 		}
-		type entry struct {
-			id   jmap.Id
-			recv time.Time
-		}
-		// One batched read for all members: receivedAt is one property,
-		// but the fetch must not cost a backend round trip per member.
-		objs, err := tc.db.GetMany(ctx, acct, TypeEmail, ids)
-		if err != nil {
-			return nil, err
-		}
-		entries := make([]entry, 0, len(ids))
-		for i, obj := range objs {
-			if obj == nil {
-				continue // destroyed between the index read and the fetch
-			}
-			recv, _ := rawjson.String(obj["receivedAt"])
-			t, _ := time.Parse(time.RFC3339, recv)
-			entries = append(entries, entry{id: ids[i], recv: t})
-		}
-		sort.Slice(entries, func(i, j int) bool {
-			if !entries[i].recv.Equal(entries[j].recv) {
-				return entries[i].recv.Before(entries[j].recv)
-			}
-			return entries[i].id < entries[j].id
-		})
-		ordered := make([]jmap.Id, len(entries))
-		for i, e := range entries {
-			ordered[i] = e.id
-		}
-		out["emailIds"] = mustJSON(ordered)
+		out["emailIds"] = mustJSON(ids)
 	}
 	return out, nil
 }
 
 // threadSizeCap bounds how many Emails may share one threadId. It is a resource
 // bound, not a spec limit (RFC 8621 section 3 does not mandate the join
-// algorithm): resolving a Thread's emailIds loads every member record, so an
-// unbounded thread (an attacker sending many messages with the same Message-ID
-// and base subject builds one) turns a single Thread/get into an unbounded
-// read. Once a thread reaches this many members a new member starts a fresh
-// threadId instead of joining. It is set well above any real conversation so it
-// never splits legitimate mail, only a same-key flood. It is a var, not a
-// const, only so a test can exercise the split boundary at a small size.
+// algorithm): resolving a Thread's emailIds scans an index entry per member and
+// returns every member id, so an unbounded thread (an attacker sending many
+// messages with the same Message-ID and base subject builds one) turns a single
+// Thread/get into an unbounded read. Once a thread reaches this many members a
+// new member starts a fresh threadId instead of joining. It is set well above
+// any real conversation so it never splits legitimate mail, only a same-key
+// flood. It is a var, not a const, only so a test can exercise the split
+// boundary at a small size.
 var threadSizeCap = 1024
 
 // assignThread returns the threadId for a newly arriving message
@@ -163,10 +137,10 @@ func assignThread(u *objectdb.Update, headers []message.HeaderField) (jmap.Id, e
 		return "", fmt.Errorf("email record has no valid threadId")
 	}
 	tid := jmap.Id(s)
-	// Thread-size cap. Resolving a Thread's emailIds loads every member
-	// record, so an unbounded thread (an attacker sending many messages with
-	// the same Message-ID and base subject - the join keys - builds one) turns
-	// a single Thread/get into an unbounded read. Once a thread reaches
+	// Thread-size cap. Resolving a Thread's emailIds scans an index entry
+	// per member, so an unbounded thread (an attacker sending many messages
+	// with the same Message-ID and base subject - the join keys - builds one)
+	// turns a single Thread/get into an unbounded read. Once a thread reaches
 	// threadSizeCap members, a new member starts a fresh threadId instead of
 	// joining. The member count comes from the Thread's stored aggregate - one
 	// record read, no index scan. The split is one-way: the overflow message

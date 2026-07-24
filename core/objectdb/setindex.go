@@ -91,14 +91,16 @@ func setIndexOps(batch *backend.Batch, acct jmap.Id, t *descriptor.Type, id jmap
 		if err != nil {
 			return err
 		}
+		// No ordering segments: OrderBy is only legal on Indexed
+		// properties, and a property is Indexed or SetIndexed, never both.
 		for _, m := range oldM {
 			if !slices.Contains(newM, m) {
-				batch.Delete(idxKey(acct, t.Name, name, []byte(m), id))
+				batch.Delete(idxKey(acct, t.Name, name, []byte(m), nil, id))
 			}
 		}
 		for _, m := range newM {
 			if !slices.Contains(oldM, m) {
-				batch.Set(idxKey(acct, t.Name, name, []byte(m), id), nil)
+				batch.Set(idxKey(acct, t.Name, name, []byte(m), nil, id), nil)
 			}
 		}
 	}

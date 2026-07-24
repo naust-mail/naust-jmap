@@ -746,6 +746,9 @@ func (u *Update) ClearAccountTag(tag string) error {
 // and destroys. Cross-record invariants a plugin enforces during /set
 // (sibling-name uniqueness, single role per account) must see records
 // staged earlier in the same commit, which the committed index cannot.
+// Unlike the DB read, ids always come back in plain id order (staged
+// records have no index keys yet to merge in OrderBy position); every
+// consumer is a membership check, so no order is promised here.
 func (u *Update) IdsWhereEqual(typeName, prop string, value json.RawMessage) ([]jmap.Id, error) {
 	t := u.db.types[typeName]
 	if t == nil {
@@ -1090,22 +1093,67 @@ func indexOps(batch *backend.Batch, acct jmap.Id, t *descriptor.Type, id jmap.Id
 		switch {
 		case oldVal == nil && newVal == nil:
 		case oldVal == nil:
-			batch.Set(idxKey(acct, t.Name, name, newVal, id), nil)
+			ord, err := orderSegs(t, p, new)
+			if err != nil {
+				return err
+			}
+			batch.Set(idxKey(acct, t.Name, name, newVal, ord, id), nil)
 		case newVal == nil:
-			batch.Delete(idxKey(acct, t.Name, name, oldVal, id))
+			ord, err := orderSegs(t, p, old)
+			if err != nil {
+				return err
+			}
+			batch.Delete(idxKey(acct, t.Name, name, oldVal, ord, id))
 		case string(oldVal) != string(newVal):
-			batch.Delete(idxKey(acct, t.Name, name, oldVal, id))
-			batch.Set(idxKey(acct, t.Name, name, newVal, id), nil)
+			// One orderSegs serves both keys: OrderBy properties are
+			// Immutable (descriptor.Validate), so old and new agree on
+			// them - only the indexed value moved.
+			ord, err := orderSegs(t, p, new)
+			if err != nil {
+				return err
+			}
+			batch.Delete(idxKey(acct, t.Name, name, oldVal, ord, id))
+			batch.Set(idxKey(acct, t.Name, name, newVal, ord, id), nil)
 		}
 	}
 	return nil
+}
+
+// orderSegs encodes a record's values for the OrderBy siblings of an
+// indexed property, in declaration order, for the key segments between
+// the index value and the id. An absent value encodes as an empty
+// segment (sorts first, and is recomputable from the record alone -
+// missing data never fails a write); a present value that does not
+// match its property's kind fails the commit, as it would on the
+// property's own index.
+func orderSegs(t *descriptor.Type, p descriptor.Property, obj Object) ([][]byte, error) {
+	if len(p.OrderBy) == 0 {
+		return nil, nil
+	}
+	out := make([][]byte, len(p.OrderBy))
+	for i, ob := range p.OrderBy {
+		raw, has := obj[ob]
+		if !has {
+			out[i] = []byte{}
+			continue
+		}
+		v, err := indexValue(t.Properties[ob], raw)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = v
+	}
+	return out, nil
 }
 
 // IdsWhereEqual returns the ids of records whose indexed property
 // equals value, straight from the property index (the /query planner's
 // fast path). The property must be declared Indexed. Equality follows
 // the index encoding, so string comparison is under i;ascii-casemap
-// (RFC 8620 section 5.5).
+// (RFC 8620 section 5.5). Ids come back in index-key order: for a
+// property with OrderBy this is its declared ordering then id (the
+// stored order IS the answer - Thread's emailIds reads it directly);
+// otherwise it is plain id order.
 func (db *DB) IdsWhereEqual(ctx context.Context, acct jmap.Id, typeName, prop string, value json.RawMessage) ([]jmap.Id, error) {
 	t := db.types[typeName]
 	if t == nil {

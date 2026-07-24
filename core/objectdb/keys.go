@@ -59,8 +59,18 @@ func objKey(acct jmap.Id, typeName string, id jmap.Id) []byte {
 	return key(seg(string(acct)), seg("o"), seg(typeName), seg(string(id)))
 }
 
-func idxKey(acct jmap.Id, typeName, prop string, value []byte, id jmap.Id) []byte {
-	return key(seg(string(acct)), seg("x"), seg(typeName), seg(prop), value, seg(string(id)))
+// idxKey builds a property index key. order holds the encoded values of
+// the property's OrderBy siblings (empty for the common no-OrderBy
+// case): they sit between the value and the id, so records sharing an
+// indexed value scan back ordered by them, then by id. An absent
+// ordering value is an empty segment, which sorts before every present
+// value.
+func idxKey(acct jmap.Id, typeName, prop string, value []byte, order [][]byte, id jmap.Id) []byte {
+	segs := make([][]byte, 0, 5+len(order))
+	segs = append(segs, seg(string(acct)), seg("x"), seg(typeName), seg(prop), value)
+	segs = append(segs, order...)
+	segs = append(segs, seg(string(id)))
+	return key(segs...)
 }
 
 func logKey(acct jmap.Id, sequence int64) []byte {
@@ -164,7 +174,14 @@ func indexValue(p descriptor.Property, raw []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		return backend.EncodeInt64(t.UnixNano()), nil
+		// Microseconds since the Unix epoch: an int64 of microseconds
+		// represents every RFC 3339 date (years 0000-9999) with room to
+		// spare, where nanoseconds would silently overflow outside
+		// 1677-2262 and file legal-but-extreme dates in the wrong place.
+		// Sub-microsecond digits are dropped (floor, so ordering stays
+		// monotonic across the epoch); ties fall to the id that follows
+		// the value in every index key.
+		return backend.EncodeInt64(t.UnixMicro()), nil
 	case descriptor.KindId:
 		s, ok := jsonscan.String(raw)
 		if !ok {

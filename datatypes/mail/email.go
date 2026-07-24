@@ -51,8 +51,12 @@ func EmailType() *descriptor.Type {
 			"blobId": {Kind: descriptor.KindId, BlobRef: true, Immutable: true, ServerSet: true},
 			// threadId is indexed so Thread/get can gather a thread's Emails
 			// and the counter maintenance can recompute a thread's per-mailbox
-			// contribution (RFC 8621 sections 3 and 2.1.1).
-			"threadId": {Kind: descriptor.KindId, Immutable: true, ServerSet: true, Indexed: true},
+			// contribution (RFC 8621 sections 3 and 2.1.1). OrderBy makes the
+			// index the Thread's emailIds answer: members scan back sorted by
+			// receivedAt then id, exactly the section 3 order, with no record
+			// loads. Both properties are immutable, so an entry files into its
+			// position once, at create, forever.
+			"threadId": {Kind: descriptor.KindId, Immutable: true, ServerSet: true, Indexed: true, OrderBy: []string{"receivedAt"}},
 			// mailboxIds ("Id[Boolean]") and keywords ("String[Boolean]")
 			// are the only mutable properties; both patchable member-wise.
 			// Both are set-indexed for membership lookups: mailboxIds for

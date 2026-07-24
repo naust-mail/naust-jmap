@@ -60,6 +60,18 @@ type Property struct {
 	// Indexed properties get an order-preserving index maintained
 	// in-commit, making them cheap /query filters and sorts.
 	Indexed bool
+	// OrderBy names sibling properties whose encoded values are built
+	// into this property's index keys, between the value and the id:
+	// records sharing an indexed value scan back ordered by these
+	// properties (RFC 8620 section 5.5 comparison rules), then by id -
+	// the stored order IS the answer, with no record loads and no sort
+	// (Thread's emailIds ordering, RFC 8621 section 3, is the shape).
+	// Only Immutable scalar siblings may be named, so an index key can
+	// never go stale: everything in it is fixed at create. A record
+	// missing a named property files before every present value -
+	// deterministic and recomputable from the record alone, never a
+	// write error.
+	OrderBy []string
 	// SetIndexed marks a composite property (KindObject or KindArray)
 	// whose members are reverse-indexed in-commit: one index entry per
 	// member, so "which records contain member X" is a range scan
@@ -148,6 +160,32 @@ func (t *Type) Validate() error {
 		}
 		if p.Indexed && p.SetIndexed {
 			return fmt.Errorf("descriptor: %s.%s cannot be both Indexed and SetIndexed", t.Name, name)
+		}
+		if len(p.OrderBy) > 0 && !p.Indexed {
+			return fmt.Errorf("descriptor: %s.%s declares OrderBy but is not Indexed", t.Name, name)
+		}
+		for _, ob := range p.OrderBy {
+			// "id" already ends every index key, and a property cannot
+			// order by itself: its value is already the key's value
+			// segment.
+			if ob == "id" || ob == name {
+				return fmt.Errorf("descriptor: %s.%s cannot order by %q", t.Name, name, ob)
+			}
+			op, ok := t.Properties[ob]
+			if !ok {
+				return fmt.Errorf("descriptor: %s.%s orders by undeclared property %q", t.Name, name, ob)
+			}
+			if op.Kind == KindObject || op.Kind == KindArray {
+				// Composite values have no order-preserving encoding,
+				// same as the Indexed rule above.
+				return fmt.Errorf("descriptor: %s.%s orders by composite property %q", t.Name, name, ob)
+			}
+			if !op.Immutable {
+				// A mutable ordering property would strand index keys at
+				// their old position when it changed; immutability makes
+				// a stale key unrepresentable.
+				return fmt.Errorf("descriptor: %s.%s orders by mutable property %q", t.Name, name, ob)
+			}
 		}
 		if p.Default != nil {
 			if err := p.CheckValue(p.Default); err != nil {
