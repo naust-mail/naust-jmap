@@ -6,7 +6,10 @@ package mail
 // Email/import, and Email/copy all reach an Email into the store through
 // insertEmail; Email/set reaches the metadata changes through the Set
 // hooks. Counters are stored incremental state: each change applies a
-// delta rather than recounting the account.
+// delta rather than recounting the account, and the thread-granular
+// counters read the Thread's stored aggregate (threadstat.go) rather
+// than the Thread's member Emails, so a change costs the same however
+// large its Thread is.
 
 import (
 	"encoding/json"
@@ -14,6 +17,7 @@ import (
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
+	"github.com/naust-mail/naust-jmap/core/private/rawjson"
 )
 
 // insertEmail assigns the Thread and stores the Email record, updating
@@ -58,7 +62,7 @@ func emailDestroy(u *objectdb.Update, id jmap.Id, _ map[string]json.RawMessage) 
 	if err := adjustCounters(u, old, nil); err != nil {
 		return nil, err
 	}
-	if err := removeEmailFromThread(u, old, id); err != nil {
+	if err := removeEmailFromThread(u, old); err != nil {
 		return nil, err
 	}
 	return nil, nil
@@ -75,9 +79,15 @@ func (d ctrDelta) zero() bool { return d == ctrDelta{} }
 // from old to new (old nil = create, new nil = destroy) across every
 // Mailbox the change can touch, in the same commit. Per-Email counters
 // (totalEmails, unreadEmails) move by the Email's own mailbox membership
-// and read state; per-Thread counters (totalThreads, unreadThreads) are
-// recomputed for the Thread from the other Emails plus this one's before
-// and after state, so the trash-aware unreadThreads rules hold.
+// and read state. Per-Thread counters (totalThreads, unreadThreads) are
+// answered from the Thread's stored aggregate (threadstat.go): the one
+// changing Email's delta updates the aggregate and the counter movements
+// fall out of the flag transitions, with no member Email loaded. The
+// aggregate write is bookkeeping (PutInternal): it never surfaces in
+// Thread/changes, because the client-visible Thread is unchanged by a
+// flag or mailbox change. Membership changes, which do change the
+// computed emailIds, are announced by an identity Put of the Thread at
+// the insert and destroy sites.
 func adjustCounters(u *objectdb.Update, old, new objectdb.Object) error {
 	deltas := map[jmap.Id]*ctrDelta{}
 	at := func(mb jmap.Id) *ctrDelta {
@@ -89,61 +99,78 @@ func adjustCounters(u *objectdb.Update, old, new objectdb.Object) error {
 		return d
 	}
 
+	// Each side's keywords and mailboxIds are decoded once, into the same
+	// projection the Thread aggregate consumes below - this is the hottest
+	// decode in the mutation path, so it must not run twice per object.
+	oldView, newView := viewOf(old), viewOf(new)
+
 	// Per-Email counters: subtract the old membership, add the new.
-	applyEmail := func(obj objectdb.Object, sign int64) {
-		if obj == nil {
+	applyEmail := func(v *memberView, sign int64) {
+		if v == nil {
 			return
 		}
-		unread := int64(0)
-		if isUnread(obj) {
-			unread = 1
-		}
-		for mb := range mailboxIdsOf(obj) {
+		unread := b2i(v.unread)
+		for mb := range v.mailboxes {
 			d := at(mb)
 			d.totalEmails += sign
 			d.unreadEmails += sign * unread
 		}
 	}
-	applyEmail(old, -1)
-	applyEmail(new, +1)
+	applyEmail(oldView, -1)
+	applyEmail(newView, +1)
 
-	// Per-Thread counters: recompute the Thread's per-Mailbox
-	// contribution before and after this Email's change.
 	tid := threadIdOf(new)
 	if tid == "" {
 		tid = threadIdOf(old)
 	}
-	if tid != "" {
+	if tid != "" && !viewsEqual(oldView, newView) {
 		trash, err := trashMailboxId(u)
 		if err != nil {
 			return err
 		}
-		var eid jmap.Id
-		if new != nil {
-			json.Unmarshal(new["id"], &eid)
-		} else {
-			json.Unmarshal(old["id"], &eid)
-		}
-		base, err := threadEmails(u, tid)
+		thr, err := u.Get(TypeThread, tid)
 		if err != nil {
 			return err
 		}
-		baseViews := threadMemberViews(base)
-		var oldView, newView *threadMemberView
-		if old != nil {
-			v := newThreadMemberView(old)
-			oldView = &v
+		st := statOf(thr)
+		// The Mailboxes whose flags can move: every Mailbox the Thread
+		// currently touches (a global unread transition can flip
+		// unreadThreads for all of them) plus any the change enters.
+		affected := map[jmap.Id]bool{}
+		for mb := range st.Mailboxes {
+			affected[mb] = true
 		}
-		if new != nil {
-			v := newThreadMemberView(new)
-			newView = &v
+		for _, v := range []*memberView{oldView, newView} {
+			if v == nil {
+				continue
+			}
+			for mb := range v.mailboxes {
+				affected[mb] = true
+			}
 		}
-		before := substituteView(baseViews, eid, oldView)
-		after := substituteView(baseViews, eid, newView)
-		for mb := range affectedMailboxes(before, after) {
+		// The before flags are evaluated under the trash rules the stored
+		// counters were folded with (st.Trash), the after flags under the
+		// current rules: when the trash role moved since this Thread was
+		// last counted, the difference carries the correction for the
+		// rule change along with the member's own delta, and the stamp
+		// records that this Thread is now up to date (see threadStat.Trash).
+		type flagPair struct{ in, unread bool }
+		before := make(map[jmap.Id]flagPair, len(affected))
+		for mb := range affected {
+			before[mb] = flagPair{in: st.inMailbox(mb), unread: st.unreadIn(mb, st.Trash)}
+		}
+		st.apply(oldView, -1)
+		st.apply(newView, +1)
+		st.Trash = trash
+		for mb := range affected {
 			d := at(mb)
-			d.totalThreads += b2i(threadInMailbox(after, mb)) - b2i(threadInMailbox(before, mb))
-			d.unreadThreads += b2i(threadUnread(after, mb, trash)) - b2i(threadUnread(before, mb, trash))
+			d.totalThreads += b2i(st.inMailbox(mb)) - b2i(before[mb].in)
+			d.unreadThreads += b2i(st.unreadIn(mb, trash)) - b2i(before[mb].unread)
+		}
+		next := cloneObject(thr)
+		next[statProperty] = mustJSON(st)
+		if err := u.PutInternal(TypeThread, tid, next); err != nil {
+			return err
 		}
 	}
 
@@ -179,140 +206,28 @@ func applyDeltas(u *objectdb.Update, deltas map[jmap.Id]*ctrDelta) error {
 	return nil
 }
 
-// threadEmails returns the Thread's Emails as this Update sees them,
-// keyed by id (staged-aware, so earlier changes in this commit show).
-func threadEmails(u *objectdb.Update, tid jmap.Id) (map[jmap.Id]objectdb.Object, error) {
-	ids, err := u.IdsWhereEqual(TypeEmail, "threadId", mustJSON(tid))
-	if err != nil {
-		return nil, err
-	}
-	return u.GetMany(TypeEmail, ids)
-}
-
-// threadMemberView is one Thread member's mailbox membership and unread
-// state, decoded once from its Email record. Without this, adjustCounters
-// re-decodes the same Email's mailboxIds and keywords JSON on every
-// Mailbox it is checked against - threadInMailbox and threadUnread each
-// look at both the before and after picture, so a Thread with N members
-// and M affected Mailboxes redecoded up to 4*M*N times for a single
-// insert. threadMemberViews below decodes each member exactly once
-// instead.
-type threadMemberView struct {
-	mailboxes map[jmap.Id]bool
-	unread    bool
-}
-
-func newThreadMemberView(obj objectdb.Object) threadMemberView {
-	return threadMemberView{mailboxes: mailboxIdsOf(obj), unread: isUnread(obj)}
-}
-
-// threadMemberViews decodes every member of a threadEmails result once,
-// up front, for substituteView to build the before/after pictures from
-// without any further JSON decoding.
-func threadMemberViews(view map[jmap.Id]objectdb.Object) map[jmap.Id]threadMemberView {
-	out := make(map[jmap.Id]threadMemberView, len(view))
-	for id, obj := range view {
-		out[id] = newThreadMemberView(obj)
-	}
-	return out
-}
-
-// substituteView copies base with eid forced to v (removed when v is
-// nil): the before/after picture of the Thread for the changing Email.
-func substituteView(base map[jmap.Id]threadMemberView, eid jmap.Id, v *threadMemberView) map[jmap.Id]threadMemberView {
-	out := make(map[jmap.Id]threadMemberView, len(base)+1)
-	for id, mv := range base {
-		if id == eid {
-			continue
-		}
-		out[id] = mv
-	}
-	if v != nil {
-		out[eid] = *v
-	}
-	return out
-}
-
-// affectedMailboxes is the set of Mailboxes any Email in either picture
-// belongs to: the only Mailboxes whose Thread counters can move.
-func affectedMailboxes(before, after map[jmap.Id]threadMemberView) map[jmap.Id]bool {
-	out := map[jmap.Id]bool{}
-	for _, view := range []map[jmap.Id]threadMemberView{before, after} {
-		for _, mv := range view {
-			for mb := range mv.mailboxes {
-				out[mb] = true
-			}
-		}
-	}
-	return out
-}
-
-// threadInMailbox reports whether the Thread counts toward totalThreads
-// for mb: at least one Email in it is in mb (section 2.1, no trash
-// adjustment).
-func threadInMailbox(view map[jmap.Id]threadMemberView, mb jmap.Id) bool {
-	for _, mv := range view {
-		if mv.mailboxes[mb] {
-			return true
-		}
-	}
-	return false
-}
-
-// threadUnread reports whether the Thread counts toward unreadThreads for
-// mb (the quality, trash-aware definition, section 2.1): among the Emails
-// considered for mb, at least one is in mb and at least one is unread.
-// The unread Email need not be the one in mb. Trash handling: for the
-// trash Mailbox only its own Emails are considered; for any other Mailbox
-// Emails that are only in the trash are ignored.
-func threadUnread(view map[jmap.Id]threadMemberView, mb, trash jmap.Id) bool {
-	inMailbox, anyUnread := false, false
-	for _, mv := range view {
-		if !consideredForUnread(mv, mb, trash) {
-			continue
-		}
-		if mv.mailboxes[mb] {
-			inMailbox = true
-		}
-		if mv.unread {
-			anyUnread = true
-		}
-	}
-	return inMailbox && anyUnread
-}
-
-// consideredForUnread applies the trash rules to decide whether mv
-// counts when computing unreadThreads for mb. With no trash Mailbox the
-// rules are inert and every Email is considered (the count degrades to
-// the simple definition naturally).
-func consideredForUnread(mv threadMemberView, mb, trash jmap.Id) bool {
-	if trash != "" && mb == trash {
-		// Trash Mailbox: ignore Emails that are not in the trash (rule 2).
-		return mv.mailboxes[trash]
-	}
-	if trash != "" && len(mv.mailboxes) == 1 && mv.mailboxes[trash] {
-		// Other Mailbox: ignore Emails only in the trash (rule 1).
-		return false
-	}
-	return true
-}
-
 // removeEmailFromThread destroys or touches the Email's Thread as it
-// leaves: the Thread is destroyed when this was its last Email, otherwise
-// touched so Thread/changes reports the departed member.
-func removeEmailFromThread(u *objectdb.Update, old objectdb.Object, id jmap.Id) error {
+// leaves: the Thread is destroyed when this was its last Email,
+// otherwise touched so Thread/changes reports the departed member. It
+// runs after adjustCounters has applied the departure, so the stored
+// aggregate already excludes this Email and a zero member count means
+// the Thread is done - no member scan decides this.
+func removeEmailFromThread(u *objectdb.Update, old objectdb.Object) error {
 	var tid jmap.Id
 	if err := json.Unmarshal(old["threadId"], &tid); err != nil {
 		return err
 	}
-	ids, err := u.IdsWhereEqual(TypeEmail, "threadId", mustJSON(tid))
+	thr, err := u.Get(TypeThread, tid)
 	if err != nil {
 		return err
 	}
-	for _, oid := range ids {
-		if oid != id {
-			return touchThread(u, tid)
-		}
+	if statOf(thr).Total > 0 {
+		// Identity Put: the departed member changed the computed
+		// emailIds, so Thread/changes must report the Thread updated -
+		// an ordinary Put marks the record loud against the counter
+		// aggregate's bookkeeping write, and the record is already in
+		// hand.
+		return u.Put(TypeThread, tid, thr)
 	}
 	return u.Destroy(TypeThread, tid)
 }
@@ -338,7 +253,7 @@ func mailboxRemoveEmails(u *objectdb.Update, mbID jmap.Id) error {
 			if err := adjustCounters(u, old, nil); err != nil {
 				return err
 			}
-			if err := removeEmailFromThread(u, old, eid); err != nil {
+			if err := removeEmailFromThread(u, old); err != nil {
 				return err
 			}
 			if err := u.Destroy(TypeEmail, eid); err != nil {
@@ -378,16 +293,25 @@ func mailboxIdsJSON(set map[jmap.Id]bool) json.RawMessage {
 }
 
 // trashMailboxId is the account's trash Mailbox id, or "" if it has none
-// (role is unique per account, so there is at most one).
+// (role is unique per account, so there is at most one). The lookup is
+// memoized per commit: every counter-affecting change resolves it, so a
+// bulk set would otherwise repeat the identical index query per Email.
+// Holding one value for the whole commit is safe even if the same commit
+// moves the role: whatever value a change counts under is stamped into
+// the Thread's aggregate (threadStat.Trash), and the role change raises
+// the migration marker, so the stale contribution is corrected the same
+// way as any other cross-commit role move.
 func trashMailboxId(u *objectdb.Update) (jmap.Id, error) {
-	ids, err := u.IdsWhereEqual(TypeMailbox, "role", json.RawMessage(`"trash"`))
-	if err != nil {
-		return "", err
-	}
-	if len(ids) == 0 {
-		return "", nil
-	}
-	return ids[0], nil
+	return objectdb.Memo(u, "mail/trashMailboxId", func() (jmap.Id, error) {
+		ids, err := u.IdsWhereEqual(TypeMailbox, "role", json.RawMessage(`"trash"`))
+		if err != nil {
+			return "", err
+		}
+		if len(ids) == 0 {
+			return "", nil
+		}
+		return ids[0], nil
+	})
 }
 
 // isUnread reports whether an Email has neither the $seen nor the $draft
@@ -407,13 +331,13 @@ func mailboxIdsOf(obj objectdb.Object) map[jmap.Id]bool {
 	return out
 }
 
-// objectKeys decodes a KindObject value to the set of its keys.
+// objectKeys decodes a KindObject value to the set of its keys. A nil,
+// null, or malformed value is the empty set, as when this decoded
+// through a map with the error ignored.
 func objectKeys(raw json.RawMessage) map[string]bool {
-	var m map[string]json.RawMessage
-	json.Unmarshal(raw, &m)
-	out := make(map[string]bool, len(m))
-	for k := range m {
-		out[k] = true
+	out := make(map[string]bool, 4)
+	if rawjson.EachKey(raw, func(k string) { out[k] = true }) != nil {
+		return map[string]bool{}
 	}
 	return out
 }
@@ -423,9 +347,8 @@ func threadIdOf(obj objectdb.Object) jmap.Id {
 	if obj == nil {
 		return ""
 	}
-	var tid jmap.Id
-	json.Unmarshal(obj["threadId"], &tid)
-	return tid
+	s, _ := rawjson.String(obj["threadId"])
+	return jmap.Id(s)
 }
 
 // addCounter adds delta to an UnsignedInt counter property, clamping at
@@ -434,8 +357,7 @@ func addCounter(obj objectdb.Object, name string, delta int64) {
 	if delta == 0 {
 		return
 	}
-	var n int64
-	json.Unmarshal(obj[name], &n)
+	n, _ := rawjson.Int(obj[name])
 	n += delta
 	if n < 0 {
 		n = 0

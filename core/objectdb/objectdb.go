@@ -17,6 +17,7 @@
 package objectdb
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
+	"github.com/naust-mail/naust-jmap/core/internal/jsonscan"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/providers/backend"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
@@ -60,6 +62,16 @@ type DB struct {
 	// now supplies the wall-clock reading the ULID id scheme stamps into
 	// ids. It is a field only so a test can pin it; production uses time.Now.
 	now func() time.Time
+	// verifyPreImages enables the commit-time shared-read integrity check
+	// (see WithVerifyPreImages).
+	verifyPreImages bool
+	// propNames interns declared property names for the record decoder:
+	// every name registered by any descriptor (plus the implicit "id")
+	// maps to itself, so decoding a stored record reuses one shared
+	// string per known name instead of allocating a copy per record
+	// (see decodeStored). Fixed at registration time, never grown by
+	// decoded input.
+	propNames map[string]string
 }
 
 // Option configures a DB at construction.
@@ -72,14 +84,27 @@ func WithIdScheme(s tuning.IdScheme) Option { return func(db *DB) { db.idScheme 
 // deterministic testing; production leaves the default, time.Now.
 func WithNow(now func() time.Time) Option { return func(db *DB) { db.now = now } }
 
+// WithVerifyPreImages is an assertion mode for test builds. Objects
+// returned by Update.Get and Update.GetMany are shared views that callers
+// must clone before modifying; a caller that writes to one in place
+// corrupts the pre-image the commit diffs indexes and the change log
+// against. With this option set, every commit re-decodes the stored bytes
+// behind each committed read and fails with a named error if the object
+// no longer matches - catching the violating hook at the exact commit
+// instead of surfacing later as silent index corruption. The check costs
+// one extra decode per read record per commit, so production
+// configurations leave it off; test helpers should turn it on.
+func WithVerifyPreImages() Option { return func(db *DB) { db.verifyPreImages = true } }
+
 // New wraps a backend and lease manager.
 func New(be backend.Backend, lm lease.Manager, opts ...Option) *DB {
 	db := &DB{
-		be:       be,
-		leases:   lm,
-		types:    make(map[string]*descriptor.Type),
-		idScheme: tuning.DefaultIdScheme,
-		now:      time.Now,
+		be:        be,
+		leases:    lm,
+		types:     make(map[string]*descriptor.Type),
+		idScheme:  tuning.DefaultIdScheme,
+		now:       time.Now,
+		propNames: map[string]string{"id": "id"},
 	}
 	for _, opt := range opts {
 		opt(db)
@@ -97,16 +122,25 @@ func (db *DB) RegisterType(t *descriptor.Type) error {
 		return fmt.Errorf("objectdb: type %s already registered", t.Name)
 	}
 	db.types[t.Name] = t
+	for name := range t.Properties {
+		db.propNames[name] = name
+	}
 	return nil
 }
 
 // Type returns a registered descriptor, or nil.
 func (db *DB) Type(name string) *descriptor.Type { return db.types[name] }
 
-// TypeNames returns every registered type name, sorted.
+// TypeNames returns every registered protocol-visible type name,
+// sorted. Internal types (descriptor.Type.Internal) are omitted: the
+// callers are protocol surfaces (push subscription filters), and an
+// internal type is not addressable there.
 func (db *DB) TypeNames() []string {
 	names := make([]string, 0, len(db.types))
-	for name := range db.types {
+	for name, t := range db.types {
+		if t.Internal {
+			continue
+		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -127,25 +161,32 @@ func (db *DB) SetNotifier(n notify.Notifier) { db.notifier = n }
 // publish to, so the wiring cannot diverge.
 func (db *DB) Notifier() notify.Notifier { return db.notifier }
 
-func unmarshal(raw []byte, v any) error { return json.Unmarshal(raw, v) }
-
 // Get returns one record.
 func (db *DB) Get(ctx context.Context, acct jmap.Id, typeName string, id jmap.Id) (Object, error) {
+	obj, _, err := db.getRaw(ctx, acct, typeName, id)
+	return obj, err
+}
+
+// getRaw is Get keeping the stored bytes alongside the decoded object.
+// The decoded object's values sub-slice raw, so returning it costs
+// nothing; Update retains it per read so the pre-image check
+// (WithVerifyPreImages) has pristine bytes to re-decode.
+func (db *DB) getRaw(ctx context.Context, acct jmap.Id, typeName string, id jmap.Id) (Object, []byte, error) {
 	if db.types[typeName] == nil {
-		return nil, ErrUnknownType
+		return nil, nil, ErrUnknownType
 	}
 	raw, err := db.be.Get(ctx, objKey(acct, typeName, id))
 	if errors.Is(err, backend.ErrNotFound) {
-		return nil, ErrNotFound
+		return nil, nil, ErrNotFound
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var obj Object
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return nil, err
+	obj, err := db.decodeStored(raw)
+	if err != nil {
+		return nil, nil, err
 	}
-	return obj, nil
+	return obj, raw, nil
 }
 
 // GetMany returns one record per id, in the same order, nil for an id Get
@@ -157,28 +198,36 @@ func (db *DB) Get(ctx context.Context, acct jmap.Id, typeName string, id jmap.Id
 // themselves. On a backend without MultiGetter it falls back to sequential
 // Get calls, so it is always correct, just not always faster.
 func (db *DB) GetMany(ctx context.Context, acct jmap.Id, typeName string, ids []jmap.Id) ([]Object, error) {
+	out, _, err := db.getManyRaw(ctx, acct, typeName, ids)
+	return out, err
+}
+
+// getManyRaw is GetMany keeping each record's stored bytes alongside the
+// decoded object, for the same reason as getRaw. raws[i] is nil exactly
+// when out[i] is.
+func (db *DB) getManyRaw(ctx context.Context, acct jmap.Id, typeName string, ids []jmap.Id) ([]Object, [][]byte, error) {
 	if db.types[typeName] == nil {
-		return nil, ErrUnknownType
+		return nil, nil, ErrUnknownType
 	}
 	if len(ids) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
+	out := make([]Object, len(ids))
+	raws := make([][]byte, len(ids))
 	mg, ok := db.be.(backend.MultiGetter)
 	if !ok {
-		out := make([]Object, len(ids))
 		for i, id := range ids {
-			obj, err := db.Get(ctx, acct, typeName, id)
+			obj, raw, err := db.getRaw(ctx, acct, typeName, id)
 			if errors.Is(err, ErrNotFound) {
 				continue
 			}
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			out[i] = obj
+			out[i], raws[i] = obj, raw
 		}
-		return out, nil
+		return out, raws, nil
 	}
-	out := make([]Object, len(ids))
 	for start := 0; start < len(ids); start += tuning.MaxMultiGetBatch {
 		end := start + tuning.MaxMultiGetBatch
 		if end > len(ids) {
@@ -189,22 +238,22 @@ func (db *DB) GetMany(ctx context.Context, acct jmap.Id, typeName string, ids []
 		for i, id := range chunk {
 			keys[i] = objKey(acct, typeName, id)
 		}
-		raws, err := mg.MultiGet(ctx, keys)
+		vals, err := mg.MultiGet(ctx, keys)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		for i, raw := range raws {
+		for i, raw := range vals {
 			if raw == nil {
 				continue
 			}
-			var obj Object
-			if err := json.Unmarshal(raw, &obj); err != nil {
-				return nil, err
+			obj, err := db.decodeStored(raw)
+			if err != nil {
+				return nil, nil, err
 			}
-			out[start+i] = obj
+			out[start+i], raws[start+i] = obj, raw
 		}
 	}
-	return out, nil
+	return out, raws, nil
 }
 
 // AllIds lists every record id of a type, in id order. If max > 0 and
@@ -286,7 +335,7 @@ func (db *DB) update(ctx context.Context, acct jmap.Id, l lease.Lease, fn func(u
 	}
 	sequence := current + 1
 
-	u := &Update{db: db, ctx: ctx, acct: acct, staged: make(map[string]*stagedRecord), bumped: map[string]struct{}{}, tagOps: map[string]bool{}, sequence: sequence}
+	u := &Update{db: db, ctx: ctx, acct: acct, staged: make(map[recKey]*stagedRecord), bumped: map[string]struct{}{}, tagOps: map[string]bool{}, sequence: sequence}
 	if err := fn(u); err != nil {
 		return nil, err
 	}
@@ -307,8 +356,21 @@ func (db *DB) update(ctx context.Context, acct jmap.Id, l lease.Lease, fn func(u
 	for _, t := range touched {
 		states[t] = strconv.FormatInt(sequence, 10)
 	}
-	if db.notifier != nil && len(states) > 0 {
-		db.notifier.Publish(ctx, acct, jmap.TypeState(states))
+	if db.notifier != nil {
+		// Internal types stay off the push surface. Section 7.1 defines a
+		// TypeState value as "the state property that would currently be
+		// returned by a call to Foo/get" - an internal type has no
+		// Foo/get, so its name cannot appear there by definition.
+		pub := make(map[string]string, len(states))
+		for name, s := range states {
+			if t := db.types[name]; t != nil && t.Internal {
+				continue
+			}
+			pub[name] = s
+		}
+		if len(pub) > 0 {
+			db.notifier.Publish(ctx, acct, jmap.TypeState(pub))
+		}
 	}
 	return states, nil
 }
@@ -322,7 +384,7 @@ type Update struct {
 	acct jmap.Id
 	// staged is keyed by type/id; each entry knows the pre-image (for
 	// index maintenance) and the final disposition.
-	staged map[string]*stagedRecord
+	staged map[recKey]*stagedRecord
 	// bumped is the set of types whose state string this commit advances
 	// without staging any record - see BumpState.
 	bumped map[string]struct{}
@@ -335,6 +397,23 @@ type Update struct {
 	// pair so they sort by in-account creation order without any extra read.
 	sequence  int64
 	createSeq int64
+	// memo is the commit-scoped cache behind Memo, allocated on first use.
+	memo map[string]any
+	// read caches committed records fetched through Get/GetMany, keyed
+	// like staged, allocated on first use. A later Put, PutInternal, or
+	// Destroy of a cached record reuses the read as its pre-image instead
+	// of fetching and decoding again; coherent because the lease excludes
+	// other writers and staged records are always consulted first. Each
+	// entry retains the stored bytes so WithVerifyPreImages can re-decode
+	// them at commit and detect a caller mutating the shared object.
+	read map[recKey]readRecord
+}
+
+// readRecord is one cached committed read: the decoded object and the
+// stored bytes it was decoded from (which its values sub-slice).
+type readRecord struct {
+	obj Object
+	raw []byte
 }
 
 type stagedRecord struct {
@@ -343,9 +422,22 @@ type stagedRecord struct {
 	old      Object // nil = record did not exist before this Update
 	new      Object // nil = destroyed
 	created  bool
+	// quiet marks a record whose every staged write was PutInternal:
+	// bookkeeping the commit persists and indexes but does not report as
+	// a client-visible update. Any ordinary write to the record clears
+	// it - loud wins.
+	quiet bool
 }
 
-func stagedKey(typeName string, id jmap.Id) string { return typeName + "\x00" + string(id) }
+// recKey identifies one record in the Update's staged and read maps. A
+// comparable struct: building one for a lookup allocates nothing, where
+// a concatenated string key would allocate on every Get and Put.
+type recKey struct {
+	typeName string
+	id       jmap.Id
+}
+
+func stagedKey(typeName string, id jmap.Id) recKey { return recKey{typeName, id} }
 
 // Context returns the context the Update runs under, for hooks that call
 // out to sockets (a policy check inside a set hook) while the lease is
@@ -358,7 +450,15 @@ func (u *Update) Context() context.Context { return u.ctx }
 func (u *Update) Account() jmap.Id { return u.acct }
 
 // Get reads a record as this Update sees it: staged changes first, then
-// committed state. Safe because the lease excludes other writers.
+// committed state (cached for the rest of the commit, so a later write to
+// the record reuses this read as its pre-image instead of fetching
+// again). Safe because the lease excludes other writers.
+//
+// The returned object is a shared view, not a private copy - for a staged
+// record it IS the staged object, for a committed one it is the cached
+// pre-image the commit will diff indexes and the change log against.
+// Callers that modify it must clone it first; WithVerifyPreImages makes a
+// violation fail the commit with a named error.
 func (u *Update) Get(typeName string, id jmap.Id) (Object, error) {
 	if st, ok := u.staged[stagedKey(typeName, id)]; ok {
 		if st.new == nil {
@@ -366,14 +466,37 @@ func (u *Update) Get(typeName string, id jmap.Id) (Object, error) {
 		}
 		return st.new, nil
 	}
-	return u.db.Get(u.ctx, u.acct, typeName, id)
+	return u.getCommitted(typeName, id)
+}
+
+// getCommitted reads a record's committed state through the Update's read
+// cache: one backend fetch and one decode per record per commit, however
+// many times Get or a write path needs the pre-image afterwards. Absence
+// is not cached; only the write paths re-read missing records, and only
+// to fail.
+func (u *Update) getCommitted(typeName string, id jmap.Id) (Object, error) {
+	key := stagedKey(typeName, id)
+	if r, ok := u.read[key]; ok {
+		return r.obj, nil
+	}
+	obj, raw, err := u.db.getRaw(u.ctx, u.acct, typeName, id)
+	if err != nil {
+		return nil, err
+	}
+	if u.read == nil {
+		u.read = make(map[recKey]readRecord)
+	}
+	u.read[key] = readRecord{obj: obj, raw: raw}
+	return obj, nil
 }
 
 // GetMany reads several records as this Update sees it: staged changes
-// first, then one batched read (DB.GetMany) for whatever ids are not
-// staged - the same read-your-own-writes semantics as Get, without a
-// backend round trip per id. Not-found ids (staged as destroyed, or absent
-// from the store) are simply missing from the returned map.
+// first, then the read cache, then one batched read (DB.GetMany) for
+// whatever is left - the same read-your-own-writes semantics as Get,
+// without a backend round trip per id. Not-found ids (staged as
+// destroyed, or absent from the store) are simply missing from the
+// returned map. The returned objects are shared views under the same
+// clone-before-modify contract as Get.
 func (u *Update) GetMany(typeName string, ids []jmap.Id) (map[jmap.Id]Object, error) {
 	out := make(map[jmap.Id]Object, len(ids))
 	remaining := make([]jmap.Id, 0, len(ids))
@@ -384,21 +507,55 @@ func (u *Update) GetMany(typeName string, ids []jmap.Id) (map[jmap.Id]Object, er
 			}
 			continue
 		}
+		if r, ok := u.read[stagedKey(typeName, id)]; ok {
+			out[id] = r.obj
+			continue
+		}
 		remaining = append(remaining, id)
 	}
 	if len(remaining) == 0 {
 		return out, nil
 	}
-	objs, err := u.db.GetMany(u.ctx, u.acct, typeName, remaining)
+	objs, raws, err := u.db.getManyRaw(u.ctx, u.acct, typeName, remaining)
 	if err != nil {
 		return nil, err
 	}
 	for i, obj := range objs {
-		if obj != nil {
-			out[remaining[i]] = obj
+		if obj == nil {
+			continue
 		}
+		out[remaining[i]] = obj
+		if u.read == nil {
+			u.read = make(map[recKey]readRecord)
+		}
+		u.read[stagedKey(typeName, remaining[i])] = readRecord{obj: obj, raw: raws[i]}
 	}
 	return out, nil
+}
+
+// Memo returns the value for key, computing it with compute at most once
+// per Update. It is a commit-scoped cache for an account-wide fact that a
+// per-object hook would otherwise re-derive for every object in a bulk
+// set (an index lookup answering "which Mailbox holds role X" is the same
+// for all of them). The cache never invalidates: the first value is held
+// for the rest of the commit, even across the caller's own staged writes,
+// so only facts whose in-commit staleness the caller can tolerate belong
+// here. Errors are not cached; a failed compute runs again on the next
+// call. Keys share one namespace across all callers - prefix with the
+// owning package - and a key must always be used with one value type.
+func Memo[T any](u *Update, key string, compute func() (T, error)) (T, error) {
+	if v, ok := u.memo[key]; ok {
+		return v.(T), nil
+	}
+	v, err := compute()
+	if err != nil {
+		return v, err
+	}
+	if u.memo == nil {
+		u.memo = make(map[string]any)
+	}
+	u.memo[key] = v
+	return v, nil
 }
 
 // newId assigns the id for one record under the DB's configured scheme
@@ -430,7 +587,7 @@ func (u *Update) Create(typeName string, obj Object) (jmap.Id, error) {
 	if _, has := obj["id"]; has {
 		return "", fmt.Errorf("objectdb: create must not carry an id")
 	}
-	if err := checkKinds(t, obj); err != nil {
+	if err := checkKinds(t, obj, nil); err != nil {
 		return "", err
 	}
 	id := u.newId()
@@ -451,25 +608,67 @@ func (u *Update) Put(typeName string, id jmap.Id, obj Object) error {
 	if t == nil {
 		return ErrUnknownType
 	}
-	var gotId jmap.Id
-	if raw, has := obj["id"]; !has || unmarshal(raw, &gotId) != nil || gotId != id {
+	if s, ok := jsonscan.String(obj["id"]); !ok || jmap.Id(s) != id {
 		return fmt.Errorf("objectdb: put object id mismatch")
-	}
-	if err := checkKinds(t, obj); err != nil {
-		return err
 	}
 	if st, ok := u.staged[stagedKey(typeName, id)]; ok {
 		if st.new == nil {
 			return ErrNotFound
 		}
+		if err := checkKinds(t, obj, st.new); err != nil {
+			return err
+		}
 		st.new = obj
+		st.quiet = false // an ordinary write makes the record loud
 		return nil
 	}
-	old, err := u.db.Get(u.ctx, u.acct, typeName, id)
+	old, err := u.getCommitted(typeName, id)
 	if err != nil {
 		return err
 	}
+	if err := checkKinds(t, obj, old); err != nil {
+		return err
+	}
 	u.staged[stagedKey(typeName, id)] = &stagedRecord{typeName: typeName, id: id, old: old, new: obj}
+	return nil
+}
+
+// PutInternal stages a bookkeeping write: a full replacement of an
+// existing record that may only change Internal properties (descriptor
+// semantics: not part of the type's public schema). The record and its
+// indexes are written like any Put, but the record is not reported as
+// updated - no change-log entry, no state move, no push - because to a
+// client the Foo data is unchanged, and section 5.1 wants the state
+// string stable when the data is unchanged. A change to any non-Internal
+// property is rejected here, at the call; and if the same commit also
+// writes the record with an ordinary Put (including the identity Put
+// that announces a computed-property change), the record is reported
+// normally - loud wins.
+func (u *Update) PutInternal(typeName string, id jmap.Id, obj Object) error {
+	t := u.db.types[typeName]
+	if t == nil {
+		return ErrUnknownType
+	}
+	if s, ok := jsonscan.String(obj["id"]); !ok || jmap.Id(s) != id {
+		return fmt.Errorf("objectdb: put object id mismatch")
+	}
+	prior, err := u.Get(typeName, id)
+	if err != nil {
+		return err
+	}
+	if err := checkKinds(t, obj, prior); err != nil {
+		return err
+	}
+	for _, name := range diffProps(prior, obj) {
+		if p, ok := t.Properties[name]; !ok || !p.Internal {
+			return fmt.Errorf("objectdb: PutInternal(%s/%s) changes non-Internal property %q", typeName, id, name)
+		}
+	}
+	if st, ok := u.staged[stagedKey(typeName, id)]; ok {
+		st.new = obj
+		return nil // st.quiet keeps its value: loud stays loud
+	}
+	u.staged[stagedKey(typeName, id)] = &stagedRecord{typeName: typeName, id: id, old: prior, new: obj, quiet: true}
 	return nil
 }
 
@@ -485,7 +684,7 @@ func (u *Update) Destroy(typeName string, id jmap.Id) error {
 		st.new = nil
 		return nil
 	}
-	old, err := u.db.Get(u.ctx, u.acct, typeName, id)
+	old, err := u.getCommitted(typeName, id)
 	if err != nil {
 		return err
 	}
@@ -598,8 +797,14 @@ func (u *Update) IdsWhereEqual(typeName, prop string, value json.RawMessage) ([]
 
 // checkKinds validates declared properties and kinds (mechanical part
 // of section 5.3 invalidProperties; attribute enforcement lives in the
-// runtime's /set).
-func checkKinds(t *descriptor.Type, obj Object) error {
+// runtime's /set). prior, when non-nil, is a record whose values have
+// already passed this check - the staged or committed pre-image of a
+// replacement - and a property whose raw bytes equal prior's is not
+// re-validated: a full-record Put that changes one property pays
+// validation for one property, not the whole record. Every property
+// still passes the declared-name check, so an undeclared name is
+// rejected regardless of prior.
+func checkKinds(t *descriptor.Type, obj, prior Object) error {
 	for name, raw := range obj {
 		if name == "id" {
 			continue
@@ -607,6 +812,9 @@ func checkKinds(t *descriptor.Type, obj Object) error {
 		p, declared := t.Properties[name]
 		if !declared {
 			return fmt.Errorf("objectdb: unknown property %q on %s", name, t.Name)
+		}
+		if prior != nil && bytes.Equal(raw, prior[name]) {
+			continue
 		}
 		if err := p.CheckValue(raw); err != nil {
 			return fmt.Errorf("objectdb: property %q: %w", name, err)
@@ -620,6 +828,11 @@ func checkKinds(t *descriptor.Type, obj Object) error {
 // stream that /changes and state strings are derived from.
 type logEntry struct {
 	Types map[string]*logTypeEntry `json:"types"`
+	// At is the commit's wall clock in Unix milliseconds, read only by
+	// TrimChanges to age entries out. Zero means unknown (an entry written
+	// before the field existed), which TrimChanges treats as not yet
+	// expired so an existing log is never dropped by a clock it lacks.
+	At int64 `json:"at,omitzero"`
 }
 
 type logTypeEntry struct {
@@ -635,7 +848,41 @@ type logTypeEntry struct {
 	UpdatedProps []string `json:"updatedProps"`
 }
 
+// verifyReads is the WithVerifyPreImages check: every cached committed
+// read is re-decoded from its stored bytes and compared to the object
+// the cache handed out. A mismatch means a caller wrote to a shared Get
+// result instead of cloning it - the pre-image the commit is about to
+// diff against is corrupt, so the commit fails naming the record. The
+// stored bytes are pristine by the backend.Get ownership contract (the
+// buffer belongs to this reader and objectdb never writes to it).
+func (u *Update) verifyReads() error {
+	for key, r := range u.read {
+		pristine, err := u.db.decodeStored(r.raw)
+		if err != nil {
+			return fmt.Errorf("objectdb: verify %s/%s: %w", key.typeName, key.id, err)
+		}
+		mutated := len(pristine) != len(r.obj)
+		if !mutated {
+			for name, val := range pristine {
+				if got, ok := r.obj[name]; !ok || !bytes.Equal(got, val) {
+					mutated = true
+					break
+				}
+			}
+		}
+		if mutated {
+			return fmt.Errorf("objectdb: object %s/%s was modified after Get returned it: Get results are shared views, clone before mutating", key.typeName, key.id)
+		}
+	}
+	return nil
+}
+
 func (u *Update) buildBatch(sequence int64) (*backend.Batch, []string, error) {
+	if u.db.verifyPreImages {
+		if err := u.verifyReads(); err != nil {
+			return nil, nil, err
+		}
+	}
 	batch := &backend.Batch{}
 	entry := logEntry{Types: make(map[string]*logTypeEntry)}
 	// Idempotently register the account (see Accounts). One tiny Set
@@ -656,11 +903,16 @@ func (u *Update) buildBatch(sequence int64) (*backend.Batch, []string, error) {
 	}
 
 	// Deterministic op order for reproducibility.
-	keys := make([]string, 0, len(u.staged))
+	keys := make([]recKey, 0, len(u.staged))
 	for k := range u.staged {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].typeName != keys[j].typeName {
+			return keys[i].typeName < keys[j].typeName
+		}
+		return keys[i].id < keys[j].id
+	})
 
 	for _, k := range keys {
 		st := u.staged[k]
@@ -685,7 +937,7 @@ func (u *Update) buildBatch(sequence int64) (*backend.Batch, []string, error) {
 			}
 			te.Destroyed = append(te.Destroyed, st.id)
 		case st.created:
-			raw, err := json.Marshal(st.new)
+			raw, err := encodeObject(st.new)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -699,7 +951,7 @@ func (u *Update) buildBatch(sequence int64) (*backend.Batch, []string, error) {
 			}
 			te.Created = append(te.Created, st.id)
 		default: // update
-			raw, err := json.Marshal(st.new)
+			raw, err := encodeObject(st.new)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -711,11 +963,28 @@ func (u *Update) buildBatch(sequence int64) (*backend.Batch, []string, error) {
 			if err := setIndexOps(batch, u.acct, t, st.id, st.old, st.new); err != nil {
 				return nil, nil, err
 			}
+			if st.quiet {
+				// Every write to this record was PutInternal: persisted
+				// and indexed above, but not a client-visible update.
+				continue
+			}
 			te.Updated = append(te.Updated, st.id)
 			if te.UpdatedProps == nil {
 				te.UpdatedProps = []string{}
 			}
-			te.UpdatedProps = mergeProps(te.UpdatedProps, diffProps(st.old, st.new))
+			// Internal property names stay out of the log: they are not
+			// part of the type's public schema, and the log's property
+			// list exists only to answer /changes-style questions about
+			// visible data.
+			props := diffProps(st.old, st.new)
+			visible := props[:0]
+			for _, name := range props {
+				if p, ok := t.Properties[name]; ok && p.Internal {
+					continue
+				}
+				visible = append(visible, name)
+			}
+			te.UpdatedProps = mergeProps(te.UpdatedProps, visible)
 		}
 	}
 
@@ -746,6 +1015,7 @@ func (u *Update) buildBatch(sequence int64) (*backend.Batch, []string, error) {
 		return batch, touched, nil
 	}
 	if hasRecords {
+		entry.At = u.db.now().UnixMilli()
 		raw, err := json.Marshal(entry)
 		if err != nil {
 			return nil, nil, err

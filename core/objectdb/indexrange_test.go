@@ -35,7 +35,7 @@ func rawStr(s string) json.RawMessage {
 
 func TestIdsWhereAtMost(t *testing.T) {
 	be := memory.New()
-	db := New(be, lease.NewInProcess(be))
+	db := New(be, lease.NewInProcess(be), WithVerifyPreImages())
 	if err := db.RegisterType(dueType()); err != nil {
 		t.Fatal(err)
 	}
@@ -106,8 +106,12 @@ func TestIdsWhereAtMost(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		delete(obj, "at")
-		return u.Put("TestDue", ids["2026-07-17T10:00:00Z"], obj)
+		next := make(Object, len(obj))
+		for k, v := range obj {
+			next[k] = v
+		}
+		delete(next, "at")
+		return u.Put("TestDue", ids["2026-07-17T10:00:00Z"], next)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -128,7 +132,7 @@ func TestIdsWhereAtMost(t *testing.T) {
 
 func TestAccounts(t *testing.T) {
 	be := memory.New()
-	db := New(be, lease.NewInProcess(be))
+	db := New(be, lease.NewInProcess(be), WithVerifyPreImages())
 	if err := db.RegisterType(dueType()); err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +172,7 @@ func TestAccounts(t *testing.T) {
 
 func TestAccountTags(t *testing.T) {
 	be := memory.New()
-	db := New(be, lease.NewInProcess(be))
+	db := New(be, lease.NewInProcess(be), WithVerifyPreImages())
 	if err := db.RegisterType(dueType()); err != nil {
 		t.Fatal(err)
 	}

@@ -9,12 +9,18 @@ package objectdb
 //   - the reference index ({acct} r {blobId} {type} {id}): maintained
 //     inside the same commit as the referencing object (buildBatch), so
 //     "is this blob referenced?" can never disagree with the data.
+//   - pending hints ({acct} p {blobId}): written by every path that can
+//     leave a blob unreferenced (upload, reference removal), cleared on
+//     reference add, so SweepBlobs works a candidate set proportional
+//     to churn instead of scanning every upload record.
 //
 // There are no reference counts: garbage collection is a sweep that
 // deletes unreferenced blobs past a grace window (section 6 gives the
 // rules; see SweepBlobs). Upload-before-reference is a normal transient
 // state, and a missed sweep just runs again - self-healing beats
-// precise.
+// precise. The pending hints keep that shape: a hint is a candidate,
+// never a verdict, so a stale one is dropped on inspection and deletion
+// safety never rests on it.
 
 import (
 	"context"
@@ -24,12 +30,18 @@ import (
 	"time"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
+	"github.com/naust-mail/naust-jmap/core/internal/jsonscan"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/providers/backend"
 	"github.com/naust-mail/naust-jmap/core/providers/blob"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/tuning"
 )
+
+// maxSweepPerCall bounds how many pending hints one SweepBlobs call
+// inspects, so a large backlog (a mass destroy) never builds one
+// unbounded lease hold; the untouched hints wait for the next call.
+const maxSweepPerCall = 1024
 
 // BlobUpload is a blob's upload record.
 type BlobUpload struct {
@@ -133,6 +145,10 @@ func (db *DB) recordUpload(ctx context.Context, acct, blobID jmap.Id, uploader s
 	}
 	batch := &backend.Batch{}
 	batch.Set(uploadKey(acct, blobID), raw)
+	// A fresh upload is unreferenced until something commits a BlobRef
+	// to it, so it enters the sweep's candidate set now; the commit that
+	// references it clears the hint again (refOps).
+	batch.Set(pendingKey(acct, blobID), nil)
 	l.Fence(batch)
 	return db.be.WriteBatch(ctx, batch)
 }
@@ -188,69 +204,132 @@ func (u *Update) BlobExists(blobID jmap.Id) (bool, error) {
 // rule "a blob MUST NOT be deleted during the method call that removed
 // the last reference" holds.
 //
-// Content is deleted from the store before the upload record: a crash
-// in between leaves a record whose content is gone (the next sweep
-// finishes the job) rather than invisible, unsweepable content.
-func (db *DB) SweepBlobs(ctx context.Context, acct jmap.Id, store blob.Store, now time.Time, grace time.Duration) ([]jmap.Id, error) {
+// Candidates come from the pending hints, not a scan of every upload
+// record: every path that can leave a blob unreferenced writes a hint
+// in the same batch as the fact (recordUpload, refOps), so a sweep's
+// work - and the time it holds the account lease against the account's
+// writers - is proportional to churn since the last sweep, never to how
+// many blobs the account holds. The hint only nominates: deletion is
+// still decided by the reference index and the grace window, so a
+// stale hint is simply dropped and can never delete a live blob.
+//
+// When the store implements blob.BatchDeleter over this DB's own
+// backend, a blob's content, upload record, and hint are deleted in ONE
+// fenced batch: all-or-nothing, and a lease lost mid-sweep fails the
+// whole deletion cleanly. Otherwise content is deleted from the store
+// before the upload record - a crash in between leaves a record whose
+// content is gone (the next sweep finishes the job) rather than
+// invisible, unsweepable content - and a lease lost between the
+// reference check and the content deletion is not caught for the
+// content itself, only for the records.
+//
+// One call inspects at most maxSweepPerCall candidates, bounding how
+// long the lease is held against the account's writers when a mass
+// destroy leaves a large backlog of hints. more reports that the call
+// hit that bound while still making progress; a caller draining a
+// backlog calls again until more is false.
+func (db *DB) SweepBlobs(ctx context.Context, acct jmap.Id, store blob.Store, now time.Time, grace time.Duration) (deleted []jmap.Id, more bool, err error) {
 	if grace < tuning.BlobMinUnreferencedAge {
 		grace = tuning.BlobMinUnreferencedAge
 	}
+
+	// Lease-free emptiness probe: most sweeps of most accounts find no
+	// hints at all, and taking the account lease for that answer would
+	// cost a write round trip per account per pass and make the
+	// account's writers queue behind it. Probing without the lease is
+	// safe: hints are only written inside commits, so an empty range
+	// means there was nothing to collect at probe time, and a hint that
+	// lands concurrently simply waits for the next pass - the same
+	// outcome as if this sweep had run a moment earlier. The scan below,
+	// under the lease, is the authoritative one.
+	start, end := prefixRange(seg(string(acct)), seg("p"))
+	empty := true
+	if err := db.be.Scan(ctx, start, end, false, func(_, _ []byte) bool {
+		empty = false
+		return false
+	}); err != nil {
+		return nil, false, err
+	}
+	if empty {
+		return nil, false, nil
+	}
+
+	// Fenced deletion when the store persists in this DB's own backend:
+	// content, upload record, and hint then leave in one fenced batch, so
+	// a lease lost mid-sweep aborts the whole deletion instead of
+	// destroying content a new lease holder may have re-referenced (the
+	// content address is deterministic, so an identical re-upload gets
+	// the same blobId back).
+	bd, fenced := store.(blob.BatchDeleter)
+	if fenced && bd.DeleteBackend() != db.be {
+		fenced = false
+	}
+
 	l, err := db.leases.Acquire(ctx, acct)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer l.Release()
 
 	// Collect first: the scan callback must not do store I/O.
-	type candidate struct {
-		blobID jmap.Id
-		rec    BlobUpload
-	}
-	var candidates []candidate
-	var scanErr error
-	start, end := prefixRange(seg(string(acct)), seg("u"))
-	err = db.be.Scan(ctx, start, end, false, func(k, v []byte) bool {
-		var rec BlobUpload
-		if scanErr = json.Unmarshal(v, &rec); scanErr != nil {
-			return false
-		}
-		candidates = append(candidates, candidate{blobID: idFromObjKey(k), rec: rec})
-		return true
+	var candidates []jmap.Id
+	err = db.be.Scan(ctx, start, end, false, func(k, _ []byte) bool {
+		candidates = append(candidates, idFromObjKey(k))
+		return len(candidates) < maxSweepPerCall
 	})
-	if err == nil {
-		err = scanErr
-	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	var deleted []jmap.Id
 	batch := &backend.Batch{}
-	for _, c := range candidates {
-		if now.Sub(c.rec.UploadedAt) < grace {
+	for _, blobID := range candidates {
+		rec, err := db.BlobUpload(ctx, acct, blobID)
+		if errors.Is(err, ErrNotFound) {
+			// Record already gone (a crashed sweep got that far): the
+			// hint is all that is left to clean.
+			batch.Delete(pendingKey(acct, blobID))
 			continue
 		}
-		referenced, err := db.BlobReferenced(ctx, acct, c.blobID)
 		if err != nil {
-			return deleted, err
+			return nil, false, err
+		}
+		if now.Sub(rec.UploadedAt) < grace {
+			continue // keep the hint; a later sweep decides
+		}
+		referenced, err := db.BlobReferenced(ctx, acct, blobID)
+		if err != nil {
+			return nil, false, err
 		}
 		if referenced {
+			batch.Delete(pendingKey(acct, blobID)) // stale hint
 			continue
 		}
-		if err := store.Delete(ctx, acct, c.blobID); err != nil {
-			return deleted, err
+		if fenced {
+			if err := bd.AppendDelete(ctx, batch, acct, blobID); err != nil {
+				return nil, false, err
+			}
+		} else if err := store.Delete(ctx, acct, blobID); err != nil {
+			return nil, false, err
 		}
-		batch.Delete(uploadKey(acct, c.blobID))
-		deleted = append(deleted, c.blobID)
+		batch.Delete(uploadKey(acct, blobID))
+		batch.Delete(pendingKey(acct, blobID))
+		deleted = append(deleted, blobID)
 	}
-	if len(deleted) == 0 {
-		return nil, nil
+	if len(batch.Ops) == 0 {
+		// Every candidate stayed inside its grace window: nothing to
+		// write, and calling again now would inspect the same hints, so
+		// there is no progress for more to promise.
+		return nil, false, nil
 	}
 	l.Fence(batch)
 	if err := db.be.WriteBatch(ctx, batch); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return deleted, nil
+	// The bound was hit and this call removed hints, so the next call
+	// sees a fresh window of candidates: a backlog drains one bounded,
+	// separately-leased call at a time.
+	more = len(candidates) == maxSweepPerCall
+	return deleted, more, nil
 }
 
 // blobRefsOf collects the blobIds referenced by an object's BlobRef
@@ -265,31 +344,40 @@ func blobRefsOf(t *descriptor.Type, obj Object) map[jmap.Id]bool {
 		if !has {
 			continue
 		}
-		var id jmap.Id
-		if unmarshal(raw, &id) != nil {
-			continue
+		s, ok := jsonscan.String(raw)
+		if !ok {
+			continue // includes a stored null: no blob referenced
 		}
 		if refs == nil {
 			refs = make(map[jmap.Id]bool)
 		}
-		refs[id] = true
+		refs[jmap.Id(s)] = true
 	}
 	return refs
 }
 
 // refOps maintains the blob reference index inside the object's commit
-// batch, exactly like indexOps does for property indexes.
+// batch, exactly like indexOps does for property indexes. It also keeps
+// the pending hints: a removed reference may have been the blob's last,
+// so the hint is set unconditionally (the sweep verifies), and an added
+// reference clears it. When one commit moves a reference between two
+// objects the batch order decides which hint op lands last - both
+// outcomes are safe, because a leftover hint on a referenced blob is
+// dropped by the sweep, and a commit that leaves a blob genuinely
+// unreferenced has no add for it, so its hint always survives.
 func refOps(batch *backend.Batch, acct jmap.Id, t *descriptor.Type, id jmap.Id, old, new Object) {
 	oldRefs := blobRefsOf(t, old)
 	newRefs := blobRefsOf(t, new)
 	for blobID := range oldRefs {
 		if !newRefs[blobID] {
 			batch.Delete(refKey(acct, blobID, t.Name, id))
+			batch.Set(pendingKey(acct, blobID), nil)
 		}
 	}
 	for blobID := range newRefs {
 		if !oldRefs[blobID] {
 			batch.Set(refKey(acct, blobID, t.Name, id), nil)
+			batch.Delete(pendingKey(acct, blobID))
 		}
 	}
 }

@@ -18,6 +18,7 @@ import (
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
+	"github.com/naust-mail/naust-jmap/core/private/rawjson"
 	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/providers/blob"
 	"github.com/naust-mail/naust-jmap/core/runtime"
@@ -107,7 +108,6 @@ func (m materializer) commit(u *objectdb.Update, pe *pendingEmail, mailboxIds, k
 	if err != nil {
 		return nil, nil, err
 	}
-	var tid jmap.Id
-	json.Unmarshal(stored["threadId"], &tid)
-	return &emailCreated{Id: id, BlobId: pe.blobId, ThreadId: tid, Size: pe.size}, nil, nil
+	tid, _ := rawjson.String(stored["threadId"])
+	return &emailCreated{Id: id, BlobId: pe.blobId, ThreadId: jmap.Id(tid), Size: pe.size}, nil, nil
 }

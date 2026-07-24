@@ -314,3 +314,56 @@ func terminateBackends(t *testing.T, dsn string) {
 		t.Fatalf("terminate backends: %v", err)
 	}
 }
+
+// TestDispatchFloodShedding drives dispatch directly on a frozen clock: within
+// one second only dispatchBudget notifications are processed and the rest are
+// shed, and the next second starts with a fresh budget. Foreign-origin change
+// hints land in the local fan-out, so a firehose subscription counts exactly
+// how many survived the shed.
+func TestDispatchFloodShedding(t *testing.T) {
+	now := time.Unix(1000, 0)
+	h := &Hints{
+		origin:  "self",
+		local:   notify.NewInProcess(),
+		shedNow: func() time.Time { return now },
+	}
+	sub, err := h.local.SubscribeAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	// Each payload names a distinct account so deliveries never coalesce away.
+	payload := func(i int) string {
+		return fmt.Sprintf(`{"o":"peer","a":"acct-%06d","t":{"Email":"s"}}`, i)
+	}
+	delivered := func() int {
+		total := 0
+		for {
+			c, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			got, err := sub.Wait(c)
+			cancel()
+			if err != nil {
+				return total
+			}
+			total += len(got)
+		}
+	}
+
+	over := dispatchBudget + 500
+	for i := 0; i < over; i++ {
+		h.dispatch(chanChanges, payload(i))
+	}
+	if got := delivered(); got != dispatchBudget {
+		t.Fatalf("flood second delivered %d, want exactly the budget %d", got, dispatchBudget)
+	}
+
+	// The next second sheds nothing.
+	now = now.Add(time.Second)
+	for i := 0; i < 10; i++ {
+		h.dispatch(chanChanges, payload(over+i))
+	}
+	if got := delivered(); got != 10 {
+		t.Fatalf("post-flood second delivered %d, want 10", got)
+	}
+}

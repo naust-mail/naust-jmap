@@ -551,6 +551,7 @@ func (w *SubmissionWorker) claim(ctx context.Context, acct jmap.Id, id jmap.Id) 
 			return nil // not due: left the queue, held, or a peer parked it
 		}
 		json.Unmarshal(obj["claimedAt"], &leftover)
+		obj = cloneObject(obj)
 		obj["claimedAt"] = mustJSON(stamp)
 		parked := now.Add(w.cfg.ClaimWindow).UTC().Format(time.RFC3339)
 		obj["nextAttemptAt"] = mustJSON(parked)
@@ -771,6 +772,7 @@ func (w *SubmissionWorker) finalize(ctx context.Context, acct jmap.Id, id jmap.I
 				anyQueued = false
 			}
 		}
+		obj = cloneObject(obj)
 		obj["deliveryStatus"] = mustJSON(ds)
 		obj["attempts"] = mustJSON(attempts)
 		delete(obj, "claimedAt")

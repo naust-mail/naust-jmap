@@ -17,7 +17,7 @@ import (
 // Update returns, and a commit that touches nothing publishes nothing.
 func TestCommitPublishes(t *testing.T) {
 	be := memory.New()
-	db := New(be, lease.NewInProcess(be))
+	db := New(be, lease.NewInProcess(be), WithVerifyPreImages())
 	if err := db.RegisterType(docType()); err != nil {
 		t.Fatal(err)
 	}

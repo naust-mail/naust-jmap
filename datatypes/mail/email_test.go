@@ -38,7 +38,7 @@ func newEmailServer(t *testing.T, acctCap AccountCapability) (*httptest.Server, 
 	a.AddUser("jane@example.com", "secret", "Ajane")
 	a.AddAccess("jane@example.com", testAccount, auth.Access{Name: "shared"})
 	be := memory.New()
-	db := objectdb.New(be, lease.NewInProcess(be))
+	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
 	store := kvstore.New(memory.New())
 	p := runtime.NewProcessor()
 	core := runtime.DefaultCoreCapabilities()

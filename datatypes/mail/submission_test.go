@@ -48,7 +48,7 @@ func newSubmissionServer(t *testing.T, limits SubmissionLimits) (*httptest.Serve
 	a := newStaticAuth()
 	a.AddUser("john@example.com", "secret", testAccount)
 	be := memory.New()
-	db := objectdb.New(be, lease.NewInProcess(be))
+	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
 	store := kvstore.New(memory.New())
 	p := runtime.NewProcessor()
 	core := runtime.DefaultCoreCapabilities()
@@ -594,16 +594,18 @@ func TestEmailSubmissionCancel(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		obj["undoStatus"] = json.RawMessage(`"final"`)
-		if err := u.Put(TypeEmailSubmission, jmap.Id(finalId), obj); err != nil {
+		next := cloneObject(obj)
+		next["undoStatus"] = json.RawMessage(`"final"`)
+		if err := u.Put(TypeEmailSubmission, jmap.Id(finalId), next); err != nil {
 			return err
 		}
 		obj, err = u.Get(TypeEmailSubmission, jmap.Id(claimedId))
 		if err != nil {
 			return err
 		}
-		obj["claimedAt"] = mustJSON(time.Now().UTC().Format(time.RFC3339))
-		return u.Put(TypeEmailSubmission, jmap.Id(claimedId), obj)
+		next = cloneObject(obj)
+		next["claimedAt"] = mustJSON(time.Now().UTC().Format(time.RFC3339))
+		return u.Put(TypeEmailSubmission, jmap.Id(claimedId), next)
 	})
 	if err != nil {
 		t.Fatal(err)

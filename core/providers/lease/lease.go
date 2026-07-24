@@ -11,7 +11,10 @@ package lease
 
 import (
 	"context"
+	"log/slog"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/providers/backend"
@@ -29,7 +32,7 @@ type Manager interface {
 // Lease is a held per-account write lease.
 type Lease interface {
 	// Fence appends the fencing assertion to a commit batch: the batch
-	// applies only if this lease is still the current generation. This
+	// applies only if this lease's claim token is still current. This
 	// is what makes a stalled holder's late writes fail instead of
 	// corrupting (the batch model is safe ONLY with this in place).
 	Fence(b *backend.Batch)
@@ -37,16 +40,37 @@ type Lease interface {
 	Release()
 }
 
-// leaseKey is the backend key holding an account's lease generation.
-func leaseKey(account jmap.Id) []byte {
-	return []byte("l/" + string(account))
-}
+// inProcessExpiry is the deadline written into claims minted by InProcess. It
+// never gates InProcess itself (the sole-process assumption makes every
+// existing claim immediately stealable); it only shapes how long a store-lease
+// instance would wait before taking over an account this manager abandoned.
+const inProcessExpiry = 15 * time.Second
 
-// InProcess is the single-node Manager: a mutex per account, with the
-// generation counter persisted through the backend so fencing behaves
-// identically to cluster implementations.
+// InProcess is the single-node Manager: a mutex per account serializes local
+// callers, and the account's claim record in the backend - the same key,
+// token format, and fence StoreLease uses - carries the fence every commit
+// asserts.
+//
+// The two managers differ only in policy. InProcess assumes it is the sole
+// process writing this store, so it takes over any existing claim immediately
+// instead of waiting out an expiry: a restart after a crash reclaims every
+// account at once. Because both managers speak one claim mechanism, that
+// assumption failing cannot corrupt anything - a store-lease instance's
+// takeover replaces this manager's token and its next fence fails cleanly,
+// and vice versa. It does surface: a claim swapped out from under this
+// manager, or a foreign token reappearing on an account it already reclaimed,
+// is proof of a live concurrent writer (a dead predecessor cannot mint new
+// claims), and InProcess logs it loudly - the deliberate sole log site in
+// core, because a silent misconfiguration detector detects nothing.
 type InProcess struct {
 	be backend.Backend
+
+	now   func() time.Time // test seam; time.Now outside tests
+	nonce string           // per-instance random claim-value base
+	seq   atomic.Uint64    // per-mint counter, keeps every claim unique
+	// warnForeign reports a proven live concurrent writer; a test seam over
+	// the slog default.
+	warnForeign func(account jmap.Id, evidence string)
 
 	mu    sync.Mutex
 	locks map[jmap.Id]*accountLock
@@ -54,11 +78,28 @@ type InProcess struct {
 
 type accountLock struct {
 	mu sync.Mutex
+	// token is the claim this InProcess manager last wrote for the account,
+	// still in the store (Release leaves it in place; there is no
+	// cross-process waiter to free). It makes the steady-state acquire a
+	// single compare-and-swap against a known value, and any failure of that
+	// swap is proof of a live concurrent writer - the sole process's claims
+	// cannot otherwise change. Guarded by mu. Unused by StoreLease, whose
+	// claims other instances may legitimately replace.
+	token []byte
 }
 
 // NewInProcess returns a Manager for a single process owning be.
 func NewInProcess(be backend.Backend) *InProcess {
-	return &InProcess{be: be, locks: make(map[jmap.Id]*accountLock)}
+	return &InProcess{
+		be:    be,
+		now:   time.Now,
+		nonce: newNonce(),
+		warnForeign: func(account jmap.Id, evidence string) {
+			slog.Warn("lease: another process is writing this store while InProcess assumes exclusivity; run one manager type per store",
+				"account", string(account), "evidence", evidence)
+		},
+		locks: make(map[jmap.Id]*accountLock),
+	}
 }
 
 // Acquire implements Manager.
@@ -87,38 +128,69 @@ func (m *InProcess) Acquire(ctx context.Context, account jmap.Id) (Lease, error)
 		return nil, ctx.Err()
 	}
 
-	// Bump the generation under the mutex; the stored value is what
-	// commit batches fence against.
-	key := leaseKey(account)
-	var bump backend.Batch
-	bump.Add(key, 1)
-	if err := m.be.WriteBatch(ctx, &bump); err != nil {
-		al.mu.Unlock()
-		return nil, err
+	key := storeClaimKey(account)
+	claim := mintToken(m.nonce, &m.seq, m.now().Add(inProcessExpiry))
+
+	// Steady state: swap directly against the claim this manager last wrote -
+	// one store round trip. The sole-process assumption means nothing else can
+	// have changed it, so a failed swap is itself the evidence of a live
+	// foreign writer and falls through to the full read path.
+	if al.token != nil {
+		switch swapped, err := cas(ctx, m.be, key, al.token, claim); {
+		case err != nil:
+			al.mu.Unlock()
+			return nil, err
+		case swapped:
+			al.token = claim
+			return &inProcessLease{al: al, key: key, claim: claim}, nil
+		}
+		m.warnForeign(account, "cached claim was replaced by another writer")
 	}
-	gen, err := m.be.Get(ctx, key)
-	if err != nil {
-		al.mu.Unlock()
-		return nil, err
+
+	// First contact with this account, or the fast path just lost its swap:
+	// read whatever claim is present and take it over immediately, regardless
+	// of expiry or owner - a predecessor's leftover is dead by assumption, and
+	// a live owner's next fence will fail cleanly rather than corrupt.
+	for {
+		old, err := getClaim(ctx, m.be, key)
+		if err != nil {
+			al.mu.Unlock()
+			return nil, err
+		}
+		swapped, err := cas(ctx, m.be, key, old, claim)
+		if err != nil {
+			al.mu.Unlock()
+			return nil, err
+		}
+		if swapped {
+			al.token = claim
+			return &inProcessLease{al: al, key: key, claim: claim}, nil
+		}
+		// A dead predecessor cannot swap a claim; losing this race proves a
+		// live concurrent writer.
+		m.warnForeign(account, "claim changed between read and takeover")
 	}
-	return &inProcessLease{lock: al, key: key, gen: gen}, nil
 }
 
 type inProcessLease struct {
-	lock *accountLock
-	key  []byte
-	gen  []byte
-	done bool
+	al    *accountLock
+	key   []byte
+	claim []byte
+	done  bool
 }
 
-// Fence implements Lease.
-func (l *inProcessLease) Fence(b *backend.Batch) { b.Assert(l.key, l.gen) }
+// Fence implements Lease. The claim token is the fence, exactly as in
+// StoreLease: the commit applies only while this token is still the current
+// claim.
+func (l *inProcessLease) Fence(b *backend.Batch) { b.Assert(l.key, l.claim) }
 
-// Release implements Lease.
+// Release implements Lease. It frees only the local mutex: the claim stays in
+// the store for the next acquire's single-swap fast path, and by assumption no
+// other process is waiting on it.
 func (l *inProcessLease) Release() {
 	if l.done {
 		return
 	}
 	l.done = true
-	l.lock.mu.Unlock()
+	l.al.mu.Unlock()
 }

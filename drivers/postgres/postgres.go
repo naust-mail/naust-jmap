@@ -37,6 +37,10 @@ const (
 	sqlSet = `INSERT INTO kv (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = excluded.v`
 	sqlDel = `DELETE FROM kv WHERE k = $1`
 	sqlGet = `SELECT v FROM kv WHERE k = $1`
+	// sqlGetLocked is sqlGet plus a row lock held to the end of the enclosing
+	// transaction, for reads whose result must stay true through commit (see
+	// assertOp).
+	sqlGetLocked = `SELECT v FROM kv WHERE k = $1 FOR UPDATE`
 	// sqlMultiGet returns exactly len(keys) rows, in input order (including
 	// repeats for a duplicated key), NULL for a key with no match - unnest
 	// WITH ORDINALITY carries each input key's original position, and the
@@ -109,6 +113,12 @@ func (s *Store) MultiGet(ctx context.Context, keys [][]byte) ([][]byte, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	// The query promises one row per key; anything else must be an error,
+	// because a caller reads a short result as "the missing keys do not
+	// exist" - a silently wrong answer.
+	if len(out) != len(keys) {
+		return nil, fmt.Errorf("postgres: MultiGet returned %d rows for %d keys", len(out), len(keys))
 	}
 	return out, nil
 }
@@ -278,9 +288,23 @@ func add(ctx context.Context, tx pgx.Tx, key []byte, delta int64) error {
 }
 
 // assertOp implements OpAssert: expect nil means the key must be absent.
+//
+// A value-expected assert reads with FOR UPDATE: holding the row lock to
+// commit makes the check atomic with the transaction it guards, so a
+// concurrent CompareAndSwap on the same key - a lease takeover - waits for
+// this transaction to finish rather than interleaving with it. Without the
+// lock, a transaction stalled between its fence check and its commit could
+// land writes after a takeover's, which is exactly what the fence exists to
+// prevent. An absent-expected assert takes no lock (a missing row cannot be
+// locked); guarding creation races is CompareAndSwapper's job, and every
+// other absent-assert path is idempotent by design.
 func assertOp(ctx context.Context, tx pgx.Tx, key, expect []byte) error {
+	q := sqlGet
+	if expect != nil {
+		q = sqlGetLocked
+	}
 	var v []byte
-	err := tx.QueryRow(ctx, sqlGet, key).Scan(&v)
+	err := tx.QueryRow(ctx, q, key).Scan(&v)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if expect == nil {
 			return nil

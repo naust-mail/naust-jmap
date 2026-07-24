@@ -91,7 +91,7 @@ func TestFinalizeBlobUploadRecordFails(t *testing.T) {
 
 	boom := errors.New("record write failed")
 	be := &recordFaultBackend{Backend: memory.New(), failKey: uploadKey(acct, id), err: boom}
-	db := New(be, lease.NewInProcess(be))
+	db := New(be, lease.NewInProcess(be), WithVerifyPreImages())
 	store := kvstore.New(be)
 
 	bw, err := store.Create(ctx, acct)
@@ -370,7 +370,7 @@ func TestFinalizeBlobUploadThenUpdateRecordFails(t *testing.T) {
 
 	boom := errors.New("record write failed")
 	be := &recordFaultBackend{Backend: memory.New(), failKey: uploadKey(acct, id), err: boom}
-	db := New(be, lease.NewInProcess(be))
+	db := New(be, lease.NewInProcess(be), WithVerifyPreImages())
 	if err := db.RegisterType(docType()); err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +422,7 @@ func TestFinalizeBlobUploadVersusSweep(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			_, _ = db.SweepBlobs(ctx, acct, store, now, tuning.BlobMinUnreferencedAge)
+			_, _, _ = db.SweepBlobs(ctx, acct, store, now, tuning.BlobMinUnreferencedAge)
 		}()
 		go func() {
 			defer wg.Done()

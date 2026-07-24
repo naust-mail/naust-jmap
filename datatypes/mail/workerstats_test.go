@@ -20,8 +20,9 @@ func unparkSubmission(t *testing.T, db *objectdb.DB, id string, at time.Time) {
 		if err != nil {
 			return err
 		}
-		obj["nextAttemptAt"] = mustJSON(at.UTC().Format(time.RFC3339))
-		return u.Put(TypeEmailSubmission, jmap.Id(id), obj)
+		next := cloneObject(obj)
+		next["nextAttemptAt"] = mustJSON(at.UTC().Format(time.RFC3339))
+		return u.Put(TypeEmailSubmission, jmap.Id(id), next)
 	})
 	if err != nil {
 		t.Fatal(err)

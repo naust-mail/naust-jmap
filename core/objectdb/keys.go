@@ -2,14 +2,23 @@ package objectdb
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
+	"github.com/naust-mail/naust-jmap/core/internal/jsonscan"
 	"github.com/naust-mail/naust-jmap/core/internal/keyenc"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/providers/backend"
 )
+
+// errBadIndexValue reports a value that cannot be encoded for its
+// property's kind. Note the decoders behind indexValue refuse a literal
+// null outright (see jsonscan), where json.Unmarshal would no-op into a
+// zero value: a null on a non-Nullable property fails closed here
+// instead of silently indexing as the kind's zero.
+var errBadIndexValue = errors.New("objectdb: value does not match the property's kind")
 
 // Key layout. Every key starts with the account segment, so one account
 // is one contiguous key range: copying, migrating, or deleting an
@@ -18,10 +27,12 @@ import (
 //	{acct} o {type} {id}                 object record (JSON)
 //	{acct} x {type} {prop} {value} {id}  property index (empty value)
 //	{acct} g {seq}                       change log entry (JSON)
+//	{acct} f                             change log floor (8-byte seq)
 //	{acct} q                             sequence counter
 //	{acct} s {type}                      per-type state (8-byte seq)
 //	{acct} u {blobId}                    blob upload record (JSON)
 //	{acct} r {blobId} {type} {id}        blob reference index (empty value)
+//	{acct} p {blobId}                    blob pending-collection hint (empty value)
 //
 // The encoding lives in internal/keyenc; segments are escaped so
 // arbitrary bytes cannot forge separators, and the encoding preserves
@@ -56,6 +67,12 @@ func logKey(acct jmap.Id, sequence int64) []byte {
 	return key(seg(string(acct)), seg("g"), backend.EncodeInt64(sequence))
 }
 
+// logFloorKey holds the oldest sequence the change log can still answer
+// from: TrimChanges writes it in the same batch that deletes everything
+// below it, so a crash can never leave deleted entries that Changes would
+// scan past silently. Absent means nothing has ever been trimmed.
+func logFloorKey(acct jmap.Id) []byte { return key(seg(string(acct)), seg("f")) }
+
 func seqKey(acct jmap.Id) []byte { return key(seg(string(acct)), seg("q")) }
 
 func typeStateKey(acct jmap.Id, typeName string) []byte {
@@ -85,6 +102,17 @@ func refKey(acct, blobID jmap.Id, typeName string, id jmap.Id) []byte {
 	return key(seg(string(acct)), seg("r"), seg(string(blobID)), seg(typeName), seg(string(id)))
 }
 
+// pendingKey marks a blob as a garbage-collection candidate: every path
+// that can leave a blob unreferenced (the upload itself, a reference
+// removal) sets it in the same batch as the fact, and SweepBlobs reads
+// only this range instead of scanning every upload record. The hint is
+// a superset, never truth - the sweep still verifies the reference
+// index before deleting, so a stale hint costs one check and a hint can
+// never delete a live blob.
+func pendingKey(acct, blobID jmap.Id) []byte {
+	return key(seg(string(acct)), seg("p"), seg(string(blobID)))
+}
+
 // indexValue encodes a property value so that bytes.Compare on index
 // keys matches the type's comparison rules (RFC 8620 section 5.5:
 // booleans false<true, numbers numerically, dates chronologically;
@@ -107,30 +135,30 @@ func indexValue(p descriptor.Property, raw []byte) ([]byte, error) {
 	}
 	switch p.Kind {
 	case descriptor.KindString:
-		var s string
-		if err := unmarshal(raw, &s); err != nil {
-			return nil, err
+		s, ok := jsonscan.String(raw)
+		if !ok {
+			return nil, errBadIndexValue
 		}
 		return []byte(strings.ToLower(s)), nil // ASCII casemap fold
 	case descriptor.KindBool:
-		var b bool
-		if err := unmarshal(raw, &b); err != nil {
-			return nil, err
+		b, ok := jsonscan.Bool(raw)
+		if !ok {
+			return nil, errBadIndexValue
 		}
 		if b {
 			return []byte{1}, nil
 		}
 		return []byte{0}, nil
 	case descriptor.KindInt, descriptor.KindUnsignedInt:
-		var n int64
-		if err := unmarshal(raw, &n); err != nil {
-			return nil, err
+		n, ok := jsonscan.Int(raw)
+		if !ok {
+			return nil, errBadIndexValue
 		}
 		return backend.EncodeInt64(n), nil
 	case descriptor.KindDate:
-		var s string
-		if err := unmarshal(raw, &s); err != nil {
-			return nil, err
+		s, ok := jsonscan.String(raw)
+		if !ok {
+			return nil, errBadIndexValue
 		}
 		t, err := time.Parse(time.RFC3339, s)
 		if err != nil {
@@ -138,11 +166,11 @@ func indexValue(p descriptor.Property, raw []byte) ([]byte, error) {
 		}
 		return backend.EncodeInt64(t.UnixNano()), nil
 	case descriptor.KindId:
-		var id jmap.Id
-		if err := unmarshal(raw, &id); err != nil {
-			return nil, err
+		s, ok := jsonscan.String(raw)
+		if !ok {
+			return nil, errBadIndexValue
 		}
-		return []byte(id), nil
+		return []byte(s), nil
 	}
 	return nil, errUnknownKind
 }

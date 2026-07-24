@@ -49,10 +49,16 @@ examples), and the runtime derives its `/get`, `/changes`, `/set`, `/copy`,
 `/query`, and `/queryChanges` methods with full RFC 8620 semantics.
 
 ```go
+// Persistence: the in-memory backend and its in-process lease manager.
+// Swap these two lines for a real driver module (e.g. drivers/sqlite)
+// and the rest is unchanged.
 be := memory.New()
 db := objectdb.New(be, lease.NewInProcess(be))
 
-users := auth.NewStatic()
+// Authentication: a demo user list with argon2id-hashed passwords. Real
+// embedders implement auth.Authenticator against their own credential
+// store, verifying a token per request rather than a password.
+users := demoauth.New(demoauth.Default())
 users.AddUser("demo@example.com", "demo", "Ademo")
 
 todo := &descriptor.Type{
@@ -76,6 +82,9 @@ srv.EnableBlobs(db, kvstore.New(be))                     // uploads, downloads, 
 srv.EnablePush(db, notify.NewInProcess(), nil, nil)      // event-source push
 http.ListenAndServe("localhost:8080", srv)
 ```
+
+(Error handling on each call is elided above for brevity; see the real file, linked above, which
+checks every one.)
 
 Run it and speak JMAP:
 

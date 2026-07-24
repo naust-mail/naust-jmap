@@ -53,6 +53,14 @@ const (
 	backoffInitial = 1 * time.Second
 	backoffMax     = 30 * time.Second
 
+	// dispatchBudget caps how many notifications the listener processes per
+	// second; the rest of that second is dropped and summarized in one warning.
+	// Hints are lossy by contract, so shedding costs only latency (everything
+	// reconciles through the store's timers), and the cap is far above any
+	// healthy commit rate - it exists so a buggy or hostile publisher flooding
+	// the channels cannot pin this process's CPU on decode and fan-out.
+	dispatchBudget = 2000
+
 	// stableConnThreshold is how long a listener connection must stay up to be
 	// counted healthy. A connection that drops sooner is treated as flapping and
 	// escalates the reconnect backoff, so a session that keeps dying right after
@@ -120,6 +128,13 @@ type Hints struct {
 	notifier *hintsNotifier
 	waker    *hintsWaker
 
+	// Flood-shed state, touched only by the listener goroutine (see shed).
+	// shedNow is a test seam; time.Now outside tests.
+	shedNow     func() time.Time
+	shedWindow  time.Time
+	shedCount   int
+	shedDropped uint64
+
 	cancel      context.CancelFunc
 	listenDone  chan struct{}
 	publishDone chan struct{}
@@ -145,6 +160,7 @@ func OpenHints(ctx context.Context, store *Store) (*Hints, error) {
 		local:       notify.NewInProcess(),
 		pub:         make(chan publishReq, publishQueueDepth),
 		waiters:     make(map[jmap.Id][]chan struct{}),
+		shedNow:     time.Now,
 		listenDone:  make(chan struct{}),
 		publishDone: make(chan struct{}),
 	}
@@ -301,8 +317,12 @@ func (h *Hints) consume(ctx context.Context, conn *pgx.Conn) {
 }
 
 // dispatch decodes one untrusted notification and applies it, dropping anything
-// malformed or self-originated.
+// malformed, self-originated, or over the per-second dispatchBudget. It runs
+// only on the listener goroutine, so the shed state needs no lock.
 func (h *Hints) dispatch(channel, payload string) {
+	if h.shed() {
+		return
+	}
 	switch channel {
 	case chanChanges:
 		p, err := decodeChange([]byte(payload))
@@ -325,6 +345,28 @@ func (h *Hints) dispatch(channel, payload string) {
 		}
 		h.signalWaiters(p.Account)
 	}
+}
+
+// shed reports whether this notification is over the listener's per-second
+// budget and must be dropped. On the first notification of each new second it
+// summarizes anything shed during the previous one, so a sustained flood
+// produces one warning per second, never one per drop. Listener-goroutine only.
+func (h *Hints) shed() bool {
+	now := h.shedNow()
+	if now.Sub(h.shedWindow) >= time.Second {
+		if h.shedDropped > 0 {
+			slog.Warn("postgres: hint flood, dropped notifications", "count", h.shedDropped)
+		}
+		h.shedWindow = now
+		h.shedCount = 0
+		h.shedDropped = 0
+	}
+	h.shedCount++
+	if h.shedCount > dispatchBudget {
+		h.shedDropped++
+		return true
+	}
+	return false
 }
 
 // signalWaiters releases every waiter currently parked on account.

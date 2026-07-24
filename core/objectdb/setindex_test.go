@@ -29,7 +29,7 @@ func tagType() *descriptor.Type {
 func newTagDB(t *testing.T) *DB {
 	t.Helper()
 	be := memory.New()
-	db := New(be, lease.NewInProcess(be))
+	db := New(be, lease.NewInProcess(be), WithVerifyPreImages())
 	if err := db.RegisterType(tagType()); err != nil {
 		t.Fatal(err)
 	}

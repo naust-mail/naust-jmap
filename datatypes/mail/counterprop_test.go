@@ -13,6 +13,7 @@ package mail
 // seed and step to reproduce.
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -129,6 +130,9 @@ func runCounterProperty(t *testing.T, seed int64) {
 	archive := createMailbox(t, ts, `{"name":"Archive","role":"archive"}`)
 	work := createMailbox(t, ts, `{"name":"Work"}`)
 	mailboxes := []string{inbox, trash, archive, work}
+	// curTrash tracks which Mailbox currently holds the trash role: the
+	// rerole op toggles it, so the oracle must follow the live rules.
+	curTrash := trash
 
 	// nonEmptySubset returns a random non-empty subset of the Mailboxes
 	// (Email/set enforces mailboxIds has at least one entry).
@@ -156,7 +160,7 @@ func runCounterProperty(t *testing.T, seed int64) {
 		emails := readEmailStates(t, ts)
 		for _, mb := range mailboxes {
 			got := readCounters(t, ts, mb)
-			want := oracleCounters(emails, mb, trash)
+			want := oracleCounters(emails, mb, curTrash)
 			g := [4]any{got["totalEmails"], got["unreadEmails"], got["totalThreads"], got["unreadThreads"]}
 			for i := range mailboxCounters {
 				if int64(g[i].(float64)) != want[i] {
@@ -171,15 +175,17 @@ func runCounterProperty(t *testing.T, seed int64) {
 	for step := 0; step < steps; step++ {
 		op := "create"
 		if len(live) > 0 {
-			switch rng.Intn(10) {
+			switch rng.Intn(11) {
 			case 0, 1, 2, 3:
 				op = "create"
 			case 4, 5:
 				op = "flag"
 			case 6, 7:
 				op = "move"
-			default:
+			case 8, 9:
 				op = "destroy"
+			default:
+				op = "rerole"
 			}
 		}
 
@@ -226,6 +232,30 @@ func runCounterProperty(t *testing.T, seed int64) {
 			callMail(t, ts, inv("Email/set", fmt.Sprintf(
 				`{"accountId":%q,"destroy":[%q]}`, testAccount, id), "0"))
 			live = append(live[:idx], live[idx+1:]...)
+
+		case "rerole":
+			// Move the trash role off and back on: the section 2.1 rules
+			// change under every stored Thread. The counters are stale by
+			// design until the migration drains, so drain fully (with a
+			// small bound to force several calls) before the oracle check.
+			role := `"trash"`
+			if curTrash == "" {
+				curTrash = trash
+			} else {
+				role = "null"
+				curTrash = ""
+			}
+			callMail(t, ts, inv("Mailbox/set", fmt.Sprintf(
+				`{"accountId":%q,"update":{%q:{"role":%s}}}`, testAccount, trash, role), "0"))
+			for {
+				done, err := MigrateThreadCounters(context.Background(), db, testAccount, 3)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if done {
+					break
+				}
+			}
 		}
 
 		check(step, op)

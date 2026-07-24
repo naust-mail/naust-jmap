@@ -30,7 +30,7 @@ func mailServer(t *testing.T) (*httptest.Server, *objectdb.DB) {
 	a := newStaticAuth()
 	a.AddUser("john@example.com", "secret", testAccount)
 	be := memory.New()
-	db := objectdb.New(be, lease.NewInProcess(be))
+	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
 	p := runtime.NewProcessor()
 	if err := RegisterMailbox(p, db, runtime.DefaultCoreCapabilities()); err != nil {
 		t.Fatal(err)
@@ -352,9 +352,10 @@ func bumpCounter(t *testing.T, db *objectdb.DB, id, counter string, n int64) {
 		if err != nil {
 			return err
 		}
+		next := cloneObject(obj)
 		raw, _ := json.Marshal(n)
-		obj[counter] = raw
-		return u.Put(TypeMailbox, jmap.Id(id), obj)
+		next[counter] = raw
+		return u.Put(TypeMailbox, jmap.Id(id), next)
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -117,7 +117,7 @@ func TestBumpStateUnknownType(t *testing.T) {
 // state), so a reconnecting client gets the right initial state.
 func TestBumpStatePersistsAcrossReopen(t *testing.T) {
 	be := memory.New()
-	db := New(be, lease.NewInProcess(be))
+	db := New(be, lease.NewInProcess(be), WithVerifyPreImages())
 	if err := db.RegisterType(pushOnlyType()); err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestBumpStatePersistsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2 := New(be, lease.NewInProcess(be))
+	db2 := New(be, lease.NewInProcess(be), WithVerifyPreImages())
 	if err := db2.RegisterType(pushOnlyType()); err != nil {
 		t.Fatal(err)
 	}

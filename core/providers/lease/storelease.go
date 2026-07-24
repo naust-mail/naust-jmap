@@ -70,11 +70,12 @@ type StoreLeaseConfig struct {
 // Acquire and Release swap the claim atomically across instances: on a backend
 // that implements backend.CompareAndSwapper they use it, otherwise an
 // Assert-guarded batch, which is a true compare-and-swap only on a backend that
-// serializes its writes. Never mix Manager types over one store: InProcess
-// fences on its generation key and StoreLease fences on its claim key, so an
-// InProcess box and a StoreLease box acting on one account would fence on
-// different keys and neither Assert would catch the other - real corruption, not
-// just lost efficiency. Run exactly one Manager type across a fleet.
+// serializes its writes. InProcess speaks this same claim key, token format,
+// and fence, differing only in policy (it assumes sole ownership and steals any
+// claim immediately), so a mixed-manager deployment cannot corrupt: each side's
+// takeover fails the other's fence cleanly. It degrades instead - steal
+// ping-pong, tempfails, and InProcess logging the proven foreign writer - so
+// still run exactly one Manager type across a fleet.
 type StoreLease struct {
 	be     backend.Backend
 	expiry time.Duration

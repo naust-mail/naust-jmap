@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/naust-mail/naust-jmap/core/internal/jsonscan"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 )
 
@@ -106,6 +107,15 @@ type Type struct {
 	// type's methods to exist (section 3.3).
 	Capability string
 	Properties map[string]Property
+	// Internal marks a type that exists only for the server's own
+	// bookkeeping: registered with the store so records, indexes, and
+	// commits work, but never part of the protocol surface. Its state
+	// changes are not published to push - RFC 8620 section 7.1 defines a
+	// TypeState value as the state "Foo/get" would return, which an
+	// internal type does not have - and its name is not listed among the
+	// store's type names, so it cannot appear in a push subscription's
+	// type filter. The type-level counterpart of Property.Internal.
+	Internal bool
 }
 
 // Validate checks the descriptor at registration time.
@@ -163,18 +173,16 @@ func (p Property) CheckValue(raw json.RawMessage) error {
 	}
 	switch p.Kind {
 	case KindString:
-		var s string
-		if err := json.Unmarshal(raw, &s); err != nil {
+		if !jsonscan.ValidString(raw) {
 			return fmt.Errorf("not a string")
 		}
 	case KindBool:
-		var b bool
-		if err := json.Unmarshal(raw, &b); err != nil {
+		if _, ok := jsonscan.Bool(raw); !ok {
 			return fmt.Errorf("not a boolean")
 		}
 	case KindInt, KindUnsignedInt:
-		var n int64
-		if err := json.Unmarshal(raw, &n); err != nil {
+		n, ok := jsonscan.Int(raw)
+		if !ok {
 			return fmt.Errorf("not an integer")
 		}
 		if p.Kind == KindUnsignedInt && !jmap.ValidUnsignedInt(n) {
@@ -184,23 +192,19 @@ func (p Property) CheckValue(raw json.RawMessage) error {
 			return fmt.Errorf("out of Int range")
 		}
 	case KindDate:
-		var s string
-		if err := json.Unmarshal(raw, &s); err != nil || !jmap.ValidDate(s) {
+		if s, ok := jsonscan.String(raw); !ok || !jmap.ValidDate(s) {
 			return fmt.Errorf("not a Date")
 		}
 	case KindId:
-		var id jmap.Id
-		if err := json.Unmarshal(raw, &id); err != nil || !id.Valid() {
+		if s, ok := jsonscan.String(raw); !ok || !jmap.Id(s).Valid() {
 			return fmt.Errorf("not an Id")
 		}
 	case KindObject:
-		var m map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &m); err != nil {
+		if !jsonscan.ValidObject(raw) {
 			return fmt.Errorf("not an object")
 		}
 	case KindArray:
-		var a []json.RawMessage
-		if err := json.Unmarshal(raw, &a); err != nil {
+		if !jsonscan.ValidArray(raw) {
 			return fmt.Errorf("not an array")
 		}
 	default:

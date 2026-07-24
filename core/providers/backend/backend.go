@@ -32,7 +32,10 @@ var ErrNoSpace = errors.New("backend: capacity exceeded")
 // Backend is the six-operation storage contract. Keys are ordered by
 // bytes.Compare; values are opaque.
 type Backend interface {
-	// Get returns the value at key, or ErrNotFound.
+	// Get returns the value at key, or ErrNotFound. The returned slice
+	// belongs to the caller: the backend must not retain, reuse, or
+	// modify it after returning (readers hold sub-slices of it in
+	// decoded records).
 	Get(ctx context.Context, key []byte) ([]byte, error)
 	// Scan visits keys in [start, end) in ascending order (descending
 	// when reverse), calling fn for each; fn returns false to stop

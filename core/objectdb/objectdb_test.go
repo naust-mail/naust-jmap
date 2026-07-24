@@ -29,7 +29,7 @@ func noteType() *descriptor.Type {
 func newDB(t *testing.T) *DB {
 	t.Helper()
 	be := memory.New()
-	db := New(be, lease.NewInProcess(be))
+	db := New(be, lease.NewInProcess(be), WithVerifyPreImages())
 	if err := db.RegisterType(noteType()); err != nil {
 		t.Fatal(err)
 	}

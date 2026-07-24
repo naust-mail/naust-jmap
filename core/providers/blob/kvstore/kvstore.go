@@ -136,6 +136,19 @@ func (s *Store) Open(ctx context.Context, acct, blobID jmap.Id) (io.ReadCloser, 
 // Delete implements blob.Store. Deleting a missing blob succeeds.
 func (s *Store) Delete(ctx context.Context, acct, blobID jmap.Id) error {
 	b := &backend.Batch{}
-	b.Delete(contentKey(acct, blobID))
+	if err := s.AppendDelete(ctx, b, acct, blobID); err != nil {
+		return err
+	}
 	return s.be.WriteBatch(ctx, b)
+}
+
+// DeleteBackend implements blob.BatchDeleter.
+func (s *Store) DeleteBackend() backend.Backend { return s.be }
+
+// AppendDelete implements blob.BatchDeleter: a blob is one key, so its
+// removal is one delete on b, applied atomically with the rest of the
+// caller's batch (and under its assertions).
+func (s *Store) AppendDelete(_ context.Context, b *backend.Batch, acct, blobID jmap.Id) error {
+	b.Delete(contentKey(acct, blobID))
+	return nil
 }

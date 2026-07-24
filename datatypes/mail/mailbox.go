@@ -20,6 +20,7 @@ import (
 	"github.com/naust-mail/naust-jmap/core/descriptor"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
+	"github.com/naust-mail/naust-jmap/core/private/rawjson"
 	"github.com/naust-mail/naust-jmap/core/runtime"
 )
 
@@ -82,6 +83,12 @@ func RegisterMailbox(p *runtime.Processor, db *objectdb.DB, core jmap.CoreCapabi
 			Arrange: mailboxArrange(db),
 		},
 	}
+	// The counter-rules marker rides with Mailbox: the trash role that
+	// defines the section 2.1 unreadThreads rules is a Mailbox property,
+	// and the hooks below are what move it.
+	if err := db.RegisterType(counterRulesType()); err != nil {
+		return err
+	}
 	return runtime.RegisterStandardTypeExt(p, db, MailboxType(), core, ext)
 }
 
@@ -91,17 +98,11 @@ func isNullRaw(raw json.RawMessage) bool {
 }
 
 // decodeString decodes a raw JSON string; ok is false for null, a
-// missing value, or a non-string. Values are compared decoded, never
-// as raw bytes: JSON escaping admits many encodings of one string.
+// missing value, or a non-string (exactly rawjson.String's contract).
+// Values are compared decoded, never as raw bytes: JSON escaping
+// admits many encodings of one string.
 func decodeString(raw json.RawMessage) (string, bool) {
-	if raw == nil || isNullRaw(raw) {
-		return "", false
-	}
-	var s string
-	if json.Unmarshal(raw, &s) != nil {
-		return "", false
-	}
-	return s, true
+	return rawjson.String(raw)
 }
 
 // checkBoolExtras requires every supplied extra argument to be a JSON
@@ -224,7 +225,31 @@ func mailboxValidate(u *objectdb.Update, old, new objectdb.Object, extra map[str
 	if sortOrder >= 1<<31 {
 		return invalidProp("sortOrder", "sortOrder must be below 2^31"), nil
 	}
+
+	// Gaining or losing the trash role changes the section 2.1
+	// unreadThreads rules for every Thread; record that so the stored
+	// counters get corrected (see threadmigrate.go). Every check above
+	// has passed, so this stages nothing for a rejected record.
+	if mailboxRole(old) != mailboxRole(new) && (mailboxRole(old) == "trash" || mailboxRole(new) == "trash") {
+		if err := noteTrashRulesChange(u); err != nil {
+			return nil, err
+		}
+	}
 	return nil, nil
+}
+
+// mailboxRole is the record's role, "" for null, absent, or a nil
+// record (the create side).
+func mailboxRole(obj objectdb.Object) string {
+	if obj == nil {
+		return ""
+	}
+	raw := obj["role"]
+	if raw == nil || isNullRaw(raw) {
+		return ""
+	}
+	role, _ := decodeString(raw)
+	return role
 }
 
 // checkMailboxName enforces the name shape: a Net-Unicode (RFC 5198)
@@ -331,6 +356,13 @@ func mailboxDestroy(u *objectdb.Update, id jmap.Id, extra map[string]json.RawMes
 			return &jmap.SetError{Type: "mailboxHasEmail", Description: "mailbox still contains emails"}, nil
 		}
 		if err := mailboxRemoveEmails(u, id); err != nil {
+			return nil, err
+		}
+	}
+	// Destroying the trash Mailbox changes the section 2.1 unreadThreads
+	// rules just as re-roling it does (see mailboxValidate).
+	if mailboxRole(obj) == "trash" {
+		if err := noteTrashRulesChange(u); err != nil {
 			return nil, err
 		}
 	}

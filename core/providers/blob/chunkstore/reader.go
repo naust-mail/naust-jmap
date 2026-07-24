@@ -85,6 +85,24 @@ func (r *reader) Close() error { return nil }
 // Delete removes a blob's manifest and pieces. Deleting a blob that is not
 // present succeeds, so garbage collection can be idempotent.
 func (s *Store) Delete(ctx context.Context, acct, blobID jmap.Id) error {
+	b := &backend.Batch{}
+	if err := s.AppendDelete(ctx, b, acct, blobID); err != nil {
+		return err
+	}
+	if len(b.Ops) == 0 {
+		return nil
+	}
+	return s.be.WriteBatch(ctx, b)
+}
+
+// DeleteBackend implements blob.BatchDeleter.
+func (s *Store) DeleteBackend() backend.Backend { return s.be }
+
+// AppendDelete implements blob.BatchDeleter: the manifest and every piece
+// are appended as deletes on b, so the blob's removal applies atomically
+// with the rest of the caller's batch (and under its assertions). A blob
+// with no manifest appends nothing.
+func (s *Store) AppendDelete(ctx context.Context, b *backend.Batch, acct, blobID jmap.Id) error {
 	m, err := s.loadManifest(ctx, acct, blobID)
 	if errors.Is(err, blob.ErrNotFound) {
 		return nil
@@ -92,12 +110,11 @@ func (s *Store) Delete(ctx context.Context, acct, blobID jmap.Id) error {
 	if err != nil {
 		return err
 	}
-	b := &backend.Batch{}
 	for i := uint32(0); i < m.count; i++ {
 		b.Delete(pieceKey(acct, m.run, i))
 	}
 	b.Delete(manifestKey(acct, blobID))
-	return s.be.WriteBatch(ctx, b)
+	return nil
 }
 
 // Put stores content whose id is already known (the Blob/copy path, where

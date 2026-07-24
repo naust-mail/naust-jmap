@@ -95,7 +95,7 @@ func TestStoreMatchesModel(t *testing.T) {
 func runStoreVsModel(t *testing.T, seed int64, commits int) {
 	ctx := context.Background()
 	be := memory.New()
-	db := New(be, lease.NewInProcess(be))
+	db := New(be, lease.NewInProcess(be), WithVerifyPreImages())
 	if err := db.RegisterType(&descriptor.Type{
 		Name:       "TestNote",
 		Capability: "urn:example:notes",

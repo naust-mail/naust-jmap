@@ -195,3 +195,47 @@ func hasStr(list []any, want string) bool {
 	}
 	return false
 }
+
+// TestThreadChangesQuietOnMetadata: a keyword or mailbox change on a
+// member Email leaves the Thread's sync surface untouched - the
+// client-visible Thread (id, emailIds) is unchanged, and RFC 8620
+// section 5.1 wants the state string stable while the data is unchanged
+// - while a membership change still reports the Thread updated.
+func TestThreadChangesQuietOnMetadata(t *testing.T) {
+	ts, db, store := emailServer(t)
+	inbox := createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
+	archive := createMailbox(t, ts, `{"name":"Archive","role":"archive"}`)
+	mb := map[string]bool{inbox: true}
+
+	a := putEmail(t, db, store, threadMsg("Hello", map[string]string{"Message-ID": "<a@x>"}), mb, nil)
+	b := putEmail(t, db, store, threadMsg("Re: Hello", map[string]string{"Message-ID": "<b@x>", "In-Reply-To": "<a@x>"}), mb, nil)
+	tid := threadOf(t, ts, a)
+
+	s := threadState(t, ts)
+	mustUpdate := func(patch string) {
+		t.Helper()
+		r := callMail(t, ts, inv("Email/set", fmt.Sprintf(
+			`{"accountId":%q,"update":{%q:%s}}`, testAccount, a, patch), "0"))
+		upd, _ := methodArgs(t, r, 0, "Email/set")["updated"].(map[string]any)
+		if _, ok := upd[a]; !ok {
+			t.Fatalf("Email/set did not apply %s: %v", patch, methodArgs(t, r, 0, "Email/set"))
+		}
+	}
+
+	mustUpdate(`{"keywords/$seen":true}`)
+	if got := threadState(t, ts); got != s {
+		t.Fatalf("keyword change moved Thread state %q -> %q", s, got)
+	}
+	mustUpdate(fmt.Sprintf(`{"mailboxIds":{%q:true}}`, archive))
+	if got := threadState(t, ts); got != s {
+		t.Fatalf("mailbox move moved Thread state %q -> %q", s, got)
+	}
+
+	// Membership change: destroying one of two members reports the
+	// Thread updated (its emailIds shrank).
+	callMail(t, ts, inv("Email/set", fmt.Sprintf(
+		`{"accountId":%q,"destroy":[%q]}`, testAccount, b), "0"))
+	if ch := threadChanges(t, ts, s); !hasStr(ch["updated"].([]any), tid) {
+		t.Fatalf("Thread not reported updated when a member left: %v", ch)
+	}
+}

@@ -88,9 +88,11 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
+	"github.com/naust-mail/naust-jmap/core/objectdb/maintain"
 	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/providers/backend"
 	"github.com/naust-mail/naust-jmap/core/providers/blob/chunkstore"
@@ -104,6 +106,16 @@ import (
 	"github.com/naust-mail/naust-jmap/drivers/sqlite"
 	"github.com/naust-mail/naust-jmap/examples/internal/tokenauth"
 )
+
+// maintenanceInterval is how often the elected instance reclaims blob
+// garbage and trims change logs. Neither job is urgent - what accumulates
+// between runs is bounded by the windows the jobs enforce, not by how
+// promptly they run - and the blob sweep is not free: it examines every
+// upload record the account has, and delivery writes one per message. An
+// unreferenced blob is not eligible until it clears
+// tuning.BlobMinUnreferencedAge anyway, so sweeping much more often than
+// that spends the scan to reclaim nothing.
+const maintenanceInterval = time.Hour
 
 // staticResolver maps envelope recipients to accounts. A real deployment
 // resolves against its user directory (which addresses are local, aliases,
@@ -350,6 +362,37 @@ func main() {
 		// webpush trivially active, no election.
 		log.Fatal(err)
 	}
+
+	// Maintenance: neither the runtime nor the database schedules its own
+	// reclamation, so the embedder owns starting it - maintain.Run is the
+	// stock loop over every account (blob collection plus change log
+	// trimming, both under the account lease so they can never race a
+	// commit). One elected instance runs it so a fleet does not repeat the
+	// same scans on every node.
+	go lease.RunSingleton(context.Background(), store, "maintenance/0", lease.SingletonConfig{}, func(ctx context.Context) {
+		maintain.Run(ctx, db, maintain.Config{
+			Blobs:    blobs,
+			Interval: maintenanceInterval,
+			OnError: func(acct jmap.Id, err error) {
+				log.Printf("maintenance: %s: %v", acct, err)
+			},
+			// The mail module's own pass: correcting Thread-granular
+			// Mailbox counters after a trash role change. One lookup per
+			// account when nothing is pending.
+			Extra: func(ctx context.Context, acct jmap.Id) {
+				for {
+					done, err := mail.MigrateThreadCounters(ctx, db, acct, 4096)
+					if err != nil {
+						log.Printf("maintenance: %s: %v", acct, err)
+						return
+					}
+					if done {
+						return
+					}
+				}
+			},
+		})
+	})
 
 	// Delivery: the same Deliverer feeds both adapters, so LMTP and HTTP
 	// ingest produce identical Emails and identical per-recipient verdicts.

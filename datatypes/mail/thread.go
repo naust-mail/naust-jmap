@@ -2,16 +2,18 @@ package mail
 
 // Thread (RFC 8621 section 3): a flat, date-ordered list of the Emails
 // that belong together. Every Email belongs to exactly one Thread. The
-// Thread record itself stores nothing but its id; emailIds is computed
-// from the Emails indexed by threadId. Assignment follows the spec's
-// suggested algorithm (a shared message-id AND an equal base subject);
-// Threads are never merged.
+// client-visible Thread is just {id, emailIds}: emailIds is computed
+// from the Emails indexed by threadId, and the record's only stored
+// content is the internal counter aggregate (threadstat.go). Assignment
+// follows the spec's suggested algorithm (a shared message-id AND an
+// equal base subject); Threads are never merged.
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/naust-mail/naust-jmap/core/descriptor"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
+	"github.com/naust-mail/naust-jmap/core/private/rawjson"
 	"github.com/naust-mail/naust-jmap/core/runtime"
 	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/message"
 )
@@ -26,13 +29,17 @@ import (
 // TypeThread is the Thread type name.
 const TypeThread = "Thread"
 
-// ThreadType returns the Thread descriptor: only the implicit id is
-// stored. emailIds is computed on /get from the Email threadId index.
+// ThreadType returns the Thread descriptor. emailIds is computed on
+// /get from the Email threadId index; the only stored property is the
+// internal counter aggregate, which the Internal flag keeps off the
+// protocol surface entirely.
 func ThreadType() *descriptor.Type {
 	return &descriptor.Type{
 		Name:       TypeThread,
 		Capability: CapabilityURI,
-		Properties: map[string]descriptor.Property{},
+		Properties: map[string]descriptor.Property{
+			statProperty: {Kind: descriptor.KindObject, Internal: true},
+		},
 	}
 }
 
@@ -61,10 +68,11 @@ func (tc threadComputed) Resolve(ctx context.Context, acct jmap.Id, stored objec
 		if name != "emailIds" {
 			continue
 		}
-		var tid jmap.Id
-		if err := json.Unmarshal(stored["id"], &tid); err != nil {
-			return nil, err
+		s, ok := rawjson.String(stored["id"])
+		if !ok {
+			return nil, fmt.Errorf("thread record has no valid id")
 		}
+		tid := jmap.Id(s)
 		ids, err := tc.db.IdsWhereEqual(ctx, acct, TypeEmail, "threadId", mustJSON(tid))
 		if err != nil {
 			return nil, err
@@ -73,16 +81,20 @@ func (tc threadComputed) Resolve(ctx context.Context, acct jmap.Id, stored objec
 			id   jmap.Id
 			recv time.Time
 		}
+		// One batched read for all members: receivedAt is one property,
+		// but the fetch must not cost a backend round trip per member.
+		objs, err := tc.db.GetMany(ctx, acct, TypeEmail, ids)
+		if err != nil {
+			return nil, err
+		}
 		entries := make([]entry, 0, len(ids))
-		for _, id := range ids {
-			obj, err := tc.db.Get(ctx, acct, TypeEmail, id)
-			if err != nil {
-				return nil, err
+		for i, obj := range objs {
+			if obj == nil {
+				continue // destroyed between the index read and the fetch
 			}
-			var recv string
-			json.Unmarshal(obj["receivedAt"], &recv)
+			recv, _ := rawjson.String(obj["receivedAt"])
 			t, _ := time.Parse(time.RFC3339, recv)
-			entries = append(entries, entry{id: id, recv: t})
+			entries = append(entries, entry{id: ids[i], recv: t})
 		}
 		sort.Slice(entries, func(i, j int) bool {
 			if !entries[i].recv.Equal(entries[j].recv) {
@@ -101,13 +113,13 @@ func (tc threadComputed) Resolve(ctx context.Context, acct jmap.Id, stored objec
 
 // threadSizeCap bounds how many Emails may share one threadId. It is a resource
 // bound, not a spec limit (RFC 8621 section 3 does not mandate the join
-// algorithm): adjustCounters rescans a thread's members on every insert, so an
+// algorithm): resolving a Thread's emailIds loads every member record, so an
 // unbounded thread (an attacker sending many messages with the same Message-ID
-// and base subject builds one) makes insertion O(N^2) overall. Once a thread
-// reaches this many members a new member starts a fresh threadId instead of
-// joining. It is set well above any real conversation so it never splits
-// legitimate mail, only a same-key flood. It is a var, not a const, only so a
-// test can exercise the split boundary at a small size.
+// and base subject builds one) turns a single Thread/get into an unbounded
+// read. Once a thread reaches this many members a new member starts a fresh
+// threadId instead of joining. It is set well above any real conversation so it
+// never splits legitimate mail, only a same-key flood. It is a var, not a
+// const, only so a test can exercise the split boundary at a small size.
 var threadSizeCap = 1024
 
 // assignThread returns the threadId for a newly arriving message
@@ -146,27 +158,34 @@ func assignThread(u *objectdb.Update, headers []message.HeaderField) (jmap.Id, e
 	if err != nil {
 		return "", err
 	}
-	var tid jmap.Id
-	if err := json.Unmarshal(obj["threadId"], &tid); err != nil {
-		return "", err
+	s, ok := rawjson.String(obj["threadId"])
+	if !ok {
+		return "", fmt.Errorf("email record has no valid threadId")
 	}
-	// Thread-size cap. adjustCounters rescans a thread's members on every
-	// insert, so an unbounded thread (an attacker sending many messages with
-	// the same Message-ID and base subject - the join keys - builds one) makes
-	// insertion O(thread) per message and O(N^2) overall. Once a thread reaches
+	tid := jmap.Id(s)
+	// Thread-size cap. Resolving a Thread's emailIds loads every member
+	// record, so an unbounded thread (an attacker sending many messages with
+	// the same Message-ID and base subject - the join keys - builds one) turns
+	// a single Thread/get into an unbounded read. Once a thread reaches
 	// threadSizeCap members, a new member starts a fresh threadId instead of
-	// joining, bounding every per-insert thread scan to the cap. The split is
-	// one-way: the overflow message never rejoins the full thread. RFC 8621
-	// section 3 states the thread-join algorithm "is not mandated", so a server
-	// may cap thread size and split the overflow this way.
-	members, err := u.IdsWhereEqual(TypeEmail, "threadId", mustJSON(tid))
+	// joining. The member count comes from the Thread's stored aggregate - one
+	// record read, no index scan. The split is one-way: the overflow message
+	// never rejoins the full thread. RFC 8621 section 3 states the thread-join
+	// algorithm "is not mandated", so a server may cap thread size and split
+	// the overflow this way.
+	thr, err := u.Get(TypeThread, tid)
 	if err != nil {
 		return "", err
 	}
-	if len(members) >= threadSizeCap {
+	if statOf(thr).Total >= int64(threadSizeCap) {
 		return u.Create(TypeThread, objectdb.Object{})
 	}
-	if err := touchThread(u, tid); err != nil {
+	// The identity Put announces the membership change: the computed
+	// emailIds gains a member, so Thread/changes must report the Thread
+	// updated, and an ordinary Put is what marks the record loud against
+	// the counter aggregate's bookkeeping write. The record is already
+	// in hand from the cap check.
+	if err := u.Put(TypeThread, tid, thr); err != nil {
 		return "", err
 	}
 	return tid, nil
@@ -195,17 +214,6 @@ func threadKeyMembers(headers []message.HeaderField) []string {
 func threadKey(msgid, base string) string {
 	sum := sha256.Sum256([]byte(msgid + "\x00" + base))
 	return hex.EncodeToString(sum[:])
-}
-
-// touchThread re-stages the Thread record so a membership change (a new
-// or departed Email) surfaces as an update in Thread/changes; the record
-// carries no data of its own to change.
-func touchThread(u *objectdb.Update, tid jmap.Id) error {
-	obj, err := u.Get(TypeThread, tid)
-	if err != nil {
-		return err
-	}
-	return u.Put(TypeThread, tid, obj)
 }
 
 // emailMsgids is the ordered, de-duplicated union of the message-ids in

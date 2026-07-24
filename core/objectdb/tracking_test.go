@@ -21,8 +21,12 @@ func updateNote(t *testing.T, db *DB, id jmap.Id, mutate func(Object)) string {
 		if err != nil {
 			return err
 		}
-		mutate(obj)
-		return u.Put("TestNote", id, obj)
+		next := make(Object, len(obj))
+		for k, v := range obj {
+			next[k] = v
+		}
+		mutate(next)
+		return u.Put("TestNote", id, next)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -145,8 +149,12 @@ func TestUpdateIdsWhereEqual(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		objB["subject"] = json.RawMessage(`"Alpha"`)
-		if err := u.Put("TestNote", idB, objB); err != nil {
+		nextB := make(Object, len(objB))
+		for k, v := range objB {
+			nextB[k] = v
+		}
+		nextB["subject"] = json.RawMessage(`"Alpha"`)
+		if err := u.Put("TestNote", idB, nextB); err != nil {
 			t.Fatal(err)
 		}
 		idC, err := u.Create("TestNote", note("ALPHA", "3"))
@@ -197,7 +205,7 @@ func TestNullableProperty(t *testing.T) {
 	}
 
 	be := memory.New()
-	db := New(be, lease.NewInProcess(be))
+	db := New(be, lease.NewInProcess(be), WithVerifyPreImages())
 	if err := db.RegisterType(&descriptor.Type{
 		Name:       "Box",
 		Capability: "urn:example:box",

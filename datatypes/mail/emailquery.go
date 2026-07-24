@@ -21,6 +21,7 @@ import (
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
+	"github.com/naust-mail/naust-jmap/core/private/rawjson"
 	"github.com/naust-mail/naust-jmap/core/runtime"
 	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/message"
 )
@@ -161,10 +162,8 @@ func (f emailFilter) MatchCondition(ctx context.Context, acct jmap.Id, obj objec
 	case "notKeyword":
 		return !objectKeys(obj["keywords"])[keywordArg(value)], nil
 	case "hasAttachment":
-		var want bool
-		json.Unmarshal(value, &want)
-		var got bool
-		json.Unmarshal(obj["hasAttachment"], &got)
+		want, _ := rawjson.Bool(value)
+		got, _ := rawjson.Bool(obj["hasAttachment"])
 		return got == want, nil
 	case "allInThreadHaveKeyword", "someInThreadHaveKeyword", "noneInThreadHaveKeyword":
 		all, some, err := f.threadKeyword(ctx, acct, obj, keywordArg(value))
@@ -387,10 +386,15 @@ func utcDate(raw json.RawMessage) time.Time {
 	return t
 }
 
+// uintVal decodes a non-negative integer, 0 for anything else. Stored
+// values passed the UnsignedInt kind check (RFC 8620 section 1.3 caps
+// them below 2^53), so the int64 range of rawjson.Int loses nothing.
 func uintVal(raw json.RawMessage) uint64 {
-	var n uint64
-	json.Unmarshal(raw, &n)
-	return n
+	n, ok := rawjson.Int(raw)
+	if !ok || n < 0 {
+		return 0
+	}
+	return uint64(n)
 }
 
 func emailDate(obj objectdb.Object, name string) time.Time {
@@ -400,9 +404,7 @@ func emailDate(obj objectdb.Object, name string) time.Time {
 }
 
 func emailUint(obj objectdb.Object, name string) uint64 {
-	var n uint64
-	json.Unmarshal(obj[name], &n)
-	return n
+	return uintVal(obj[name])
 }
 
 // addressText concatenates the names and emails of a stored EmailAddress[]

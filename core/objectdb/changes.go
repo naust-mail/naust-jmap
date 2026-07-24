@@ -55,6 +55,17 @@ func (db *DB) Changes(ctx context.Context, acct jmap.Id, typeName, sinceState st
 	if since > global {
 		return nil, ErrCannotCalculateChanges
 	}
+	// A state older than the trimmed log is uncomputable: the entries that
+	// would describe the difference are gone, and scanning from the first
+	// surviving key would answer with a partial diff (5.2 requires the
+	// complete set of changes, so an incomplete one is not an option).
+	floor, err := db.logFloor(ctx, acct)
+	if err != nil {
+		return nil, err
+	}
+	if since+1 < floor {
+		return nil, ErrCannotCalculateChanges
+	}
 
 	// dispositions per id, in chronological entry order.
 	const (
@@ -148,6 +159,21 @@ func (db *DB) Changes(ctx context.Context, acct jmap.Id, typeName, sinceState st
 	}
 	if scanErr != nil {
 		return nil, scanErr
+	}
+
+	// Re-read the floor now that the scan is done: readers take no lease, so
+	// a trim may have committed between the floor check above and the entry
+	// reads themselves, deleting entries this scan needed. The floor moves in
+	// the same batch as the deletions, so a floor still at or below since+1
+	// proves no needed entry was deleted; a floor above it means the scan
+	// cannot be trusted to have seen the complete set of changes, and 5.2
+	// requires the complete set or a refusal, never a partial diff.
+	floor, err = db.logFloor(ctx, acct)
+	if err != nil {
+		return nil, err
+	}
+	if since+1 < floor {
+		return nil, ErrCannotCalculateChanges
 	}
 
 	for id, d := range disp {

@@ -1,12 +1,15 @@
 package objectdb
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
+	"github.com/naust-mail/naust-jmap/core/internal/jsonscan"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/providers/backend"
 )
@@ -26,72 +29,75 @@ import (
 // the object's keys for a KindObject, the string elements for a
 // KindArray. A null or absent value has no members (json.Unmarshal maps
 // "null" to a nil map/slice). Non-string array elements are an error, as
-// a set index needs string members.
+// a set index needs string members. Duplicate KindObject member names
+// collapse to one member, as they would decoding through a map; the
+// dedup is a linear scan of the output because member lists are small
+// (a record's mailboxes, its keywords), so a map would cost more than
+// it saves.
 func setMembers(p descriptor.Property, raw json.RawMessage) ([]string, error) {
 	if raw == nil {
 		return nil, nil
 	}
 	switch p.Kind {
 	case descriptor.KindObject:
-		var m map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &m); err != nil {
+		var out []string
+		err := jsonscan.EachKey(raw, func(k string) {
+			if !slices.Contains(out, k) {
+				out = append(out, k)
+			}
+		})
+		if err != nil {
 			return nil, err
-		}
-		out := make([]string, 0, len(m))
-		for k := range m {
-			out = append(out, k)
 		}
 		return out, nil
 	case descriptor.KindArray:
-		var a []string
-		if err := json.Unmarshal(raw, &a); err != nil {
+		var out []string
+		if err := jsonscan.EachString(raw, func(e string) { out = append(out, e) }); err != nil {
 			return nil, err
 		}
-		return a, nil
+		return out, nil
 	}
 	return nil, fmt.Errorf("objectdb: kind %d is not set-indexable", p.Kind)
-}
-
-// memberSet is setMembers as a lookup set for one record version.
-func memberSet(p descriptor.Property, obj Object, name string) (map[string]bool, error) {
-	if obj == nil {
-		return nil, nil
-	}
-	members, err := setMembers(p, obj[name])
-	if err != nil {
-		return nil, err
-	}
-	set := make(map[string]bool, len(members))
-	for _, m := range members {
-		set[m] = true
-	}
-	return set, nil
 }
 
 // setIndexOps maintains the membership reverse index for SetIndexed
 // properties: delete keys for departed members, set keys for arrived
 // ones. Runs inside the same commit as the object write, so the index
 // can never disagree with the records (like indexOps and refOps).
+// Byte-identical old and new values short-circuit - identical bytes are
+// identical members - which makes the untouched composite property of
+// an updated record (the mailboxIds of a flag flip) free. The diff
+// itself is two linear scans over small member lists, no maps.
 func setIndexOps(batch *backend.Batch, acct jmap.Id, t *descriptor.Type, id jmap.Id, old, new Object) error {
 	for name, p := range t.Properties {
 		if !p.SetIndexed {
 			continue
 		}
-		oldM, err := memberSet(p, old, name)
+		var oldRaw, newRaw json.RawMessage
+		if old != nil {
+			oldRaw = old[name]
+		}
+		if new != nil {
+			newRaw = new[name]
+		}
+		if bytes.Equal(oldRaw, newRaw) {
+			continue
+		}
+		oldM, err := setMembers(p, oldRaw)
 		if err != nil {
 			return err
 		}
-		newM, err := memberSet(p, new, name)
+		newM, err := setMembers(p, newRaw)
 		if err != nil {
 			return err
 		}
-		for m := range oldM {
-			if !newM[m] {
+		for _, m := range oldM {
+			if !slices.Contains(newM, m) {
 				batch.Delete(idxKey(acct, t.Name, name, []byte(m), id))
 			}
 		}
-		for m := range newM {
-			if !oldM[m] {
+		for _, m := range newM {
+			if !slices.Contains(oldM, m) {
 				batch.Set(idxKey(acct, t.Name, name, []byte(m), id), nil)
 			}
 		}

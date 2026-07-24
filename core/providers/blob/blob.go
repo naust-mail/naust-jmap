@@ -21,6 +21,7 @@ import (
 	"io"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
+	"github.com/naust-mail/naust-jmap/core/providers/backend"
 )
 
 // ErrNotFound reports a blob that does not exist in the account.
@@ -44,6 +45,28 @@ type Store interface {
 	// Delete removes a blob. Deleting a missing blob is not an error
 	// (garbage collection must be idempotent).
 	Delete(ctx context.Context, acct, blobID jmap.Id) error
+}
+
+// BatchDeleter is an optional Store capability: a store persisting its blobs
+// in a backend.Backend can append a blob's removal to a caller's batch
+// instead of performing it, so the removal commits atomically with - and
+// under the same fencing assertions as - the caller's own writes. A garbage
+// collector fencing its commits on a lease uses this to make "delete the
+// content, its record, and its bookkeeping" one all-or-nothing write: a
+// lease lost mid-collection then aborts the content deletion too, instead
+// of destroying content a concurrent writer has re-referenced. The
+// optional-capability shape follows backend.MultiGetter.
+type BatchDeleter interface {
+	// DeleteBackend is the Backend the appended operations must be written
+	// to. The capability is valid only when the caller will write its batch
+	// to this exact Backend - the caller must compare identity and fall
+	// back to Delete otherwise.
+	DeleteBackend() backend.Backend
+	// AppendDelete appends the operations removing (acct, blobID) to b.
+	// Nothing is deleted until the caller writes the batch. A missing blob
+	// appends nothing and is not an error (like Delete, collection must be
+	// idempotent).
+	AppendDelete(ctx context.Context, b *backend.Batch, acct, blobID jmap.Id) error
 }
 
 // BlobWriter streams one blob's content into a Store, computing its content

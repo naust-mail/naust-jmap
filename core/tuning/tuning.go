@@ -102,6 +102,26 @@ var UploadRefreshInterval = time.Minute
 // following Foo/get could request at once.
 var DefaultMaxChanges = 2048
 
+// ChangeLogRetention is how far back the change log stays answerable: an entry
+// older than this may be trimmed, after which a Foo/changes from a state below
+// the log floor gets cannotCalculateChanges and the client resyncs. RFC 8620
+// section 5.2 says servers SHOULD be able to calculate changes from any state
+// given to a client within the last 30 days; this default meets that SHOULD.
+// It is the client-facing guarantee: a device offline for less than this never
+// pays for a full resync. Tightening it is a permitted tradeoff with industry
+// precedent (large providers retain as little as a week) and only shifts cost
+// onto long-offline clients, never correctness.
+var ChangeLogRetention = 30 * 24 * time.Hour
+
+// ChangeLogMaxEntries bounds how many change log entries one account retains,
+// regardless of age. ChangeLogRetention alone does not bound disk: every commit
+// appends an entry, so a high commit rate accumulates without limit inside the
+// window. This is the resource bound; the window is the sync guarantee.
+// Whichever trims more wins. Set it high enough that reaching it is abnormal,
+// since an account that does will force resyncs on clients that were offline
+// well under ChangeLogRetention.
+var ChangeLogMaxEntries = 100000
+
 // MaxFilterNodes bounds a filter tree's total node count (operators plus
 // condition leaves) in a Foo/query. CheckIJSON caps the request's JSON
 // nesting depth but not a FilterOperator's breadth: a client can pack tens of

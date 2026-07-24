@@ -28,7 +28,7 @@ func identityServer(t *testing.T) *httptest.Server {
 	a := newStaticAuth()
 	a.AddUser("john@example.com", "secret", testAccount)
 	be := memory.New()
-	db := objectdb.New(be, lease.NewInProcess(be))
+	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
 	p := runtime.NewProcessor()
 	core := runtime.DefaultCoreCapabilities()
 	policy := NewStaticSendPolicy()

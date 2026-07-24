@@ -97,7 +97,7 @@ func newWorkerServer(t *testing.T, limits SubmissionLimits, wcfg SubmissionWorke
 	a := newStaticAuth()
 	a.AddUser("john@example.com", "secret", testAccount)
 	be := memory.New()
-	db := objectdb.New(be, lease.NewInProcess(be))
+	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
 	store := kvstore.New(memory.New())
 	p := runtime.NewProcessor()
 	core := runtime.DefaultCoreCapabilities()
@@ -186,7 +186,7 @@ func recString(rec objectdb.Object, prop string) string {
 
 func TestWorkerConfigInvariant(t *testing.T) {
 	be := memory.New()
-	db := objectdb.New(be, lease.NewInProcess(be))
+	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
 	store := kvstore.New(memory.New())
 	q := newSubmissionQueue(db, store)
 	if _, err := NewSubmissionWorker(q, &fakeSubmitter{}, SubmissionWorkerConfig{
@@ -654,8 +654,9 @@ func TestWorkerClaimTokenCollisionResistant(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		obj["nextAttemptAt"] = mustJSON(clock.now().UTC().Format(time.RFC3339))
-		return u.Put(TypeEmailSubmission, jmap.Id(id), obj)
+		next := cloneObject(obj)
+		next["nextAttemptAt"] = mustJSON(clock.now().UTC().Format(time.RFC3339))
+		return u.Put(TypeEmailSubmission, jmap.Id(id), next)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -717,8 +718,9 @@ func TestWorkerStaleFinalizeDropped(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		obj["claimedAt"] = mustJSON(current)
-		return u.Put(TypeEmailSubmission, jmap.Id(id), obj)
+		next := cloneObject(obj)
+		next["claimedAt"] = mustJSON(current)
+		return u.Put(TypeEmailSubmission, jmap.Id(id), next)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -979,7 +981,7 @@ func TestWorkerMinAttemptsFloor(t *testing.T) {
 // first retry uses the default fast backoff rather than the 8h plateau.
 func TestWorkerEmptyRetryScheduleUsesDefault(t *testing.T) {
 	be := memory.New()
-	db := objectdb.New(be, lease.NewInProcess(be))
+	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
 	store := kvstore.New(memory.New())
 	w, err := NewSubmissionWorker(newSubmissionQueue(db, store), &fakeSubmitter{},
 		SubmissionWorkerConfig{RetrySchedule: []time.Duration{}})
@@ -999,7 +1001,7 @@ func TestWorkerEmptyRetryScheduleUsesDefault(t *testing.T) {
 // pinned-seam timing assertion in this file relies on.
 func TestWorkerBackoffJitterBounds(t *testing.T) {
 	be := memory.New()
-	db := objectdb.New(be, lease.NewInProcess(be))
+	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
 	store := kvstore.New(memory.New())
 	w, err := NewSubmissionWorker(newSubmissionQueue(db, store), &fakeSubmitter{},
 		SubmissionWorkerConfig{RetrySchedule: []time.Duration{time.Minute}, RetryPlateau: 10 * time.Minute})
