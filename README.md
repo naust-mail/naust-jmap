@@ -220,11 +220,11 @@ them apart, so this is an operational choice, not an architectural one - pick by
 importing, since a store you do not import is absent from the binary and from
 the dependency graph.
 
-| Store | Shape | Choose it when |
-|---|---|---|
-| `kvstore` | Each blob is one value in the backend | Blobs are reliably small **and you can bound both blob size and ingress concurrency**. Fewest writes per blob, and blobs commit in the same transaction as the objects referencing them. Cost: an arriving blob is held whole in memory, so peak scales with blob size times concurrent writers - see the warning below. |
-| `chunkstore` | Fixed-size pieces plus a manifest | Blobs can be large or the size is not known in advance. Memory stays flat regardless of blob size, still transactional, at the cost of several writes per blob. The default for mail. |
-| `fsstore` | One file per blob, tmp-then-rename | Throughput on large blobs matters more than transactional coupling. A transactional store has to journal every byte it takes; this does not. Cost: blobs no longer commit with the objects referencing them (the ordering is chosen so the survivable inconsistency is an unreferenced blob, which the sweeper reclaims). |
+| Store        | Shape                                 | Choose it when                                                                                                                                                                                                                                                                                                            |
+|--------------|---------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `kvstore`    | Each blob is one value in the backend | Blobs are reliably small **and you can bound both blob size and ingress concurrency**. Fewest writes per blob, and blobs commit in the same transaction as the objects referencing them. Cost: an arriving blob is held whole in memory, so peak scales with blob size times concurrent writers - see the warning below.  |
+| `chunkstore` | Fixed-size pieces plus a manifest     | Blobs can be large or the size is not known in advance. Memory stays flat regardless of blob size, still transactional, at the cost of several writes per blob. The default for mail.                                                                                                                                     |
+| `fsstore`    | One file per blob, tmp-then-rename    | Throughput on large blobs matters more than transactional coupling. A transactional store has to journal every byte it takes; this does not. Cost: blobs no longer commit with the objects referencing them (the ordering is chosen so the survivable inconsistency is an unreferenced blob, which the sweeper reclaims). |
 
 > **`kvstore`'s memory is attacker-controlled.** It holds each arriving blob whole
 > in memory, and both factors in `size x concurrency` are normally chosen by the
@@ -271,27 +271,29 @@ delivering a message both ways, and reading it back over JMAP. With no
 <details>
 <summary>RFC 8621 support matrix</summary>
 
-| Object / method                             | Status  | Notes                                                                                               |
-|---------------------------------------------|---------|-----------------------------------------------------------------------------------------------------|
-| `Mailbox/get`, `/query`, `/changes`         | Yes     | 18 IANA roles, tree with a depth limit, computed `myRights`                                         |
-| `Mailbox/set`                               | Yes     | create/update/destroy, `onDestroyRemoveEmails` cascade                                              |
-| Mailbox counters                            | Yes     | `totalEmails`, `unreadEmails`, `totalThreads`, `unreadThreads` (section 2.1, trash-aware)           |
-| `Thread/get`, `/changes`                    | Yes     | References + subject grouping; Threads never merge (see Design decisions)                           |
-| `Email/get`                                 | Yes     | stored fast fields + on-demand MIME parse; `header:{name}:as{Form}:all` parsed forms                |
-| `Email/query`                               | Yes     | every section 4.4.1 condition, section 4.4.2 sort, `collapseThreads`, fast total                    |
-| `Email/set` (keywords, mailboxIds, destroy) | Yes     | flag and file existing mail; per-record atomic                                                      |
-| `Email/set` (create / compose)              | Yes     | strict-reject message generation from parts (see Design decisions)                                  |
-| `Email/import`, `Email/parse`               | Yes     | ingest a blob; parse without storing (`notParsable`, section 4.9, not yet split from serverFail)    |
-| `Email/copy`                                | Yes     | cross-account copy with `onSuccessDestroyOriginal`                                                  |
-| `SearchSnippet/get`                         | Yes     | highlighted subject and body preview                                                                |
-| Delivery (LMTP, HTTP ingest)                | Yes     | transport-agnostic `Deliverer`; RFC 2033 LMTP; host-provided recipient `Resolver`                   |
-| `EmailDelivery` push type                   | Yes     | section 1.5 method-less push; state advances on new mail only                                       |
-| `Identity/get`, `/changes`, `/set`          | Yes     | section 6 defaults, `SendPolicy`-gated creation, immutable `email`                                  |
-| `EmailSubmission` (all methods)             | Yes     | section 7 envelope derivation, section 7.5 error taxonomy, `onSuccessUpdateEmail/Destroy`           |
-| Sending worker + SMTP relay                 | Yes     | records-as-queue worker (see Design decisions); reference `Submitter` over SMTP, RFC 3461           |
-| FUTURERELEASE (RFC 4865)                    | Yes     | native holds via `sendAt`; over-limit or conflicting holds rejected, not clamped                    |
-| `VacationResponse`                          | Planned | own capability (section 8), a later module                                                          |
-| Mail/Submission capability objects          | Yes     | `maxMailboxesPerEmail`, `maxSizeAttachmentsPerEmail`, `maxDelayedSend`, etc. (sections 1.3.1/1.3.2) |
+| Object / method                             | Status | Notes                                                                                                  |
+|---------------------------------------------|--------|--------------------------------------------------------------------------------------------------------|
+| `Mailbox/get`, `/query`, `/changes`         | Yes    | 18 IANA roles, tree with a depth limit, computed `myRights`                                            |
+| `Mailbox/set`                               | Yes    | create/update/destroy, `onDestroyRemoveEmails` cascade                                                 |
+| Mailbox counters                            | Yes    | `totalEmails`, `unreadEmails`, `totalThreads`, `unreadThreads` (section 2.1, trash-aware)              |
+| `Thread/get`, `/changes`                    | Yes    | References + subject grouping; Threads never merge (see Design decisions)                              |
+| `Email/get`                                 | Yes    | stored fast fields + on-demand MIME parse; `header:{name}:as{Form}:all` parsed forms                   |
+| `Email/query`                               | Yes    | every section 4.4.1 condition, section 4.4.2 sort, `collapseThreads`, fast total                       |
+| `Email/set` (keywords, mailboxIds, destroy) | Yes    | flag and file existing mail; per-record atomic                                                         |
+| `Email/set` (create / compose)              | Yes    | strict-reject message generation from parts (see Design decisions)                                     |
+| `Email/import`, `Email/parse`               | Yes    | ingest a blob; parse without storing (`notParsable`, section 4.9, not yet split from serverFail)       |
+| `Email/copy`                                | Yes    | cross-account copy with `onSuccessDestroyOriginal`                                                     |
+| `SearchSnippet/get`                         | Yes    | highlighted subject and body preview                                                                   |
+| Delivery (LMTP, HTTP ingest)                | Yes    | transport-agnostic `Deliverer`; RFC 2033 LMTP; host-provided recipient `Resolver`                      |
+| `EmailDelivery` push type                   | Yes    | section 1.5 method-less push; state advances on new mail only                                          |
+| `Identity/get`, `/changes`, `/set`          | Yes    | section 6 defaults, `SendPolicy`-gated creation, immutable `email`                                     |
+| `EmailSubmission` (all methods)             | Yes    | section 7 envelope derivation, section 7.5 error taxonomy, `onSuccessUpdateEmail/Destroy`              |
+| Sending worker + SMTP relay                 | Yes    | records-as-queue worker (see Design decisions); reference `Submitter` over SMTP, RFC 3461              |
+| FUTURERELEASE (RFC 4865)                    | Yes    | native holds via `sendAt`; over-limit or conflicting holds rejected, not clamped                       |
+| Trace stamping at delivery                  | Yes    | `Return-Path` + `Received` prefixed as the message streams in (RFC 5321 section 4.4); no FOR clause    |
+| DSN/MDN ingestion                           | Yes    | ENVID = submission id (RFC 3461); RFC 3464/8098 parsed into `deliveryStatus`/`dsnBlobIds`/`mdnBlobIds` |
+| `VacationResponse/get`, `/set`              | Yes    | section 8 singleton; delivery-side responder per RFC 3834 through the one submission queue             |
+| Mail/Submission capability objects          | Yes    | `maxMailboxesPerEmail`, `maxSizeAttachmentsPerEmail`, `maxDelayedSend`, etc. (sections 1.3.1/1.3.2)    |
 
 Search is a swappable interface (`mail.Searcher`); the built-in implementation
 is case-insensitive substring matching. MDN (RFC 9007), S/MIME verification
@@ -306,9 +308,8 @@ above) reads, composes and sends, over either the sqlite or postgres driver
 (the latter including a multi-node cluster hint layer). Coming next, in
 order:
 
-- DSN/MDN ingestion into `EmailSubmission` (`dsnBlobIds`, final
-  `deliveryStatus`), and `VacationResponse`
-- MDN, S/MIME verification, and quotas as further RFC 8621-family modules
+- MDN send/parse (RFC 9007), S/MIME verification, and quotas as further
+  RFC 8621-family modules
 
 ## License
 

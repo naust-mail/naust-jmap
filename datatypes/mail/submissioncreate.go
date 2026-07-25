@@ -181,11 +181,14 @@ func (h submissionCreate) prepare(ctx context.Context, call *runtime.Call, acct,
 		"sendAt":         sendAtRaw,
 		"undoStatus":     mustJSON(undoPending),
 		"deliveryStatus": mustJSON(ds),
-		"dsnBlobIds":     json.RawMessage(`[]`),
-		"mdnBlobIds":     json.RawMessage(`[]`),
 		"attempts":       json.RawMessage(`0`),
 		"nextAttemptAt":  sendAtRaw,
 		"blobId":         email["blobId"],
+	}
+	// The message's Message-ID, indexed for inbound report correlation
+	// (RFC 8098 section 3.2.5's Original-Message-ID; the DSN fallback).
+	if mid := messageIDHeader(msg.msg.Headers); mid != "" {
+		record["messageId"] = mustJSON(mid)
 	}
 	return &preparedSubmission{
 		record:          record,
@@ -224,8 +227,9 @@ func (h submissionCreate) commit(u *objectdb.Update, prepared any) (jmap.Id, obj
 		"sendAt":         ps.record["sendAt"],
 		"undoStatus":     ps.record["undoStatus"],
 		"deliveryStatus": ps.record["deliveryStatus"],
-		"dsnBlobIds":     ps.record["dsnBlobIds"],
-		"mdnBlobIds":     ps.record["mdnBlobIds"],
+		// The computed report lists are empty by construction at create.
+		"dsnBlobIds": json.RawMessage(`[]`),
+		"mdnBlobIds": json.RawMessage(`[]`),
 	}
 	if ps.envelopeChanged {
 		echo["envelope"] = ps.record["envelope"]

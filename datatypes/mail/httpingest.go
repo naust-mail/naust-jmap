@@ -43,6 +43,10 @@ const defaultMaxIngestInFlight = 64
 // HTTPIngest is an http.Handler that ingests one message per POST.
 type HTTPIngest struct {
 	d *Deliverer
+	// hostname names this server in the Received stamp's BY clause (RFC 5321
+	// section 4.4). Empty means the handler describes no transport hop and
+	// deliveries get the Return-Path line only.
+	hostname string
 	// slots bounds the requests being served at once; a request beyond the
 	// ceiling is told to come back rather than served without room for it.
 	slots chan struct{}
@@ -55,6 +59,15 @@ type HTTPIngestOption func(*HTTPIngest)
 // Beyond it a request is answered 503 with a Retry-After.
 func WithMaxIngestInFlight(n int) HTTPIngestOption {
 	return func(h *HTTPIngest) { h.slots = make(chan struct{}, n) }
+}
+
+// WithIngestHostname names this server in the Received stamp each delivered
+// message gets (RFC 5321 section 4.4, the BY clause). Without it the handler
+// stamps Return-Path only: HTTP has no registered WITH protocol value and no
+// LHLO-style peer claim, so the stamp records the observed peer address and
+// this name, nothing claimed.
+func WithIngestHostname(name string) HTTPIngestOption {
+	return func(h *HTTPIngest) { h.hostname = name }
 }
 
 // NewHTTPIngest wraps a Deliverer as an HTTP ingest handler.
@@ -107,7 +120,12 @@ func (h *HTTPIngest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	env := Envelope{MailFrom: r.Header.Get(headerMailFrom), Recipients: rcpts}
+	env := Envelope{
+		MailFrom:   r.Header.Get(headerMailFrom),
+		Recipients: rcpts,
+		PeerAddr:   r.RemoteAddr,
+		LocalName:  h.hostname,
+	}
 	events := h.d.Deliver(r.Context(), env, r.Body)
 
 	results := make([]httpResult, len(events))

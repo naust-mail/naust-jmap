@@ -43,7 +43,6 @@ const (
 // says destroying the Email MUST NOT affect the submission (section 7.5),
 // and the blob reference keeps GC off the bytes of a pending send.
 func EmailSubmissionType() *descriptor.Type {
-	emptyList := json.RawMessage(`[]`)
 	return &descriptor.Type{
 		Name:       TypeEmailSubmission,
 		Capability: SubmissionCapabilityURI,
@@ -59,12 +58,11 @@ func EmailSubmissionType() *descriptor.Type {
 			"sendAt":     {Kind: descriptor.KindDate, Immutable: true, ServerSet: true},
 			"undoStatus": {Kind: descriptor.KindString},
 			// deliveryStatus is SUPPORTED (never null): per-recipient
-			// status from creation on, updated by the sending worker.
+			// status from creation on, updated by the sending worker and by
+			// ingested reports. dsnBlobIds/mdnBlobIds are NOT stored: they
+			// are computed on /get from the SubmissionReport records, so the
+			// submission record never grows with received reports.
 			"deliveryStatus": {Kind: descriptor.KindObject, ServerSet: true},
-			// DSN/MDN ingestion is not yet implemented; the lists exist
-			// (and stay empty) so the schema is already shaped for it.
-			"dsnBlobIds": {Kind: descriptor.KindArray, ServerSet: true, Default: emptyList},
-			"mdnBlobIds": {Kind: descriptor.KindArray, ServerSet: true, Default: emptyList},
 			// Queue mechanics, invisible to the client.
 			"attempts": {Kind: descriptor.KindUnsignedInt, Internal: true},
 			// nextAttemptAt is indexed: key order is due order, which IS
@@ -79,6 +77,10 @@ func EmailSubmissionType() *descriptor.Type {
 			// index (nextAttemptAt) carries claim expiry.
 			"claimedAt": {Kind: descriptor.KindString, Internal: true},
 			"blobId":    {Kind: descriptor.KindId, BlobRef: true, Internal: true},
+			// The sent message's Message-ID, indexed so an inbound MDN
+			// (Original-Message-ID, RFC 8098 section 3.2.5) or an opted-in
+			// DSN fallback can find the submission it reports on.
+			"messageId": {Kind: descriptor.KindString, Internal: true, Indexed: true},
 		},
 	}
 }
@@ -99,6 +101,11 @@ func RegisterEmailSubmission(p *runtime.Processor, db *objectdb.DB, store blob.S
 	if policy == nil {
 		policy = NewStaticSendPolicy()
 	}
+	// The internal SubmissionReport records (received DSNs/MDNs) live in the
+	// same db; no JMAP methods, so registered with the database only.
+	if err := db.RegisterType(submissionReportType()); err != nil {
+		return nil, err
+	}
 	q := newSubmissionQueue(db, store)
 	creator := submissionCreate{db: db, store: store, policy: policy, limits: limits}
 	ext := &runtime.Extensions{
@@ -109,14 +116,23 @@ func RegisterEmailSubmission(p *runtime.Processor, db *objectdb.DB, store blob.S
 				Check: checkOnSuccessArgs,
 			},
 		},
+		// The section 7 default is all properties, which for this type
+		// includes the two computed report lists.
+		DefaultGetProperties: []string{
+			"identityId", "emailId", "threadId", "envelope", "sendAt",
+			"undoStatus", "deliveryStatus", "dsnBlobIds", "mdnBlobIds",
+		},
+		Computed: submissionComputed{db: db},
 		Set: &runtime.SetHooks{
 			// Updates are the cancel transition only; creation is the
 			// submission pipeline (submissioncreate.go), prepared outside
 			// the account lease like every other producer. Destroy is
 			// plain record removal: it MUST NOT affect the deliveries it
 			// represents (section 7.5), and the worker tolerates a
-			// claimed record vanishing.
+			// claimed record vanishing - but it takes the submission's
+			// report records (and so their blob references) with it.
 			Validate:      submissionValidate,
+			Destroy:       submissionDestroy,
 			PrepareCreate: creator.prepare,
 			CommitCreate:  creator.commit,
 			AfterSet:      submissionAfterSet(db, p, q),
@@ -164,6 +180,67 @@ func submissionValidate(_ *objectdb.Update, old, new objectdb.Object, _ map[stri
 		return serr, nil
 	}
 	new["deliveryStatus"] = ds
+	return nil, nil
+}
+
+// submissionComputed resolves dsnBlobIds and mdnBlobIds on /get (section
+// 7): each is the blob list of the reports received for the submission, in
+// receipt order, projected from the SubmissionReport records. One report
+// may consume several state-machine slots (a multi-recipient DSN), so the
+// projection deduplicates blob ids.
+type submissionComputed struct{ db *objectdb.DB }
+
+func (submissionComputed) Accepts(name string) bool {
+	return name == "dsnBlobIds" || name == "mdnBlobIds"
+}
+
+func (c submissionComputed) Resolve(ctx context.Context, acct jmap.Id, stored objectdb.Object, names []string, _ map[string]json.RawMessage) (map[string]json.RawMessage, error) {
+	var id jmap.Id
+	json.Unmarshal(stored["id"], &id)
+	rows, err := loadReportRows(
+		func(t string, rid jmap.Id) (objectdb.Object, error) { return c.db.Get(ctx, acct, t, rid) },
+		func(t, prop string, v json.RawMessage) ([]jmap.Id, error) {
+			return c.db.IdsWhereEqual(ctx, acct, t, prop, v)
+		}, id)
+	if err != nil {
+		return nil, err
+	}
+	blobs := func(kind string) json.RawMessage {
+		out := []jmap.Id{}
+		seen := map[jmap.Id]bool{}
+		for _, r := range rows {
+			if r.kind == kind && !seen[r.blobId] {
+				seen[r.blobId] = true
+				out = append(out, r.blobId)
+			}
+		}
+		return mustJSON(out)
+	}
+	resolved := make(map[string]json.RawMessage, len(names))
+	for _, name := range names {
+		switch name {
+		case "dsnBlobIds":
+			resolved[name] = blobs(reportKindDSN)
+		case "mdnBlobIds":
+			resolved[name] = blobs(reportKindMDN)
+		}
+	}
+	return resolved, nil
+}
+
+// submissionDestroy removes a destroyed submission's report records in the
+// same commit, releasing their blob references: with the submission gone
+// there is no object the reports could ever be fetched through.
+func submissionDestroy(u *objectdb.Update, id jmap.Id, _ map[string]json.RawMessage) (*jmap.SetError, error) {
+	ids, err := u.IdsWhereEqual(TypeSubmissionReport, "submissionId", mustJSON(id))
+	if err != nil {
+		return nil, err
+	}
+	for _, rid := range ids {
+		if err := u.Destroy(TypeSubmissionReport, rid); err != nil {
+			return nil, err
+		}
+	}
 	return nil, nil
 }
 

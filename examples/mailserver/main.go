@@ -317,6 +317,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if err := mail.RegisterVacationResponse(proc, db); err != nil {
+		log.Fatal(err)
+	}
 
 	srv, err := runtime.NewServer(users, proc, "http://"+*httpAddr, core)
 	if err != nil {
@@ -326,6 +329,9 @@ func main() {
 		log.Fatal(err)
 	}
 	if err := srv.RegisterCapability(mail.SubmissionCapabilityURI, struct{}{}, mail.SubmissionAccountCapabilityFor(limits)); err != nil {
+		log.Fatal(err)
+	}
+	if err := srv.RegisterCapability(mail.VacationCapabilityURI, struct{}{}, struct{}{}); err != nil {
 		log.Fatal(err)
 	}
 	// Binary data (RFC 8620 section 6) and push (section 7): blob
@@ -396,7 +402,12 @@ func main() {
 
 	// Delivery: the same Deliverer feeds both adapters, so LMTP and HTTP
 	// ingest produce identical Emails and identical per-recipient verdicts.
-	deliverer := mail.NewDeliverer(db, blobs, resolve)
+	// Report ingestion correlates inbound DSNs/MDNs with the submissions
+	// they report on, and the vacation responder answers per RFC 3834
+	// through the same submission queue everything else sends through.
+	deliverer := mail.NewDeliverer(db, blobs, resolve,
+		mail.WithReportIngestion(),
+		mail.WithVacationResponder(queue))
 
 	// The sending worker: real relay when -relay is set, loopback through
 	// the local Deliverer otherwise. Either way it is the same Submitter
@@ -456,7 +467,7 @@ func main() {
 	// adapter, everything else is the JMAP server (/api, /.well-known/jmap,
 	// /eventsource, the blob endpoints).
 	root := http.NewServeMux()
-	root.Handle("/ingest", mail.NewHTTPIngest(deliverer))
+	root.Handle("/ingest", mail.NewHTTPIngest(deliverer, mail.WithIngestHostname("mailserver.example")))
 	root.Handle("/login", users.LoginHandler())
 	root.Handle("/", srv)
 

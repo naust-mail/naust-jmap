@@ -235,6 +235,7 @@ type lmtpSession struct {
 	ctx      context.Context
 
 	greeted      bool
+	heloName     string // the peer's LHLO argument, for the Received stamp
 	haveFrom     bool
 	from         string
 	rcpts        []string // recipients that resolved (got a 2xx RCPT reply)
@@ -255,6 +256,7 @@ func (s *lmtpSession) resetTxn() {
 func (s *lmtpSession) lhlo(arg string) {
 	s.resetTxn()
 	s.greeted = true
+	s.heloName = arg
 	_ = s.tp.PrintfLine("250-%s", s.hostname)
 	_ = s.tp.PrintfLine("250-PIPELINING")
 	_ = s.tp.PrintfLine("250-ENHANCEDSTATUSCODES")
@@ -351,7 +353,18 @@ func (s *lmtpSession) data() bool {
 	_ = s.conn.SetReadDeadline(time.Now().Add(lmtpDataTimeout))
 
 	dr := s.tp.DotReader()
-	events := s.d.Deliver(s.ctx, Envelope{MailFrom: s.from, Recipients: s.rcpts}, dr)
+	// The envelope carries the hop for the Received stamp (RFC 5321 section
+	// 4.4): the LHLO claim, the observed peer address, "LMTP" as the WITH
+	// value (IANA Mail Transmission Types, registered by RFC 2033), and this
+	// server's name for the BY clause.
+	events := s.d.Deliver(s.ctx, Envelope{
+		MailFrom:   s.from,
+		Recipients: s.rcpts,
+		HeloName:   s.heloName,
+		PeerAddr:   s.conn.RemoteAddr().String(),
+		Protocol:   "LMTP",
+		LocalName:  s.hostname,
+	}, dr)
 	// Deliver may stop reading early (message too large); drain the rest of the
 	// dot-encoded body so the terminating "." is consumed and the command
 	// stream resyncs - but bound the drain. A body that keeps streaming past

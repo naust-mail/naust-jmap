@@ -74,10 +74,23 @@ func TestDeliverHappyPath(t *testing.T) {
 	if ev.EmailId == "" || ev.Account != testAccount {
 		t.Fatalf("event missing EmailId/Account: %+v", ev)
 	}
-	if ev.BlobId != blob.IdFor([]byte(simpleMessage)) {
-		t.Fatalf("blob id = %q, want content address", ev.BlobId)
+	// The stored blob is the trace-stamped message (RFC 5321 4.4): the
+	// Return-Path prefix followed by the original octets, and BlobId/Size
+	// name exactly those stored octets.
+	rc, _, err := store.Open(context.Background(), testAccount, ev.BlobId)
+	if err != nil {
+		t.Fatalf("open delivered blob: %v", err)
 	}
-	if ev.Size != int64(len(simpleMessage)) || ev.MessageId == "" {
+	stored, _ := io.ReadAll(rc)
+	rc.Close()
+	want := "Return-Path: <joe@example.com>\r\n" + simpleMessage
+	if string(stored) != want {
+		t.Fatalf("stored blob = %q, want Return-Path prefix + message", stored)
+	}
+	if ev.BlobId != blob.IdFor(stored) {
+		t.Fatalf("blob id = %q, want content address of stored octets", ev.BlobId)
+	}
+	if ev.Size != int64(len(want)) || ev.MessageId == "" {
 		t.Fatalf("size/messageId wrong: %+v", ev)
 	}
 

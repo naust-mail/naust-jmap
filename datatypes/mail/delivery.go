@@ -74,7 +74,7 @@ type DeliveryEvent struct {
 	Outcome    Outcome   // the verdict (see Outcome)
 	Reason     string    // short human/log reason, for a bounce or a log line
 	Account    jmap.Id   // resolved account, set when a recipient resolves
-	EmailId    jmap.Id   // the created Email, set only when Accepted
+	EmailId    jmap.Id   // the created Email, set only when Accepted (empty for a swallowed report, see WithReportIngestion)
 	BlobId     jmap.Id   // content-addressed blob id of the raw message
 	Size       int64     // octets of the raw message
 	ReceivedAt time.Time // server receive time (the Email's receivedAt)
@@ -87,6 +87,18 @@ type DeliveryEvent struct {
 type Envelope struct {
 	MailFrom   string
 	Recipients []string
+
+	// Trace describes the transport hop for the Received stamp (RFC 5321
+	// section 4.4), filled by the ingest adapter. LocalName is this server's
+	// name (the BY clause) and gates the stamp: when it is empty - a caller
+	// handing Deliver a message directly, with no hop to describe - only the
+	// Return-Path line is prefixed. HeloName is the peer's LHLO/HELO claim
+	// (untrusted; sanitized before use), PeerAddr its observed network
+	// address, and Protocol the IANA-registered WITH value ("" omits WITH).
+	HeloName  string
+	PeerAddr  string
+	Protocol  string
+	LocalName string
 }
 
 // Resolver maps an envelope recipient to the local account that should
@@ -139,6 +151,16 @@ type Deliverer struct {
 	resolver Resolver
 	sink     DeliverySink
 	maxSize  int64
+	// reports enables DSN/MDN ingestion (WithReportIngestion): a delivered
+	// report that correlates with an EmailSubmission updates it. Requires
+	// RegisterEmailSubmission on the same db.
+	reports bool
+	// msgIDFallback additionally correlates DSNs by the returned content's
+	// Message-ID (WithMessageIDCorrelation).
+	msgIDFallback bool
+	// vacationQ, when set (WithVacationResponder), enables the RFC 3834
+	// auto-responder and names the queue its replies are submitted through.
+	vacationQ *SubmissionQueue
 }
 
 // DelivererOption configures a Deliverer.
@@ -152,6 +174,29 @@ func WithMaxMessageSize(n int64) DelivererOption {
 // WithDeliverySink installs a sink for delivery outcomes (default: discard).
 func WithDeliverySink(s DeliverySink) DelivererOption {
 	return func(d *Deliverer) { d.sink = s }
+}
+
+// WithReportIngestion makes delivery recognize inbound delivery status
+// notifications (RFC 3464) and message disposition notifications (RFC 8098)
+// and apply them to the EmailSubmission they report on: deliveryStatus is
+// updated and the report becomes fetchable through dsnBlobIds/mdnBlobIds
+// (RFC 8621 section 7). Only messages with the null envelope sender are
+// considered (both formats require it), correlation is by the ENVID this
+// server stamps on relay (the submission id) or, for MDNs, the
+// Original-Message-ID. Uncorrelated reports are ordinary mail. Requires
+// RegisterEmailSubmission on the same db.
+func WithReportIngestion() DelivererOption {
+	return func(d *Deliverer) { d.reports = true }
+}
+
+// WithMessageIDCorrelation additionally correlates DSNs whose ENVID was
+// lost in transit by the returned content's Message-ID. A report matched
+// this way is recorded and shown but can never finalize deliveryStatus -
+// a Message-ID is quotable by anyone who saw the message, so it proves
+// less than the envelope ENVID does (RFC 3464 section 4.1 warns DSNs are
+// forgeable; the strong key stays the one this server itself stamped).
+func WithMessageIDCorrelation() DelivererOption {
+	return func(d *Deliverer) { d.msgIDFallback = true }
 }
 
 // NewDeliverer builds a Deliverer. db is where Emails land, store holds the
@@ -272,10 +317,21 @@ func (d *Deliverer) deliver(ctx context.Context, env Envelope, r io.Reader, even
 		}
 	}()
 
+	// The trace prefix (Return-Path + Received, RFC 5321 section 4.4) is
+	// streamed ahead of the message octets, so the blob store and the parser
+	// both see the stamped message and neither is ever handed the unstamped
+	// one. The prefix is server-built and small; the size cap governs the
+	// network octets, which the cappedReader still meters.
+	now := time.Now()
+	prefix := tracePrefix(env, now)
 	capped := &cappedReader{r: r, max: d.maxSize}
 	c := newCapture()
 	c.preview = true
-	msg, err := parseMessage(io.TeeReader(capped, bw), c)
+	// Reports are considered only from the null envelope sender, which both
+	// report formats mandate (RFC 3464 section 2, RFC 8098 section 3), so
+	// nothing else pays the capture and no non-report can correlate.
+	c.reports = d.reports && env.MailFrom == ""
+	msg, err := parseMessage(io.TeeReader(io.MultiReader(strings.NewReader(prefix), capped), bw), c)
 	switch {
 	case errors.Is(err, errTooLarge):
 		failAll(Rejected, "message too large")
@@ -285,9 +341,12 @@ func (d *Deliverer) deliver(ctx context.Context, env Envelope, r io.Reader, even
 		log.Printf("naust-jmap delivery: read error: %v", err)
 		return
 	}
-	size := capped.read
-	now := time.Now()
+	size := int64(len(prefix)) + capped.read
 	msgID := messageIDHeader(msg.msg.Headers)
+	var rep *inboundReport
+	if c.reports {
+		rep = extractReport(msg)
+	}
 
 	// Record the blob, publish its content, and create the Email in the first
 	// recipient's account under one hold of its account lease: the record is
@@ -302,7 +361,7 @@ func (d *Deliverer) deliver(ctx context.Context, env Envelope, r io.Reader, even
 	blobID := bw.ID()
 	var firstEmail jmap.Id
 	finalized, _, firstErr := d.db.FinalizeBlobUploadThenUpdate(ctx, targets[0].account, bw,
-		events[targets[0].idx].Recipient, now, d.inboxInsert(blobID, size, msg, now, &firstEmail))
+		events[targets[0].idx].Recipient, now, d.inboxInsert(blobID, size, msg, now, rep, &firstEmail))
 	if finalized == "" {
 		failAll(TempFailed, "temporary server error")
 		log.Printf("naust-jmap delivery: blob finalize: %v", firstErr)
@@ -318,7 +377,7 @@ func (d *Deliverer) deliver(ctx context.Context, env Envelope, r io.Reader, even
 		ev.MessageId = msgID
 		id, err := firstEmail, firstErr
 		if i > 0 {
-			id, err = d.copyAndDeliver(ctx, targets[0].account, t.account, blobID, ev.Recipient, size, msg, now)
+			id, err = d.copyAndDeliver(ctx, targets[0].account, t.account, blobID, ev.Recipient, size, msg, now, rep)
 		}
 		switch {
 		case err == nil:
@@ -333,6 +392,20 @@ func (d *Deliverer) deliver(ctx context.Context, env Envelope, r io.Reader, even
 			log.Printf("naust-jmap delivery: %s: %v", strconv.Quote(ev.Recipient), err)
 		}
 	}
+
+	// Auto-responses run after every verdict is settled: a reply is a
+	// consequence of a delivery, never a participant in it (RFC 8621
+	// section 8 delivers first, responds per RFC 3834 after). A swallowed
+	// report has no EmailId and gets no reply - an ingested DSN/MDN is
+	// automatic mail anyway, refused by the Auto-Submitted/null-sender
+	// gates.
+	if d.vacationQ != nil {
+		for _, t := range targets {
+			if ev := events[t.idx]; ev.Outcome == Accepted && ev.EmailId != "" {
+				d.maybeVacationReply(ctx, t.account, ev.Recipient, env, msg, now)
+			}
+		}
+	}
 }
 
 // copyAndDeliver gives one further recipient's account its own copy of the
@@ -342,7 +415,7 @@ func (d *Deliverer) deliver(ctx context.Context, env Envelope, r io.Reader, even
 // one hold of the target account's lease, same as the first recipient's. A
 // blobId is the content address (RFC 8620 section 6.1), so every copy of the
 // message has the same one.
-func (d *Deliverer) copyAndDeliver(ctx context.Context, from, to jmap.Id, blobID jmap.Id, recipient string, size int64, msg *parsed, now time.Time) (jmap.Id, error) {
+func (d *Deliverer) copyAndDeliver(ctx context.Context, from, to jmap.Id, blobID jmap.Id, recipient string, size int64, msg *parsed, now time.Time, rep *inboundReport) (jmap.Id, error) {
 	rc, _, err := d.store.Open(ctx, from, blobID)
 	if err != nil {
 		return "", err
@@ -363,7 +436,7 @@ func (d *Deliverer) copyAndDeliver(ctx context.Context, from, to jmap.Id, blobID
 	}
 	var id jmap.Id
 	finalized, _, err := d.db.FinalizeBlobUploadThenUpdate(ctx, to, w, recipient, now,
-		d.inboxInsert(blobID, size, msg, now, &id))
+		d.inboxInsert(blobID, size, msg, now, rep, &id))
 	committed = finalized != ""
 	return id, err
 }
@@ -402,8 +475,23 @@ func (c *cappedReader) Read(p []byte) (int, error) {
 // id. The blob is already recorded in the account by the finalize half of the
 // same lease hold, so the blobId passes the referential upload-record check
 // later Email/set operations apply.
-func (d *Deliverer) inboxInsert(blobID jmap.Id, size int64, msg *parsed, now time.Time, id *jmap.Id) func(u *objectdb.Update) error {
+//
+// When the message was recognized as a report (rep non-nil), ingestion runs
+// first, in the same lease hold: the submission update, the report records,
+// and the inbox Email all commit together or not at all. A matched report
+// that advanced nothing is swallowed - the hold commits without an Email and
+// id stays empty (see ingestReport).
+func (d *Deliverer) inboxInsert(blobID jmap.Id, size int64, msg *parsed, now time.Time, rep *inboundReport, id *jmap.Id) func(u *objectdb.Update) error {
 	return func(u *objectdb.Update) error {
+		if rep != nil {
+			matched, deliver, err := d.ingestReport(u, rep, blobID, now)
+			if err != nil {
+				return err
+			}
+			if matched && !deliver {
+				return nil
+			}
+		}
 		inbox, err := inboxMailboxId(u)
 		if err != nil {
 			return err

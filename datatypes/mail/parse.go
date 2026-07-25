@@ -44,9 +44,17 @@ type capture struct {
 	// previewBudget is what this message has left to spend on preview text,
 	// shared by every preview sink it installs (maxPreviewCapture).
 	previewBudget int
+	// reports requests the machine-parsable content of a delivery or
+	// disposition report (RFC 6522): the message/delivery-status or
+	// message/disposition-notification part, and the returned-content part
+	// the Message-ID of the original message can be read from. Set by a
+	// delivery ingesting reports; each captured part is bounded
+	// (maxReportCapture).
+	reports bool
 
-	previews   map[*message.Part]*previewSink
-	valueSinks map[*message.Part]*valueSink
+	previews    map[*message.Part]*previewSink
+	valueSinks  map[*message.Part]*valueSink
+	reportSinks map[*message.Part]*reportSink
 }
 
 // factory is the SinkFactory this capture installs. It is called once per leaf,
@@ -55,6 +63,18 @@ type capture struct {
 func (c *capture) factory() message.SinkFactory {
 	return func(p *message.Part) message.LeafSinks {
 		ls := message.LeafSinks{Identity: c.identity}
+		// The report parts (RFC 6522 section 3: the machine-parsable second
+		// part, and the returned content the original Message-ID is read
+		// from) are not text/*, so they are captured before the text gate.
+		if c.reports {
+			switch p.Type {
+			case "message/delivery-status", "message/disposition-notification",
+				"message/rfc822", "text/rfc822-headers":
+				s := &reportSink{}
+				c.reportSinks[p] = s
+				ls.Sinks = append(ls.Sinks, s)
+			}
+		}
 		if !strings.HasPrefix(p.Type, "text/") {
 			return ls
 		}
@@ -80,6 +100,7 @@ func newCapture() *capture {
 		previewBudget: maxPreviewCapture,
 		previews:      map[*message.Part]*previewSink{},
 		valueSinks:    map[*message.Part]*valueSink{},
+		reportSinks:   map[*message.Part]*reportSink{},
 	}
 }
 

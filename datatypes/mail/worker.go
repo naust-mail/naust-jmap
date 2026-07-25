@@ -60,6 +60,7 @@ import (
 	mrand "math/rand/v2"
 	"sort"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -643,7 +644,7 @@ func (w *SubmissionWorker) sendOne(ctx context.Context, acct jmap.Id, c claimedR
 	}
 	var results []RecipientResult
 	if len(rcpts) > 0 {
-		results = w.transmit(ctx, acct, env, blobId, rcpts)
+		results = w.transmit(ctx, acct, c.id, env, blobId, rcpts)
 	}
 	w.finalize(ctx, acct, c.id, c.stamp, results)
 }
@@ -656,7 +657,7 @@ func (w *SubmissionWorker) sendOne(ctx context.Context, acct jmap.Id, c claimedR
 // attempt produced no verdict for (a Submitter error, an unopenable
 // blob, or a result the Submitter omitted) temporarily fail with a
 // synthetic reply, so the normal backoff machinery owns the retry.
-func (w *SubmissionWorker) transmit(ctx context.Context, acct jmap.Id, env subEnvelope, blobId jmap.Id, rcpts []SubmissionRecipient) []RecipientResult {
+func (w *SubmissionWorker) transmit(ctx context.Context, acct, id jmap.Id, env subEnvelope, blobId jmap.Id, rcpts []SubmissionRecipient) []RecipientResult {
 	rd, size, err := w.q.store.Open(ctx, acct, blobId)
 	if err != nil {
 		return mergeResults(rcpts, nil, "451 4.2.0 message content unavailable")
@@ -664,9 +665,26 @@ func (w *SubmissionWorker) transmit(ctx context.Context, acct jmap.Id, env subEn
 	defer rd.Close()
 	tctx, cancel := context.WithTimeout(ctx, w.cfg.TransmitTimeout)
 	defer cancel()
+	// The submission id is stamped as the envelope's ENVID at transmit
+	// time, overriding any client value - RFC 8621 section 7 explicitly
+	// blesses this ("the server may also choose to set this itself... to
+	// the EmailSubmission id") - so a DSN that comes back (RFC 3461 section
+	// 5.4 returns the ENVID verbatim) names the submission it reports on.
+	// The stored record's envelope is untouched: the stamp exists on the
+	// wire only, and the Submitter drops it when the smarthost does not
+	// advertise DSN.
+	params := make(map[string]*string, len(env.MailFrom.Parameters)+1)
+	for k, v := range env.MailFrom.Parameters {
+		if strings.EqualFold(k, "ENVID") {
+			continue // overridden below, whatever its stored spelling
+		}
+		params[k] = v
+	}
+	envid := string(id)
+	params["ENVID"] = &envid
 	results, err := w.submit.Submit(tctx, SubmissionEnvelope{
 		MailFrom:       env.MailFrom.Email,
-		MailParameters: env.MailFrom.Parameters,
+		MailParameters: params,
 		Recipients:     rcpts,
 		Size:           size,
 	}, stripBcc(rd))

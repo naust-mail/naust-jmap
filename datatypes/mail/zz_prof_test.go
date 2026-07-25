@@ -30,13 +30,13 @@ func profPath(t *testing.T, name string) string {
 	return filepath.Join(dir, name)
 }
 
-func benchMessage(seq int) string {
+func benchMessage(seq int, to string) string {
 	payload := make([]byte, 1<<20) // 1 MiB, as the ingest benchmark uses
 	for i := range payload {
 		payload[i] = byte(i)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "From: joe@example.com\r\nTo: jane@example.com\r\n")
+	fmt.Fprintf(&b, "From: joe@example.com\r\nTo: %s\r\n", to)
 	fmt.Fprintf(&b, "Subject: profile %d\r\nMessage-ID: <%d@example.com>\r\n", seq, seq)
 	b.WriteString("MIME-Version: 1.0\r\n")
 	b.WriteString("Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\r\n")
@@ -71,7 +71,7 @@ func TestZZProfileDelivery(t *testing.T) {
 	const n = 30
 	msgs := make([]string, n)
 	for i := range msgs {
-		msgs[i] = benchMessage(i) // distinct, so dedup never short-circuits
+		msgs[i] = benchMessage(i, "jane@example.com") // distinct, so dedup never short-circuits
 	}
 	wire := len(msgs[0])
 
