@@ -41,6 +41,56 @@ var threadKeywordSorts = map[string]bool{
 	"someInThreadHaveKeyword": true,
 }
 
+// emailQueryHooks builds Email's /query customization. The record-local
+// declarations are what let Email/query answer canCalculateChanges:
+// true and Email/queryChanges (RFC 8620 section 5.6) compute real
+// diffs. Declared conditions and sorts read only the record's own
+// stored properties or its own message blob (blob-backed ones declare
+// no reads list: still record-local, never immutability-proven). The
+// three *InThreadHaveKeyword conditions and the two thread-keyword
+// sorts are deliberately ABSENT: their verdict reads sibling records,
+// so a query using them falls back to cannotCalculateChanges -
+// correctness over coverage. Thread is the group companion: threadId
+// values are Thread ids, and every membership change - including a
+// member's destroy - updates or destroys the Thread record in the same
+// commit, which is what makes collapsed diffs sound.
+func emailQueryHooks(db *objectdb.DB, searcher Searcher) *runtime.QueryHooks {
+	return &runtime.QueryHooks{
+		Filter:      emailFilter{db: db, searcher: searcher},
+		Sort:        emailSort{db: db},
+		CollapseKey: "threadId",
+		LocalConditions: map[string][]string{
+			"inMailbox":          {"mailboxIds"},
+			"inMailboxOtherThan": {"mailboxIds"},
+			"before":             {"receivedAt"},
+			"after":              {"receivedAt"},
+			"minSize":            {"size"},
+			"maxSize":            {"size"},
+			"hasKeyword":         {"keywords"},
+			"notKeyword":         {"keywords"},
+			"hasAttachment":      {"hasAttachment"},
+			"text":               nil,
+			"from":               nil,
+			"to":                 nil,
+			"cc":                 nil,
+			"bcc":                nil,
+			"subject":            nil,
+			"body":               nil,
+			"header":             nil,
+		},
+		LocalSorts: map[string][]string{
+			"receivedAt": {"receivedAt"},
+			"sentAt":     {"sentAt"},
+			"size":       {"size"},
+			"from":       {"from"},
+			"to":         {"to"},
+			"subject":    {"subject"},
+			"hasKeyword": {"keywords"},
+		},
+		GroupCompanion: TypeThread,
+	}
+}
+
 // ---- filter ----
 
 type emailFilter struct {
@@ -106,9 +156,29 @@ func (emailFilter) EnterRecord(ctx context.Context) context.Context {
 	return context.WithValue(ctx, parseCacheKey{}, &parseCache{})
 }
 
-// ConditionSet answers the two membership conditions from the set index;
+// ConditionSet answers the two membership conditions from the set index
+// and the before/after date window from the receivedAt range index;
 // every other condition returns ok=false and is left to the predicate.
 func (f emailFilter) ConditionSet(ctx context.Context, acct jmap.Id, name string, value json.RawMessage) ([]jmap.Id, bool, bool, error) {
+	switch name {
+	case "before", "after":
+		// The index bound is inclusive on both primitives while the
+		// section 4.4.1 conditions are half-open, so the returned set is
+		// a SUPERSET (by at most the boundary instant) - exact stays
+		// false and the authoritative predicate trims the edge. That is
+		// the planner's contract: a producer only ever narrows.
+		var ids []jmap.Id
+		var err error
+		if name == "before" {
+			ids, err = f.db.IdsWhereAtMost(ctx, acct, TypeEmail, "receivedAt", value, 0)
+		} else {
+			ids, err = f.db.IdsWhereAtLeast(ctx, acct, TypeEmail, "receivedAt", value, 0)
+		}
+		if err != nil {
+			return nil, false, false, err
+		}
+		return ids, false, true, nil
+	}
 	var prop, member string
 	switch name {
 	case "inMailbox":
@@ -135,7 +205,7 @@ func (f emailFilter) MatchCondition(ctx context.Context, acct jmap.Id, obj objec
 	switch name {
 	case "inMailbox":
 		id, _ := decodeString(value)
-		return objectKeys(obj["mailboxIds"])[id], nil
+		return hasKey(obj["mailboxIds"], id), nil
 	case "inMailboxOtherThan":
 		var exclude []string
 		json.Unmarshal(value, &exclude)
@@ -158,9 +228,9 @@ func (f emailFilter) MatchCondition(ctx context.Context, acct jmap.Id, obj objec
 	case "maxSize":
 		return emailUint(obj, "size") < uintVal(value), nil
 	case "hasKeyword":
-		return objectKeys(obj["keywords"])[keywordArg(value)], nil
+		return hasKey(obj["keywords"], keywordArg(value)), nil
 	case "notKeyword":
-		return !objectKeys(obj["keywords"])[keywordArg(value)], nil
+		return !hasKey(obj["keywords"], keywordArg(value)), nil
 	case "hasAttachment":
 		want, _ := rawjson.Bool(value)
 		got, _ := rawjson.Bool(obj["hasAttachment"])
@@ -189,7 +259,7 @@ func (f emailFilter) MatchCondition(ctx context.Context, acct jmap.Id, obj objec
 // members through the threadId index.
 func (f emailFilter) threadKeyword(ctx context.Context, acct jmap.Id, obj objectdb.Object, keyword string) (all, some bool, err error) {
 	tid := threadIdOf(obj)
-	ids, err := f.db.IdsWhereEqual(ctx, acct, TypeEmail, "threadId", mustJSON(tid))
+	ids, err := f.db.IdsWhereEqual(ctx, acct, TypeEmail, "threadId", mustJSON(tid), 0)
 	if err != nil {
 		return false, false, err
 	}
@@ -199,7 +269,7 @@ func (f emailFilter) threadKeyword(ctx context.Context, acct jmap.Id, obj object
 		if err != nil {
 			return false, false, err
 		}
-		if objectKeys(member["keywords"])[keyword] {
+		if hasKey(member["keywords"], keyword) {
 			some = true
 		} else {
 			all = false
@@ -253,7 +323,7 @@ func (s emailSort) ParseSort(ctx context.Context, acct jmap.Id, raws []json.RawM
 		if v, ok := cache[key]; ok {
 			return v
 		}
-		ids, err := s.db.IdsWhereEqual(ctx, acct, TypeEmail, "threadId", mustJSON(tid))
+		ids, err := s.db.IdsWhereEqual(ctx, acct, TypeEmail, "threadId", mustJSON(tid), 0)
 		res := all
 		if err == nil {
 			for _, id := range ids {
@@ -261,7 +331,7 @@ func (s emailSort) ParseSort(ctx context.Context, acct jmap.Id, raws []json.RawM
 				if err != nil {
 					continue
 				}
-				has := objectKeys(m["keywords"])[keyword]
+				has := hasKey(m["keywords"], keyword)
 				if all && !has {
 					res = false
 				}
@@ -280,26 +350,40 @@ func (s emailSort) ParseSort(ctx context.Context, acct jmap.Id, raws []json.RawM
 	// large enough for the sort to matter) redecodes and recomputes its date,
 	// address, subject, or keyword set from scratch every single time it is
 	// compared. Caching by id turns that into one computation per record.
-	dateCache := map[string]time.Time{}
-	addrCache := map[string]string{}
+	// Each property gets its own map so the cache key is the record id
+	// alone: a lookup keyed by string(id) compiles to a no-alloc probe,
+	// where a concatenated id+property key would allocate on every one of
+	// the O(N log N) comparisons just to be hashed and thrown away.
+	recvDateCache := map[string]time.Time{}
+	sentDateCache := map[string]time.Time{}
+	fromCache := map[string]string{}
+	toCache := map[string]string{}
 	subjectCache := map[string]string{}
 	kwCache := map[string]map[string]bool{}
 	getDate := func(obj objectdb.Object, name string) time.Time {
-		key := string(obj["id"]) + "\x00" + name
-		if v, ok := dateCache[key]; ok {
+		c := recvDateCache
+		if name == "sentAt" {
+			c = sentDateCache
+		}
+		id := obj["id"]
+		if v, ok := c[string(id)]; ok {
 			return v
 		}
 		v := emailDate(obj, name)
-		dateCache[key] = v
+		c[string(id)] = v
 		return v
 	}
 	getAddr := func(obj objectdb.Object, field string) string {
-		key := string(obj["id"]) + "\x00" + field
-		if v, ok := addrCache[key]; ok {
+		c := fromCache
+		if field == "to" {
+			c = toCache
+		}
+		id := obj["id"]
+		if v, ok := c[string(id)]; ok {
 			return v
 		}
 		v := foldKey(firstAddr(obj, field))
-		addrCache[key] = v
+		c[string(id)] = v
 		return v
 	}
 	getSubject := func(obj objectdb.Object) string {

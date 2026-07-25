@@ -122,6 +122,18 @@ var ChangeLogRetention = 30 * 24 * time.Hour
 // well under ChangeLogRetention.
 var ChangeLogMaxEntries = 100000
 
+// QueryChangesMaxWork is the single work budget for one Foo/queryChanges
+// call (RFC 8620 section 5.6): it caps how many commits behind a client
+// state may be, how many coalesced changed ids the log walk may collect,
+// and how many group members a collapsed query may expand - each unit is
+// roughly one id held or one entry walked. Exceeding it refuses the call
+// as cannotCalculateChanges BEFORE the expensive work happens, which is
+// always safe: the client's fallback is re-running the query, roughly
+// the same cost as the answer the budget disallowed. 5.6 has no paging,
+// so a budget (not intermediate states) is what keeps a hostile or
+// long-absent client from turning the change log into unbounded work.
+var QueryChangesMaxWork = 4096
+
 // MaxFilterNodes bounds a filter tree's total node count (operators plus
 // condition leaves) in a Foo/query. CheckIJSON caps the request's JSON
 // nesting depth but not a FilterOperator's breadth: a client can pack tens of

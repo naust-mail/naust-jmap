@@ -7,7 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/providers/auth"
@@ -37,6 +37,9 @@ type Processor struct {
 	capabilities map[string]bool
 	// MaxCallsInRequest bounds methodCalls length; zero means no bound.
 	MaxCallsInRequest int
+	// verifyQueryProjection enables the projected-evaluation assertion
+	// mode for test builds (see VerifyQueryProjection).
+	verifyQueryProjection bool
 }
 
 type method struct {
@@ -54,6 +57,20 @@ func NewProcessor() *Processor {
 	p.Register("Core/echo", jmap.CoreCapability, echo)
 	return p
 }
+
+// VerifyQueryProjection is an assertion mode for test builds. Query
+// evaluation loads records materializing only the properties the
+// type's QueryHooks reads declarations enumerate; a declaration that
+// omits a property its hook actually reads would make the hook see the
+// property as absent and silently return wrong results. With this mode
+// set, every projected evaluation is re-run against fully decoded
+// records and any divergence fails the request with a named error -
+// catching the lying declaration at the exact query instead of
+// surfacing as corrupted client caches. The double evaluation is only
+// sound when nothing commits between the two runs, and it doubles the
+// cost of every projected query, so it is for serial test harnesses,
+// never production.
+func (p *Processor) VerifyQueryProjection() { p.verifyQueryProjection = true }
 
 // Register adds a method. Its capability is advertised as supported and
 // the method is callable only when the request opts in to it.
@@ -131,7 +148,7 @@ func (p *Processor) processCall(ctx context.Context, inv jmap.Invocation, ident 
 	// carries only a generic serverFail (RFC 8620 section 3.6.2).
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("naust-jmap: recovered panic in method %q: %v", inv.Name, r)
+			slog.Error("naust-jmap: recovered panic in method", "method", inv.Name, "panic", r)
 			out = []jmap.Invocation{jmap.ErrorInvocation(inv.CallID, jmap.MethodError{
 				Type:        jmap.ErrServerFail,
 				Description: "internal error",

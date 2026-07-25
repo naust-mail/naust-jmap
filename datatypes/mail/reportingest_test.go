@@ -326,7 +326,7 @@ func TestReportIngestDestroyReleasesReports(t *testing.T) {
 	h := newReportHarness(t, "destroy1@example.com")
 	h.deliverReport(t, dsnFor(h.subId, "jane@remote.example", "failed", "5.1.1", "550 5.1.1 unknown", ""))
 	ctx := context.Background()
-	ids, err := h.db.IdsWhereEqual(ctx, testAccount, TypeSubmissionReport, "submissionId", mustJSON(jmap.Id(h.subId)))
+	ids, err := h.db.IdsWhereEqual(ctx, testAccount, TypeSubmissionReport, "submissionId", mustJSON(jmap.Id(h.subId)), 0)
 	if err != nil || len(ids) != 1 {
 		t.Fatalf("report rows before destroy: %v %v", ids, err)
 	}
@@ -336,7 +336,7 @@ func TestReportIngestDestroyReleasesReports(t *testing.T) {
 	if destroyed, _ := methodArgs(t, r, 0, "EmailSubmission/set")["destroyed"].([]any); len(destroyed) != 1 {
 		t.Fatalf("destroy failed: %v", r.MethodResponses[0].Args)
 	}
-	ids, err = h.db.IdsWhereEqual(ctx, testAccount, TypeSubmissionReport, "submissionId", mustJSON(jmap.Id(h.subId)))
+	ids, err = h.db.IdsWhereEqual(ctx, testAccount, TypeSubmissionReport, "submissionId", mustJSON(jmap.Id(h.subId)), 0)
 	if err != nil || len(ids) != 0 {
 		t.Fatalf("report rows survived destroy: %v %v", ids, err)
 	}

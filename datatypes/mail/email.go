@@ -66,7 +66,11 @@ func EmailType() *descriptor.Type {
 			"mailboxIds": {Kind: descriptor.KindObject, SetIndexed: true},
 			"keywords":   {Kind: descriptor.KindObject, Default: json.RawMessage(`{}`), SetIndexed: true},
 			"size":       {Kind: descriptor.KindUnsignedInt, Immutable: true, ServerSet: true},
-			"receivedAt": {Kind: descriptor.KindDate, Immutable: true, ServerSet: true},
+			// receivedAt is indexed: the property is immutable, so each
+			// entry is written once at create, and the ordered index
+			// answers the section 4.4.1 before/after conditions as range
+			// reads instead of full scans.
+			"receivedAt": {Kind: descriptor.KindDate, Immutable: true, ServerSet: true, Indexed: true},
 			// Convenience header properties (section 4.1.3).
 			"messageId":  msgids,
 			"inReplyTo":  msgids,
@@ -154,13 +158,10 @@ func RegisterEmail(p *runtime.Processor, db *objectdb.DB, store blob.Store, core
 			CommitCreate:  creator.commit,
 		},
 		// Email/query (RFC 8621 section 4.4): the FilterCondition semantics
-		// (with an index producer for inMailbox/hasKeyword), the mail sort
-		// comparators, and collapseThreads keyed on threadId.
-		Query: &runtime.QueryHooks{
-			Filter:      emailFilter{db: db, searcher: searcher},
-			Sort:        emailSort{db: db},
-			CollapseKey: "threadId",
-		},
+		// (with index producers for inMailbox/hasKeyword and the
+		// before/after date window), the mail sort comparators, and
+		// collapseThreads keyed on threadId.
+		Query: emailQueryHooks(db, searcher),
 	}
 	if err := runtime.RegisterStandardTypeExt(p, db, EmailType(), core, ext); err != nil {
 		return err

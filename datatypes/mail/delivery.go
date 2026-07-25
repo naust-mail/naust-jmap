@@ -22,8 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
-	"strconv"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -245,7 +244,7 @@ func (d *Deliverer) Deliver(ctx context.Context, env Envelope, r io.Reader) (eve
 	defer func() { d.sink.Record(ctx, events) }()
 	defer func() {
 		if p := recover(); p != nil {
-			log.Printf("naust-jmap delivery: recovered panic: %v", p)
+			slog.Error("naust-jmap delivery: recovered panic", "panic", p)
 		}
 	}()
 	d.deliver(ctx, env, r, events)
@@ -307,7 +306,7 @@ func (d *Deliverer) deliver(ctx context.Context, env Envelope, r io.Reader, even
 	bw, err := d.store.Create(ctx, targets[0].account)
 	if err != nil {
 		failAll(TempFailed, "temporary server error")
-		log.Printf("naust-jmap delivery: blob create: %v", err)
+		slog.Error("naust-jmap delivery: blob create", "err", err)
 		return
 	}
 	committed := false
@@ -338,7 +337,7 @@ func (d *Deliverer) deliver(ctx context.Context, env Envelope, r io.Reader, even
 		return
 	case err != nil:
 		failAll(TempFailed, "read error")
-		log.Printf("naust-jmap delivery: read error: %v", err)
+		slog.Error("naust-jmap delivery: read error", "err", err)
 		return
 	}
 	size := int64(len(prefix)) + capped.read
@@ -364,7 +363,7 @@ func (d *Deliverer) deliver(ctx context.Context, env Envelope, r io.Reader, even
 		events[targets[0].idx].Recipient, now, d.inboxInsert(blobID, size, msg, now, rep, &firstEmail))
 	if finalized == "" {
 		failAll(TempFailed, "temporary server error")
-		log.Printf("naust-jmap delivery: blob finalize: %v", firstErr)
+		slog.Error("naust-jmap delivery: blob finalize", "err", firstErr)
 		return
 	}
 	committed = true
@@ -386,10 +385,12 @@ func (d *Deliverer) deliver(ctx context.Context, env Envelope, r io.Reader, even
 			ev.Outcome, ev.Reason = TempFailed, "no inbox mailbox"
 		default:
 			ev.Outcome, ev.Reason = TempFailed, "temporary server error"
-			// Quote the untrusted recipient so no control character it might
-			// carry can forge or escape a log line (defense in depth; the LMTP
-			// ingress already rejects control-char addresses at parse time).
-			log.Printf("naust-jmap delivery: %s: %v", strconv.Quote(ev.Recipient), err)
+			// The untrusted recipient goes in its own structured field rather
+			// than interpolated into the message, so no control character it
+			// might carry can forge or escape a log line (defense in depth; the
+			// LMTP ingress already rejects control-char addresses at parse
+			// time).
+			slog.Error("naust-jmap delivery", "recipient", ev.Recipient, "err", err)
 		}
 	}
 

@@ -137,9 +137,27 @@ func RegisterEmailSubmission(p *runtime.Processor, db *objectdb.DB, store blob.S
 			CommitCreate:  creator.commit,
 			AfterSet:      submissionAfterSet(db, p, q),
 		},
+		// EmailSubmission's whole filter and sort surface reads only the
+		// record's own stored properties, so every EmailSubmission query
+		// is change-calculable (RFC 8620 section 5.6). Both "sendAt" and
+		// the section 7.3 alias "sentAt" name the same stored property.
 		Query: &runtime.QueryHooks{
 			Filter: submissionFilter{},
 			Sort:   submissionSort{},
+			LocalConditions: map[string][]string{
+				"identityIds": {"identityId"},
+				"emailIds":    {"emailId"},
+				"threadIds":   {"threadId"},
+				"undoStatus":  {"undoStatus"},
+				"before":      {"sendAt"},
+				"after":       {"sendAt"},
+			},
+			LocalSorts: map[string][]string{
+				"emailId":  {"emailId"},
+				"threadId": {"threadId"},
+				"sendAt":   {"sendAt"},
+				"sentAt":   {"sendAt"},
+			},
 		},
 	}
 	if err := runtime.RegisterStandardTypeExt(p, db, EmailSubmissionType(), core, ext); err != nil {
@@ -200,7 +218,7 @@ func (c submissionComputed) Resolve(ctx context.Context, acct jmap.Id, stored ob
 	rows, err := loadReportRows(
 		func(t string, rid jmap.Id) (objectdb.Object, error) { return c.db.Get(ctx, acct, t, rid) },
 		func(t, prop string, v json.RawMessage) ([]jmap.Id, error) {
-			return c.db.IdsWhereEqual(ctx, acct, t, prop, v)
+			return c.db.IdsWhereEqual(ctx, acct, t, prop, v, 0)
 		}, id)
 	if err != nil {
 		return nil, err

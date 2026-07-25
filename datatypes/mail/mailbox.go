@@ -78,10 +78,7 @@ func RegisterMailbox(p *runtime.Processor, db *objectdb.DB, core jmap.CoreCapabi
 			Validate: mailboxValidate,
 			Destroy:  mailboxDestroy,
 		},
-		Query: &runtime.QueryHooks{
-			Filter:  mailboxFilter{},
-			Arrange: mailboxArrange(db),
-		},
+		Query: mailboxQueryHooks(db),
 	}
 	// The counter-rules marker rides with Mailbox: the trash role that
 	// defines the section 2.1 unreadThreads rules is a Mailbox property,
@@ -90,6 +87,29 @@ func RegisterMailbox(p *runtime.Processor, db *objectdb.DB, core jmap.CoreCapabi
 		return err
 	}
 	return runtime.RegisterStandardTypeExt(p, db, MailboxType(), core, ext)
+}
+
+// mailboxQueryHooks builds Mailbox's /query customization. Every
+// Mailbox FilterCondition reads only the record's own stored
+// properties, so plain Mailbox queries are change-calculable (RFC 8620
+// section 5.6). Arrange is declared the identity when no extra
+// arguments are passed - a query using sortAsTree or filterAsTree reads
+// OTHER mailboxes' standing (an ancestor's filter verdict decides a
+// child's) and is refused change calculation by the extras rule, not by
+// a declaration.
+func mailboxQueryHooks(db *objectdb.DB) *runtime.QueryHooks {
+	return &runtime.QueryHooks{
+		Filter: mailboxFilter{},
+		LocalConditions: map[string][]string{
+			"parentId":     {"parentId"},
+			"name":         {"name"},
+			"role":         {"role"},
+			"hasAnyRole":   {"role"},
+			"isSubscribed": {"isSubscribed"},
+		},
+		Arrange:      mailboxArrange(db),
+		LocalArrange: true,
+	}
 }
 
 // isNullRaw reports whether raw is the literal JSON null.

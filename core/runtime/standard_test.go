@@ -43,6 +43,7 @@ func noteServer(t *testing.T, core jmap.CoreCapabilities) *httptest.Server {
 	be := memory.New()
 	db := objectdb.New(be, lease.NewInProcess(be))
 	p := NewProcessor()
+	p.VerifyQueryProjection()
 	if err := RegisterStandardType(p, db, testNoteType(), core); err != nil {
 		t.Fatal(err)
 	}

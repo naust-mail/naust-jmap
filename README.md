@@ -147,7 +147,7 @@ from its descriptor, not written per type.
 | Methods    | `Foo/get`, `Foo/changes`, `Foo/set`    | Yes      | PatchObject validation, change coalescing, per-record atomicity                                                       |
 | Methods    | `Foo/copy`                             | Yes      | Cross-account copy with `onSuccessDestroyOriginal`                                                                    |
 | Methods    | `Foo/query`                            | Yes      | Indexed range scans, in-memory residual, anchors, windowing                                                           |
-| Methods    | `Foo/queryChanges`                     | Fallback | Always answers `cannotCalculateChanges` (permitted by section 5.6); clients refetch the query                         |
+| Methods    | `Foo/queryChanges`                     | Yes      | Real diffs for record-local queries (declared via `QueryHooks`), tiered answering, `upToId`, work-budget refusals     |
 | State      | State strings and `ifInState`          | Yes      | Optimistic concurrency with `stateMismatch`                                                                           |
 | Blobs      | Upload/download endpoints, `Blob/copy` | Yes      | Reference tracking and unreferenced-blob sweeping                                                                     |
 | Push       | EventSource (`/eventsource`)           | Yes      | `types`, `closeafter`, `ping` arguments                                                                               |
@@ -159,8 +159,25 @@ from its descriptor, not written per type.
 <summary>Design decisions worth knowing about</summary>
 
 Where the RFCs leave a behavior to the server, the choice is recorded here so
-embedders know what to expect. The entries below concern the mail module
-(RFC 8621); see Mail below.
+embedders know what to expect. The first entry concerns the core runtime;
+the rest concern the mail module (RFC 8621); see Mail below.
+
+**queryChanges answers only what it can prove.** `Foo/queryChanges` computes
+real diffs for record-local queries: those whose filter and sort verdicts
+depend only on each record's own data, declared per name on
+`runtime.QueryHooks` (core-language queries qualify by construction, and
+`runtime.CheckRecordLocal` is the shipped checker a datatype's tests prove
+declarations with). Anything undeclared - Email's thread-keyword conditions,
+Mailbox tree arrangements - answers `cannotCalculateChanges`, the section
+5.6 escape that costs the client one refetch; a forgotten declaration
+degrades service but can never corrupt a client's cached list. States are
+plain commit numbers, so how far behind a client is costs a subtraction, and
+a single work budget refuses oversized answers before the expensive work
+happens. Collapsed Email queries stay sound through the Thread group
+companion: every membership change updates the Thread record, so a destroyed
+representative's untouched sibling is still re-reported. Ordered streaming
+evaluation for mutable queries (bounding tier-2 work by index order) is a
+recognized future extension of the query planner, not built.
 
 **Threads never merge.** Emails are grouped into Threads by their
 References/In-Reply-To chain plus a normalized subject. If two existing

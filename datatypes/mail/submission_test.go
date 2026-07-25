@@ -51,6 +51,7 @@ func newSubmissionServer(t *testing.T, limits SubmissionLimits) (*httptest.Serve
 	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
 	store := kvstore.New(memory.New())
 	p := runtime.NewProcessor()
+	p.VerifyQueryProjection()
 	core := runtime.DefaultCoreCapabilities()
 	policy := &submissionPolicy{StaticSendPolicy: NewStaticSendPolicy()}
 	policy.Allow(testAccount, "john@example.com", "*@corp.example")

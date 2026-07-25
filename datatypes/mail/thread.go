@@ -75,7 +75,7 @@ func (tc threadComputed) Resolve(ctx context.Context, acct jmap.Id, stored objec
 		// scan returns the members already in the section 3 order -
 		// receivedAt oldest first, id as the stable tiebreak - with no
 		// record loads and nothing to sort.
-		ids, err := tc.db.IdsWhereEqual(ctx, acct, TypeEmail, "threadId", mustJSON(tid))
+		ids, err := tc.db.IdsWhereEqual(ctx, acct, TypeEmail, "threadId", mustJSON(tid), 0)
 		if err != nil {
 			return nil, err
 		}

@@ -257,6 +257,61 @@ type QueryHooks struct {
 	// drop records, never add (RFC 8621 Mailbox/query's sortAsTree and
 	// filterAsTree). extra carries the decoded extra /query arguments.
 	Arrange func(ctx context.Context, acct jmap.Id, matched []QueryRecord, compare func(a, b objectdb.Object) int, extra map[string]json.RawMessage) ([]jmap.Id, error)
+
+	// The fields below declare which queries Foo/queryChanges (RFC 8620
+	// section 5.6) can answer. Calculating a result diff from the change
+	// log is sound only for a RECORD-LOCAL query: one where a record's
+	// match verdict and sort key depend on nothing but that record's own
+	// stored properties and blob content, so an id's membership or
+	// position can only change when that record itself appears in the
+	// type's change log. The core cannot see inside FilterSemantics,
+	// SortSemantics, or Arrange, so a type with such hooks must declare
+	// which of its names are record-local; anything undeclared makes the
+	// query answer canCalculateChanges: false and Foo/queryChanges refuse
+	// with cannotCalculateChanges - the section 5.6 escape hatch that
+	// tells the client to re-run the query. Forgetting a declaration
+	// therefore degrades service, never corrupts a client's cached list;
+	// only an actively false declaration can do that.
+	//
+	// A type without Filter/Sort hooks needs no declarations: the core
+	// equality conditions and declared-property comparators read exactly
+	// the named stored property, which is record-local by construction.
+
+	// LocalConditions declares the FilterCondition names this type's
+	// FilterSemantics evaluates record-locally, each mapped to the stored
+	// properties the condition reads. A nil property list declares the
+	// condition record-local without enumerating its reads (matching on
+	// the record's own blob content is such a case: record-local, but not
+	// a stored property). The list feeds the section 5.6 upToId rule -
+	// a query may honor upToId only when it can prove the result list
+	// immutable, which requires every read property to be declared
+	// Immutable - so a condition with unenumerated reads is still
+	// calculable, just never immutability-proven. Only valid alongside a
+	// Filter hook.
+	LocalConditions map[string][]string
+	// LocalSorts is LocalConditions for sort comparator property names
+	// evaluated by this type's SortSemantics. Only valid alongside a Sort
+	// hook.
+	LocalSorts map[string][]string
+	// LocalArrange declares that Arrange, when called with no extra
+	// /query arguments, returns exactly the ids of its input in the given
+	// order (RFC 8621 Mailbox/query: the tree transforms run only when
+	// their extra arguments ask for them). Queries that do pass extra
+	// arguments are never change-calculable: the core cannot know what an
+	// extras-driven arrangement reads. Only valid alongside an Arrange
+	// hook.
+	LocalArrange bool
+	// GroupCompanion names a registered type whose record ids are this
+	// type's CollapseKey values and whose own change-log entries report
+	// every group whose membership changed (RFC 8621: Thread for Email -
+	// threadId values are Thread ids, and any Email joining or leaving a
+	// thread updates or destroys the Thread record in the same commit).
+	// It is what makes a collapsed query (section 4.4.3) calculable: a
+	// collapsed result can change through an untouched record when a
+	// group sibling changes, so the calculation expands changed groups to
+	// their members and the query state covers commits to both types. The
+	// companion must be registered before this type. Requires CollapseKey.
+	GroupCompanion string
 }
 
 // ResponseExtras adds type-specific fields to derived method
@@ -425,6 +480,49 @@ func (e *Extensions) validate(t *descriptor.Type) error {
 	if e.Query != nil && e.Query.CollapseKey != "" {
 		if _, declared := t.Properties[e.Query.CollapseKey]; !declared {
 			return fmt.Errorf("runtime: %s: Query.CollapseKey names unknown property %q", t.Name, e.Query.CollapseKey)
+		}
+	}
+	if e.Query != nil {
+		// The change-calculation declarations qualify hooks, so each is
+		// only meaningful next to the hook it qualifies; without hooks the
+		// core language is record-local by construction and a declaration
+		// would be dead weight or a misunderstanding.
+		if e.Query.LocalConditions != nil && e.Query.Filter == nil {
+			return fmt.Errorf("runtime: %s: Query.LocalConditions declared without a Filter hook (core conditions are record-local by construction)", t.Name)
+		}
+		if e.Query.LocalSorts != nil && e.Query.Sort == nil {
+			return fmt.Errorf("runtime: %s: Query.LocalSorts declared without a Sort hook (core comparators are record-local by construction)", t.Name)
+		}
+		if e.Query.LocalArrange && e.Query.Arrange == nil {
+			return fmt.Errorf("runtime: %s: Query.LocalArrange declared without an Arrange hook", t.Name)
+		}
+		for kind, decls := range map[string]map[string][]string{"LocalConditions": e.Query.LocalConditions, "LocalSorts": e.Query.LocalSorts} {
+			for name, reads := range decls {
+				if name == "" {
+					return fmt.Errorf("runtime: %s: Query.%s declares an empty name", t.Name, kind)
+				}
+				for _, prop := range reads {
+					p, declared := t.Properties[prop]
+					if !declared || p.Internal {
+						return fmt.Errorf("runtime: %s: Query.%s[%q] reads undeclared property %q", t.Name, kind, name, prop)
+					}
+				}
+			}
+		}
+		if e.Query.GroupCompanion != "" {
+			// The companion must name an already registered type;
+			// RegisterStandardTypeExt checks that, since only it holds
+			// the db.
+			if e.Query.CollapseKey == "" {
+				return fmt.Errorf("runtime: %s: Query.GroupCompanion requires a CollapseKey (the companion's ids are the collapse-key values)", t.Name)
+			}
+			// Change calculation expands a changed group to its members by
+			// an equality read on the collapse key, so the key must be
+			// indexed - without the index the expansion would be a table
+			// scan per group.
+			if p := t.Properties[e.Query.CollapseKey]; !p.Indexed {
+				return fmt.Errorf("runtime: %s: Query.GroupCompanion requires the CollapseKey property %q to be Indexed", t.Name, e.Query.CollapseKey)
+			}
 		}
 	}
 	return nil

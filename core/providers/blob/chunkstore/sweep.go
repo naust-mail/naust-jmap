@@ -3,7 +3,7 @@ package chunkstore
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
@@ -77,7 +77,7 @@ func (s *Store) Sweep(ctx context.Context) (int, error) {
 		reclaimed++
 	}
 	if reclaimed > 0 {
-		log.Printf("naust-jmap chunkstore: reclaimed %d orphaned upload run(s)", reclaimed)
+		slog.Info("naust-jmap chunkstore: reclaimed orphaned upload runs", "count", reclaimed)
 	}
 	return reclaimed, nil
 }

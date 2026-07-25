@@ -110,14 +110,14 @@ func TestPutInternalIsSilent(t *testing.T) {
 	if string(obj["marker"]) != `"m2"` {
 		t.Errorf("marker = %s, want \"m2\"", obj["marker"])
 	}
-	ids, err := db.IdsWhereEqual(ctx, acct, "TestMarked", "marker", json.RawMessage(`"m2"`))
+	ids, err := db.IdsWhereEqual(ctx, acct, "TestMarked", "marker", json.RawMessage(`"m2"`), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(ids) != 1 || ids[0] != id {
 		t.Errorf("index at new value = %v, want [%s]", ids, id)
 	}
-	stale, err := db.IdsWhereEqual(ctx, acct, "TestMarked", "marker", json.RawMessage(`"m1"`))
+	stale, err := db.IdsWhereEqual(ctx, acct, "TestMarked", "marker", json.RawMessage(`"m1"`), 0)
 	if err != nil {
 		t.Fatal(err)
 	}

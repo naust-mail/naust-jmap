@@ -299,7 +299,7 @@ func FuzzQueryPlan(f *testing.F) {
 				t.Fatal(err)
 			}
 		}
-		matched, err := st.loadAndMatch(ctx, "Atest1", root, candidates)
+		matched, err := st.loadAndMatch(ctx, "Atest1", root, candidates, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

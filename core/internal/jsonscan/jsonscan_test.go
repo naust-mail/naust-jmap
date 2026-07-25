@@ -83,6 +83,21 @@ func checkOracles(t *testing.T, raw []byte) {
 		}
 	}
 
+	// HasKey mirrors map membership under EachKey's acceptance; probes
+	// cover hits, misses, names only reachable by unescaping, and names
+	// that exist only inside nested values (which must never match).
+	for _, probe := range []string{"a", "b", "c", "id", "$seen", "café", "absent"} {
+		gotH, hErr := HasKey(raw, probe)
+		if (hErr == nil) != (mErr == nil) {
+			t.Errorf("HasKey(%q, %q) err = %v, stdlib %v", raw, probe, hErr, mErr)
+		} else if hErr == nil {
+			_, want := m[probe]
+			if gotH != want {
+				t.Errorf("HasKey(%q, %q) = %v, stdlib %v", raw, probe, gotH, want)
+			}
+		}
+	}
+
 	// EachString mirrors decoding into []string, in order.
 	var ss []string
 	ssErr := json.Unmarshal(raw, &ss)
@@ -131,6 +146,47 @@ func checkInterning(t *testing.T, raw []byte) {
 	}
 }
 
+// subsetWants covers a nil set (validate-only), hits, misses, and
+// names only reachable by unescaping.
+var subsetWants = []map[string]bool{
+	nil,
+	{"a": true, "café": true, "$seen": true},
+	{"a": true, "b": true, "c": true, "id": true, "x": true},
+}
+
+// checkSubset verifies DecodeObjectSubset against its executable
+// specification: DecodeObject followed by filtering to the wanted
+// names, with identical acceptance.
+func checkSubset(t *testing.T, raw []byte) {
+	t.Helper()
+	full, fullErr := DecodeObject(raw, internDict)
+	for _, wanted := range subsetWants {
+		got, err := DecodeObjectSubset(raw, internDict, wanted)
+		if (err == nil) != (fullErr == nil) {
+			t.Fatalf("DecodeObjectSubset(%q, %v) err = %v, DecodeObject %v", raw, wanted, err, fullErr)
+		}
+		if err != nil {
+			continue
+		}
+		if (got == nil) != (full == nil) {
+			t.Fatalf("DecodeObjectSubset(%q, %v) nil-ness mismatch", raw, wanted)
+		}
+		want := 0
+		for k, v := range full {
+			if !wanted[k] {
+				continue
+			}
+			want++
+			if g, ok := got[k]; !ok || !bytes.Equal(g, v) {
+				t.Fatalf("DecodeObjectSubset(%q, %v)[%q] = %q, DecodeObject %q", raw, wanted, k, g, v)
+			}
+		}
+		if len(got) != want {
+			t.Fatalf("DecodeObjectSubset(%q, %v) has %d members, want %d", raw, wanted, len(got), want)
+		}
+	}
+}
+
 func TestHelpersAgainstStdlib(t *testing.T) {
 	cases := []string{
 		// Structure and whitespace.
@@ -154,6 +210,9 @@ func TestHelpersAgainstStdlib(t *testing.T) {
 		`{"a":1}`, `{"a":1,"b":2}`, `{"a":1,"a":2}`, `{"a":}`, `{"a"1}`,
 		`{"a":1,}`, `{a:1}`, `{"a":{"b":[1,{"c":null}]}}`, `{"a":1}}`,
 		`{"\ud800":1}`, `{"a":"\q"}`, `{"a":01}`,
+		`{"$seen":true}`, `{"\u0024seen":true}`,
+		`{"café":1}`, `{"caf\u00e9":1}`,
+		`{"absent":{"a":1}}`, `{"x":1,"a":2,"x":3}`,
 		// Arrays.
 		`["a"]`, `["a","b"]`, `["a",]`, `[,"a"]`, `["a" "b"]`,
 		`["a",null]`, `["a",1]`, `[null]`, `[[]]`, "[\"\U0001F600\"]",
@@ -162,6 +221,7 @@ func TestHelpersAgainstStdlib(t *testing.T) {
 	for _, c := range cases {
 		checkOracles(t, []byte(c))
 		checkInterning(t, []byte(c))
+		checkSubset(t, []byte(c))
 	}
 	// Depth: the stdlib decides both sides of its own nesting limit.
 	checkOracles(t, []byte(strings.Repeat("[", MaxDepth)+strings.Repeat("]", MaxDepth)))
@@ -178,5 +238,6 @@ func FuzzHelpersVsStdlib(f *testing.F) {
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		checkOracles(t, raw)
 		checkInterning(t, raw)
+		checkSubset(t, raw)
 	})
 }

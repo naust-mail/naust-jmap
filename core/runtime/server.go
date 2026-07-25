@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"mime"
 	"net/http"
 	"strings"
@@ -65,7 +65,7 @@ func NewServer(a auth.Authenticator, p *Processor, baseURL string, core jmap.Cor
 		return nil, errors.New("runtime: core limits must be positive (RFC 8620 section 8.5 requires enforced limits)")
 	}
 	for _, warning := range tuning.Validate() {
-		log.Printf("naust-jmap: tuning: %s", warning)
+		slog.Warn("naust-jmap: tuning", "warning", warning)
 	}
 	return &Server{
 		authn:       a,

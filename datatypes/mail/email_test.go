@@ -41,6 +41,10 @@ func newEmailServer(t *testing.T, acctCap AccountCapability) (*httptest.Server, 
 	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
 	store := kvstore.New(memory.New())
 	p := runtime.NewProcessor()
+	// Assertion mode: every projected query evaluation in this suite is
+	// cross-checked against a full decode, so a reads declaration that
+	// lies about what a condition or comparator reads fails loudly here.
+	p.VerifyQueryProjection()
 	core := runtime.DefaultCoreCapabilities()
 	if err := RegisterMailbox(p, db, core); err != nil {
 		t.Fatal(err)

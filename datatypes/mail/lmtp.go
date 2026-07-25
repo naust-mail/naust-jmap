@@ -15,7 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/textproto"
 	"strconv"
@@ -115,7 +115,7 @@ func ServeLMTP(ln net.Listener, d *Deliverer, hostname string, opts ...LMTPOptio
 			} else if backoff *= 2; backoff > time.Second {
 				backoff = time.Second
 			}
-			log.Printf("naust-jmap lmtp: accept error (retry in %v): %v", backoff, err)
+			slog.Warn("naust-jmap lmtp: accept error, retrying", "backoff", backoff, "err", err)
 			time.Sleep(backoff)
 			continue
 		}
@@ -149,7 +149,7 @@ func serveLMTPConn(conn net.Conn, d *Deliverer, hostname string) {
 	// transmission channel") rather than a bare TCP drop, then close.
 	defer func() {
 		if p := recover(); p != nil {
-			log.Printf("naust-jmap lmtp: recovered panic: %v", p)
+			slog.Error("naust-jmap lmtp: recovered panic", "panic", p)
 			_ = tp.PrintfLine("421 4.3.0 %s service error, closing channel", hostname)
 		}
 	}()

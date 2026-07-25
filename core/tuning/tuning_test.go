@@ -6,6 +6,36 @@ import (
 	"time"
 )
 
+// TestIdSchemeString covers every named scheme plus an out-of-range value,
+// since String() is what appears in logs and error messages an operator
+// reads to diagnose a misconfigured objectdb.WithIdScheme.
+func TestIdSchemeString(t *testing.T) {
+	cases := []struct {
+		s    IdScheme
+		want string
+	}{
+		{SchemeULID, "ulid"},
+		{SchemeSequence, "sequence"},
+		{SchemeRandom, "random"},
+		{IdScheme(99), "unknown"},
+		{IdScheme(-1), "unknown"},
+	}
+	for _, c := range cases {
+		if got := c.s.String(); got != c.want {
+			t.Errorf("IdScheme(%d).String() = %q, want %q", c.s, got, c.want)
+		}
+	}
+}
+
+// TestDefaultIdSchemeIsULID pins the documented default (objectdb.WithIdScheme
+// unset uses ULID) so a future reordering of the IdScheme constants cannot
+// silently change what an embedder gets without choosing.
+func TestDefaultIdSchemeIsULID(t *testing.T) {
+	if DefaultIdScheme != SchemeULID {
+		t.Fatalf("DefaultIdScheme = %v, want SchemeULID", DefaultIdScheme)
+	}
+}
+
 // assertWarns fails unless Validate returns a warning mentioning name.
 func assertWarns(t *testing.T, name string) {
 	t.Helper()

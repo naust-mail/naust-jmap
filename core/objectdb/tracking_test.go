@@ -231,7 +231,7 @@ func TestNullableProperty(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ids, err := db.IdsWhereEqual(ctx, acct, "Box", "parent", json.RawMessage(`null`))
+	ids, err := db.IdsWhereEqual(ctx, acct, "Box", "parent", json.RawMessage(`null`), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +239,7 @@ func TestNullableProperty(t *testing.T) {
 		t.Errorf("parent=null matches: %v, want [%s]", ids, top)
 	}
 	parent, _ := json.Marshal(top)
-	ids, err = db.IdsWhereEqual(ctx, acct, "Box", "parent", parent)
+	ids, err = db.IdsWhereEqual(ctx, acct, "Box", "parent", parent, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

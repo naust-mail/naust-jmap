@@ -340,6 +340,540 @@ func TestRejectsPathEscapes(t *testing.T) {
 	}
 }
 
+// The root-escape backstop in blobPath compares a joined path against a
+// prefix derived from root. If New did not canonicalize a root given with a
+// trailing separator, that prefix would carry a doubled separator no clean
+// joined path ever matches, and every legitimate call would be rejected as an
+// escape. New must normalize root so this never happens.
+func TestNonCanonicalRootStillWorks(t *testing.T) {
+	base := t.TempDir()
+	s, err := fsstore.New(base + string(filepath.Separator))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("From: a@example.com\r\n\r\nhello")
+	id := write(t, s, data)
+	if got := read(t, s, id); !bytes.Equal(got, data) {
+		t.Fatalf("read back %q, want %q", got, data)
+	}
+}
+
+// New's own doc says it "runs Sweep to reclaim any temporary file left
+// behind by an upload that crashed long enough ago" - startup debris from a
+// previous, killed process. That path was untested: every other test
+// starts from a fresh root via newStore before any tmp file exists.
+func TestNewSweepsStaleDebrisAtStartup(t *testing.T) {
+	root := t.TempDir()
+	tmp := filepath.Join(root, "tmp")
+	if err := os.MkdirAll(tmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(tmp, "up-stale")
+	if err := os.WriteFile(stale, []byte("orphaned by a killed process"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-(tuning.UploadReclaimWindow + time.Minute))
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	fresh := filepath.Join(tmp, "up-fresh")
+	if err := os.WriteFile(fresh, []byte("still within the window"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := fsstore.New(root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale debris survived New: stat err = %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("New swept a file still within the reclaim window: %v", err)
+	}
+}
+
+// Sweep must tolerate a missing tmp directory rather than erroring: nothing
+// else in the store recreates it once removed (a mistaken cleanup, a
+// separate maintenance script), and a permanent Sweep failure would be
+// worse than treating "no debris directory" as "no debris".
+func TestSweepToleratesMissingTmpDir(t *testing.T) {
+	s, root := newStore(t)
+	if err := os.RemoveAll(filepath.Join(root, "tmp")); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep with no tmp dir: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("Sweep with no tmp dir reclaimed %d, want 0", n)
+	}
+}
+
+// Sweep must stop promptly on a cancelled context rather than walking a
+// large backlog to completion regardless of the caller.
+func TestSweepRespectsCancelledContext(t *testing.T) {
+	s, root := newStore(t)
+	w, err := s.Create(context.Background(), acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("stale")); err != nil {
+		t.Fatal(err)
+	}
+	age(t, root, tuning.UploadReclaimWindow+time.Minute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := s.Sweep(ctx); err == nil {
+		t.Fatal("Sweep with a cancelled context: want an error, got nil")
+	}
+}
+
+// A finalized writer, whether by Commit or by Abort, must refuse every
+// further operation: a caller holding a stale reference (a bug, or a retry
+// after a caller-side timeout that actually succeeded) must not be able to
+// mutate or republish content past finalization.
+func TestWriterRefusesUseAfterFinalize(t *testing.T) {
+	commitThenRefuse := func(t *testing.T, finalize func(w blob.BlobWriter) error) {
+		s, _ := newStore(t)
+		w, err := s.Create(context.Background(), acct)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte("data")); err != nil {
+			t.Fatal(err)
+		}
+		if err := finalize(w); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte("more")); err == nil {
+			t.Error("Write after finalize succeeded, want an error")
+		}
+		if _, err := w.Commit(); err == nil {
+			t.Error("Commit after finalize succeeded, want an error")
+		}
+	}
+	t.Run("after commit", func(t *testing.T) {
+		commitThenRefuse(t, func(w blob.BlobWriter) error { _, err := w.Commit(); return err })
+	})
+	t.Run("after abort", func(t *testing.T) {
+		commitThenRefuse(t, func(w blob.BlobWriter) error { return w.Abort() })
+	})
+}
+
+// Put and Delete share blobPath with Open, but Open's path-escape coverage
+// (TestRejectsPathEscapes) does not exercise them: Put creates a file and
+// Delete removes one, so a bypass here is a write/unlink primitive rather
+// than just an unexpected read.
+func TestPutAndDeleteRejectPathEscapes(t *testing.T) {
+	s, _ := newStore(t)
+	for _, bad := range []jmap.Id{"..", "../../etc", "a/b", "", "A..", "G..", "A/."} {
+		if err := s.Put(context.Background(), acct, bad, []byte("x")); err == nil {
+			t.Errorf("Put with blobId %q: want a rejection", bad)
+		}
+		if err := s.Put(context.Background(), bad, "Gx", []byte("x")); err == nil {
+			t.Errorf("Put with account %q: want a rejection", bad)
+		}
+		if err := s.Delete(context.Background(), acct, bad); err == nil {
+			t.Errorf("Delete with blobId %q: want a rejection", bad)
+		}
+		if err := s.Delete(context.Background(), bad, "Gx"); err == nil {
+			t.Errorf("Delete with account %q: want a rejection", bad)
+		}
+	}
+}
+
+// blobPath falls back to the whole id as the shard when the id is under 3
+// characters (the general case slices id[1:3]). A blobId that short never
+// comes from IdFromDigest, but Put accepts a caller-supplied id, so the
+// fallback is reachable and must still round-trip correctly.
+func TestPutWithShortBlobID(t *testing.T) {
+	s, _ := newStore(t)
+	const id = jmap.Id("Gx")
+	data := []byte("short id")
+	if err := s.Put(context.Background(), acct, id, data); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, s, id); !bytes.Equal(got, data) {
+		t.Fatalf("read back %q, want %q", got, data)
+	}
+	if err := s.Delete(context.Background(), acct, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Open(context.Background(), acct, id); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("after Delete, Open: %v, want blob.ErrNotFound", err)
+	}
+}
+
+// Create validates the account id up front, like blobPath does for Open,
+// Put, and Delete - but Create's check was untested, and a bypass here
+// would leave a temporary file allocated under an attacker-chosen path
+// component before anything else in the store gets a chance to reject it.
+func TestCreateRejectsBadAccount(t *testing.T) {
+	s, root := newStore(t)
+	for _, bad := range []jmap.Id{"..", "../../etc", "a/b", ""} {
+		if _, err := s.Create(context.Background(), bad); err == nil {
+			t.Errorf("Create with account %q: want a rejection", bad)
+		}
+	}
+	if n := countFiles(t, filepath.Join(root, "tmp")); n != 0 {
+		t.Fatalf("rejected Create calls left %d file(s) in tmp", n)
+	}
+}
+
+// A zero-byte blob is a legitimate value (an empty attachment, a stub
+// upload) and its content address is well-defined (sha256 of no bytes);
+// nothing in Write/Commit special-cases "never wrote anything", so it must
+// still round-trip through both entry points.
+func TestEmptyBlob(t *testing.T) {
+	s, _ := newStore(t)
+
+	id := write(t, s, nil)
+	if want := blob.IdFor(nil); id != want {
+		t.Fatalf("empty blob via Create/Commit got id %q, want %q", id, want)
+	}
+	if got := read(t, s, id); len(got) != 0 {
+		t.Fatalf("empty blob read back %d bytes, want 0", len(got))
+	}
+
+	if err := s.Put(context.Background(), acct, id, nil); err != nil {
+		t.Fatalf("Put of empty content: %v", err)
+	}
+	if got := read(t, s, id); len(got) != 0 {
+		t.Fatalf("empty blob via Put read back %d bytes, want 0", len(got))
+	}
+}
+
+// Sweep must not choke on a subdirectory under tmp/: nothing in this store
+// creates one, but Sweep is a maintenance pass over a directory it does not
+// fully control (an operator poking around, a future writer that shards
+// tmp/), and e.IsDir() is the guard that is supposed to make that safe.
+func TestSweepSkipsSubdirectories(t *testing.T) {
+	s, root := newStore(t)
+	sub := filepath.Join(root, "tmp", "unexpected-dir")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-(tuning.UploadReclaimWindow + time.Minute))
+	if err := os.Chtimes(sub, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep with a subdirectory present: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("Sweep reported %d reclaimed, want 0", n)
+	}
+	if _, err := os.Stat(sub); err != nil {
+		t.Fatalf("Sweep removed the subdirectory: %v", err)
+	}
+}
+
+// chmodCleanup restores path's mode at test end, before t.TempDir()'s own
+// cleanup runs (t.Cleanup is LIFO, and this is registered after newStore's
+// call to t.TempDir), so a permission fault injected mid-test never leaves
+// TempDir unable to remove its own tree.
+func chmodCleanup(t *testing.T, path string, restore os.FileMode) {
+	t.Helper()
+	t.Cleanup(func() { os.Chmod(path, restore) })
+}
+
+// New propagates a failure to create its tmp directory: root is a plain
+// file, so MkdirAll cannot descend into it.
+func TestNewFailsWhenRootIsAFile(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(root, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fsstore.New(root); err == nil {
+		t.Fatal("New with a file as root: want an error")
+	}
+}
+
+// New propagates a failure from its startup Sweep: an unreadable tmp
+// directory (already present from a prior run, permissions clamped down by
+// an operator or a broken deploy) must fail New rather than silently
+// starting with debris New could not inspect.
+func TestNewPropagatesSweepFailure(t *testing.T) {
+	root := t.TempDir()
+	tmp := filepath.Join(root, "tmp")
+	if err := os.MkdirAll(tmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(tmp, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	chmodCleanup(t, tmp, 0o700)
+
+	if _, err := fsstore.New(root); err == nil {
+		t.Fatal("New with an unreadable tmp dir: want an error")
+	}
+}
+
+// Sweep itself, not just New's startup call, must propagate a permission
+// failure reading tmp/ rather than reporting a false "nothing to reclaim".
+func TestSweepPropagatesReadDirFailure(t *testing.T) {
+	s, root := newStore(t)
+	tmp := filepath.Join(root, "tmp")
+	if err := os.Chmod(tmp, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	chmodCleanup(t, tmp, 0o700)
+
+	if _, err := s.Sweep(context.Background()); err == nil {
+		t.Fatal("Sweep with an unreadable tmp dir: want an error")
+	}
+}
+
+// Sweep must propagate a failure removing a stale file (a read-only tmp
+// directory - an operator lockdown, a misconfigured mount) rather than
+// silently reporting the file reclaimed.
+func TestSweepPropagatesRemoveFailure(t *testing.T) {
+	s, root := newStore(t)
+	w, err := s.Create(context.Background(), acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("stale")); err != nil {
+		t.Fatal(err)
+	}
+	age(t, root, tuning.UploadReclaimWindow+time.Minute)
+
+	tmp := filepath.Join(root, "tmp")
+	if err := os.Chmod(tmp, 0o500); err != nil { // read+execute, no write
+		t.Fatal(err)
+	}
+	chmodCleanup(t, tmp, 0o700)
+
+	if _, err := s.Sweep(context.Background()); err == nil {
+		t.Fatal("Sweep unable to remove a stale file: want an error")
+	}
+}
+
+// Create propagates a failure allocating its temporary file: tmp/ is gone
+// (removed out from under a running store, which Sweep and Delete never
+// do, but an operator or a stray cleanup script might).
+func TestCreateFailsWhenTmpDirMissing(t *testing.T) {
+	s, root := newStore(t)
+	if err := os.RemoveAll(filepath.Join(root, "tmp")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(context.Background(), acct); err == nil {
+		t.Fatal("Create with tmp/ missing: want an error")
+	}
+}
+
+// A write that must flush (the buffer throttle has aged past
+// UploadRefreshInterval) propagates the underlying file error rather than
+// reporting success over lost bytes; the failure is sticky, so a later call
+// that flushes unconditionally (ID, or a Write past the buffer threshold)
+// gets the same error without a second attempt to touch the file.
+func TestWriteFailsWhenUnderlyingFileClosed(t *testing.T) {
+	s, _ := newStore(t)
+	w, err := s.Create(context.Background(), acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsstore.CloseUnderlyingFile(w); err != nil {
+		t.Fatal(err)
+	}
+	fsstore.AgeThrottle(w, tuning.UploadRefreshInterval+time.Second)
+
+	if _, err := w.Write([]byte("x")); err == nil {
+		t.Fatal("Write against a closed file: want an error")
+	}
+	// The failed flush already reset the throttle, so a second small write
+	// would not attempt another flush on its own; ID() flushes
+	// unconditionally and is what must surface the sticky failure.
+	w.ID()
+	if _, err := w.Commit(); err == nil {
+		t.Fatal("Commit after a sticky flush failure: want an error")
+	}
+}
+
+// Commit propagates a flush failure for buffered-but-unflushed bytes: the
+// underlying file is closed while data still sits in the write buffer.
+func TestCommitFailsWhenFlushFails(t *testing.T) {
+	s, _ := newStore(t)
+	w, err := s.Create(context.Background(), acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Small write, well under the buffer threshold and the refresh
+	// interval: it stays buffered, unflushed, until Commit forces it.
+	if _, err := w.Write([]byte("buffered")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsstore.CloseUnderlyingFile(w); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Commit(); err == nil {
+		t.Fatal("Commit whose flush fails: want an error")
+	}
+}
+
+// Commit propagates an fsync failure distinctly from a flush failure: all
+// bytes are already flushed (a write past the buffer threshold empties the
+// buffer as it goes), so Commit's own flush is a no-op and Sync is the
+// first call to touch the now-closed file.
+func TestCommitFailsWhenSyncFails(t *testing.T) {
+	s, _ := newStore(t)
+	w, err := s.Create(context.Background(), acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	big := make([]byte, 128<<10) // well past writerBufSize
+	if _, err := w.Write(big); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsstore.CloseUnderlyingFile(w); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Commit(); err == nil {
+		t.Fatal("Commit whose fsync fails: want an error")
+	}
+}
+
+// Commit propagates a failure creating the destination shard directory: the
+// account's top-level directory already exists as a plain file, so
+// MkdirAll cannot descend through it. The temporary file must still be
+// cleaned up rather than left in tmp/.
+func TestCommitFailsWhenAccountDirIsAFile(t *testing.T) {
+	s, root := newStore(t)
+	if err := os.WriteFile(filepath.Join(root, string(acct)), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := s.Create(context.Background(), acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Commit(); err == nil {
+		t.Fatal("Commit under a file-shadowed account dir: want an error")
+	}
+	if n := countFiles(t, filepath.Join(root, "tmp")); n != 0 {
+		t.Fatalf("failed Commit left %d file(s) in tmp", n)
+	}
+}
+
+// Commit propagates a rename failure when the destination path is already
+// occupied by a directory: a directory cannot be replaced by a rename of a
+// regular file onto it.
+func TestCommitFailsWhenDestinationIsADirectory(t *testing.T) {
+	s, root := newStore(t)
+	data := []byte("collides with a pre-existing directory")
+	id := blob.IdFor(data)
+	dst := filepath.Join(root, string(acct), string(id[1:3]), string(id))
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := s.Create(context.Background(), acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Commit(); err == nil {
+		t.Fatal("Commit onto an existing directory: want an error")
+	}
+}
+
+// Put shares Commit's directory-creation and rename steps; both failure
+// modes above apply to it independently and were unexercised.
+func TestPutFailsWhenAccountDirIsAFile(t *testing.T) {
+	s, root := newStore(t)
+	if err := os.WriteFile(filepath.Join(root, string(acct)), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("put target")
+	if err := s.Put(context.Background(), acct, blob.IdFor(data), data); err == nil {
+		t.Fatal("Put under a file-shadowed account dir: want an error")
+	}
+	if n := countFiles(t, filepath.Join(root, "tmp")); n != 0 {
+		t.Fatalf("failed Put left %d file(s) in tmp", n)
+	}
+}
+
+// Put allocates its own temporary file independently of Create; that
+// allocation failing (tmp/ missing) is a distinct branch from the
+// account-directory MkdirAll failure above.
+func TestPutFailsWhenTmpDirMissing(t *testing.T) {
+	s, root := newStore(t)
+	if err := os.RemoveAll(filepath.Join(root, "tmp")); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("no tmp dir to stage through")
+	if err := s.Put(context.Background(), acct, blob.IdFor(data), data); err == nil {
+		t.Fatal("Put with tmp/ missing: want an error")
+	}
+}
+
+func TestPutFailsWhenDestinationIsADirectory(t *testing.T) {
+	s, root := newStore(t)
+	data := []byte("put collides with a directory")
+	id := blob.IdFor(data)
+	dst := filepath.Join(root, string(acct), string(id[1:3]), string(id))
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(context.Background(), acct, id, data); err == nil {
+		t.Fatal("Put onto an existing directory: want an error")
+	}
+}
+
+// Delete propagates a failure unlinking a blob: the containing shard
+// directory is read-only, so the file exists and is readable but cannot be
+// removed - distinct from the already-covered "missing, so a no-op" path.
+func TestDeletePropagatesRemoveFailure(t *testing.T) {
+	s, root := newStore(t)
+	id := write(t, s, []byte("undeletable"))
+	shard := filepath.Join(root, string(acct), string(id[1:3]))
+	if err := os.Chmod(shard, 0o500); err != nil { // read+execute, no write
+		t.Fatal(err)
+	}
+	chmodCleanup(t, shard, 0o700)
+
+	if err := s.Delete(context.Background(), acct, id); err == nil {
+		t.Fatal("Delete from a read-only directory: want an error")
+	}
+}
+
+// Open propagates a permission failure distinctly from ErrNotFound: the
+// blob exists but this process cannot read it.
+func TestOpenPropagatesPermissionFailure(t *testing.T) {
+	s, root := newStore(t)
+	id := write(t, s, []byte("unreadable"))
+	path := filepath.Join(root, string(acct), string(id[1:3]), string(id))
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	chmodCleanup(t, path, 0o600)
+
+	_, _, err := s.Open(context.Background(), acct, id)
+	if err == nil || errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("Open of an unreadable blob = %v, want a non-ErrNotFound error", err)
+	}
+}
+
+// syncDir itself, isolated from Commit/Put: a missing directory cannot be
+// opened for the fsync. Driving this through Commit's own call site would
+// need the destination directory to vanish in the narrow window between
+// Rename and syncDir, which is exactly the kind of race this direct,
+// deterministic call avoids.
+func TestSyncDirMissingDirectory(t *testing.T) {
+	if err := fsstore.SyncDir(filepath.Join(t.TempDir(), "does-not-exist")); err == nil {
+		t.Fatal("SyncDir of a missing directory: want an error")
+	}
+}
+
 // countFiles counts the regular files under dir, recursively.
 func countFiles(t *testing.T, dir string) int {
 	t.Helper()

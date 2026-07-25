@@ -65,8 +65,11 @@ func TestQueryNullFilterCasemapSort(t *testing.T) {
 		`{"accountId":"Atest1","sort":[{"property":"subject"}]}`)
 	wantIds(t, args, ids["apple"], ids["Banana"], ids["Cherry"])
 
-	if args["canCalculateChanges"] != false {
-		t.Fatalf("canCalculateChanges = %v, want false (M0)", args["canCalculateChanges"])
+	// A pure descriptor type's conditions and comparators read only the
+	// named stored property, so every query on it is change-calculable
+	// (5.5 defines canCalculateChanges per filter/sort combination).
+	if args["canCalculateChanges"] != true {
+		t.Fatalf("canCalculateChanges = %v, want true", args["canCalculateChanges"])
 	}
 	if args["position"] != float64(0) {
 		t.Fatalf("position = %v, want 0", args["position"])

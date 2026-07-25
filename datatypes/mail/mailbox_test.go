@@ -32,6 +32,7 @@ func mailServer(t *testing.T) (*httptest.Server, *objectdb.DB) {
 	be := memory.New()
 	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
 	p := runtime.NewProcessor()
+	p.VerifyQueryProjection()
 	if err := RegisterMailbox(p, db, runtime.DefaultCoreCapabilities()); err != nil {
 		t.Fatal(err)
 	}

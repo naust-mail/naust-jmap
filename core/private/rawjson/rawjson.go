@@ -43,3 +43,8 @@ func Bool(raw []byte) (bool, bool) { return jsonscan.Bool(raw) }
 // never materialized. A literal null makes no calls and no error,
 // mirroring json.Unmarshal's null-to-nil-map.
 func EachKey(raw []byte, fn func(key string)) error { return jsonscan.EachKey(raw, fn) }
+
+// HasKey reports whether a JSON object value has a member named key,
+// without materializing the member set; acceptance matches EachKey,
+// including validation of the whole value and null-as-empty.
+func HasKey(raw []byte, key string) (bool, error) { return jsonscan.HasKey(raw, key) }

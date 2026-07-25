@@ -342,6 +342,15 @@ func objectKeys(raw json.RawMessage) map[string]bool {
 	return out
 }
 
+// hasKey reports whether a KindObject value has the given key, without
+// building the key set objectKeys would - a membership test on the hot
+// query path allocates nothing this way. A nil, null, or malformed
+// value has no keys, matching objectKeys.
+func hasKey(raw json.RawMessage, key string) bool {
+	ok, err := rawjson.HasKey(raw, key)
+	return err == nil && ok
+}
+
 // threadIdOf decodes an Email's threadId, "" when the object is nil.
 func threadIdOf(obj objectdb.Object) jmap.Id {
 	if obj == nil {

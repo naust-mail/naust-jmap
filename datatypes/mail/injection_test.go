@@ -157,3 +157,30 @@ func TestRelayParamInjectionRejected(t *testing.T) {
 		t.Errorf("buildRcptCmd rejected a valid ORCPT: %v", err)
 	}
 }
+
+// TestAppendParamKeyInjectionRejected: appendParam is the generic-parameter
+// branch reached by any key that is not SIZE/ENVID/RET (MAIL FROM) or
+// NOTIFY/ORCPT (RCPT TO). The value is gated by paramValueWireSafe already;
+// the key must be gated the same way, since it reaches the wire verbatim in
+// both the "key" and "key=value" forms.
+func TestAppendParamKeyInjectionRejected(t *testing.T) {
+	for _, bad := range injectionParams {
+		if _, err := buildMailCmd(
+			SubmissionEnvelope{MailFrom: "john@example.com", MailParameters: map[string]*string{bad: ptr("v")}},
+			nil, false); err == nil {
+			t.Errorf("buildMailCmd accepted parameter key %q", bad)
+		}
+		if _, err := buildMailCmd(
+			SubmissionEnvelope{MailFrom: "john@example.com", MailParameters: map[string]*string{bad: nil}},
+			nil, false); err == nil {
+			t.Errorf("buildMailCmd accepted valueless parameter key %q", bad)
+		}
+	}
+
+	// A normal generic parameter still builds, so the guard is not over-broad.
+	if _, err := buildMailCmd(
+		SubmissionEnvelope{MailFrom: "john@example.com", MailParameters: map[string]*string{"X-CUSTOM": ptr("v")}},
+		nil, false); err != nil {
+		t.Errorf("buildMailCmd rejected a valid generic parameter: %v", err)
+	}
+}

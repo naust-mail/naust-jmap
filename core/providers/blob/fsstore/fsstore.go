@@ -57,6 +57,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
@@ -77,6 +78,9 @@ const tmpDir = "tmp"
 // the mechanism as it actually runs.
 type Store struct {
 	root string
+	// rootPrefix is root plus one separator, precomputed once so blobPath can
+	// check a joined path stays under root with a plain prefix comparison.
+	rootPrefix string
 }
 
 // New prepares root as a blob store, creating it if needed, and runs Sweep to
@@ -85,7 +89,8 @@ type Store struct {
 // process may still be writing it - is spared, and reclaimed by a later sweep
 // once its window elapses.
 func New(root string) (*Store, error) {
-	s := &Store{root: root}
+	root = filepath.Clean(root)
+	s := &Store{root: root, rootPrefix: root + string(filepath.Separator)}
 	if err := os.MkdirAll(filepath.Join(root, tmpDir), 0o700); err != nil {
 		return nil, err
 	}
@@ -121,7 +126,14 @@ func (s *Store) blobPath(acct, blobID jmap.Id) (string, error) {
 	if len(id) >= 3 {
 		shard = id[1:3]
 	}
-	return filepath.Join(s.root, string(acct), shard, id), nil
+	p := filepath.Join(s.root, string(acct), shard, id)
+	// Backstop: safeID already forecloses traversal by allowlisting id
+	// characters, but a joined path is cheap to re-check against root should
+	// that allowlist ever loosen.
+	if !strings.HasPrefix(p, s.rootPrefix) {
+		return "", fmt.Errorf("fsstore: path escapes root")
+	}
+	return p, nil
 }
 
 // Create implements blob.Store. Bytes go to a temporary file as they arrive and

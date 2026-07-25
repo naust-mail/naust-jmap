@@ -198,29 +198,52 @@ func (db *DB) getRaw(ctx context.Context, acct jmap.Id, typeName string, id jmap
 // themselves. On a backend without MultiGetter it falls back to sequential
 // Get calls, so it is always correct, just not always faster.
 func (db *DB) GetMany(ctx context.Context, acct jmap.Id, typeName string, ids []jmap.Id) ([]Object, error) {
-	out, _, err := db.getManyRaw(ctx, acct, typeName, ids)
+	out, _, err := db.getManyRaw(ctx, acct, typeName, ids, nil)
+	return out, err
+}
+
+// GetManyProjected is GetMany materializing only the wanted property
+// names of each record: same order, same nil-for-missing convention,
+// same one-round-trip batching. Every stored record is still fully
+// validated (see decodeStoredSubset), only the materialization is
+// narrowed, so a caller that reads a few properties of many records -
+// a query evaluation over its declared reads, or /get with a
+// properties argument - does not allocate the rest. The wanted set
+// must include every property the caller will read, "id" included;
+// nothing here adds it. A nil wanted set is GetMany.
+func (db *DB) GetManyProjected(ctx context.Context, acct jmap.Id, typeName string, ids []jmap.Id, wanted map[string]bool) ([]Object, error) {
+	out, _, err := db.getManyRaw(ctx, acct, typeName, ids, wanted)
 	return out, err
 }
 
 // getManyRaw is GetMany keeping each record's stored bytes alongside the
 // decoded object, for the same reason as getRaw. raws[i] is nil exactly
-// when out[i] is.
-func (db *DB) getManyRaw(ctx context.Context, acct jmap.Id, typeName string, ids []jmap.Id) ([]Object, [][]byte, error) {
+// when out[i] is. A non-nil wanted set narrows what each record
+// materializes (GetManyProjected); nil decodes everything.
+func (db *DB) getManyRaw(ctx context.Context, acct jmap.Id, typeName string, ids []jmap.Id, wanted map[string]bool) ([]Object, [][]byte, error) {
 	if db.types[typeName] == nil {
 		return nil, nil, ErrUnknownType
 	}
 	if len(ids) == 0 {
 		return nil, nil, nil
 	}
+	decode := db.decodeStored
+	if wanted != nil {
+		decode = func(raw []byte) (Object, error) { return db.decodeStoredSubset(raw, wanted) }
+	}
 	out := make([]Object, len(ids))
 	raws := make([][]byte, len(ids))
 	mg, ok := db.be.(backend.MultiGetter)
 	if !ok {
 		for i, id := range ids {
-			obj, raw, err := db.getRaw(ctx, acct, typeName, id)
-			if errors.Is(err, ErrNotFound) {
+			raw, err := db.be.Get(ctx, objKey(acct, typeName, id))
+			if errors.Is(err, backend.ErrNotFound) {
 				continue
 			}
+			if err != nil {
+				return nil, nil, err
+			}
+			obj, err := decode(raw)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -246,7 +269,7 @@ func (db *DB) getManyRaw(ctx context.Context, acct jmap.Id, typeName string, ids
 			if raw == nil {
 				continue
 			}
-			obj, err := db.decodeStored(raw)
+			obj, err := decode(raw)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -303,6 +326,23 @@ func (db *DB) TypeState(ctx context.Context, acct jmap.Id, typeName string) (str
 		return "", err
 	}
 	return strconv.FormatInt(seq, 10), nil
+}
+
+// Sequence returns the account's current commit sequence number: the
+// number of commits it has ever made (0 for a pristine account). Every
+// state string the account's types report is one of these numbers, so
+// a state compares against the sequence with plain arithmetic - which
+// is how a reader decides, before doing any work, whether a client
+// state is from the future (never issued) or how far behind it is.
+func (db *DB) Sequence(ctx context.Context, acct jmap.Id) (int64, error) {
+	raw, err := db.be.Get(ctx, seqKey(acct))
+	if errors.Is(err, backend.ErrNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return backend.DecodeInt64(raw)
 }
 
 // Update runs fn under the account's writer lease and commits every
@@ -516,7 +556,7 @@ func (u *Update) GetMany(typeName string, ids []jmap.Id) (map[jmap.Id]Object, er
 	if len(remaining) == 0 {
 		return out, nil
 	}
-	objs, raws, err := u.db.getManyRaw(u.ctx, u.acct, typeName, remaining)
+	objs, raws, err := u.db.getManyRaw(u.ctx, u.acct, typeName, remaining, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -762,7 +802,10 @@ func (u *Update) IdsWhereEqual(typeName, prop string, value json.RawMessage) ([]
 	if err != nil {
 		return nil, err
 	}
-	committed, err := u.db.IdsWhereEqual(u.ctx, u.acct, typeName, prop, value)
+	// Unbounded: the staged-record merge below needs the full committed
+	// set to subtract from, and transaction-side consumers are small
+	// membership checks, not client-driven fan-outs.
+	committed, err := u.db.IdsWhereEqual(u.ctx, u.acct, typeName, prop, value, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1148,13 +1191,16 @@ func orderSegs(t *descriptor.Type, p descriptor.Property, obj Object) ([][]byte,
 
 // IdsWhereEqual returns the ids of records whose indexed property
 // equals value, straight from the property index (the /query planner's
-// fast path). The property must be declared Indexed. Equality follows
-// the index encoding, so string comparison is under i;ascii-casemap
-// (RFC 8620 section 5.5). Ids come back in index-key order: for a
-// property with OrderBy this is its declared ordering then id (the
-// stored order IS the answer - Thread's emailIds reads it directly);
-// otherwise it is plain id order.
-func (db *DB) IdsWhereEqual(ctx context.Context, acct jmap.Id, typeName, prop string, value json.RawMessage) ([]jmap.Id, error) {
+// fast path), up to limit (0 means no limit). The property must be
+// declared Indexed. Equality follows the index encoding, so string
+// comparison is under i;ascii-casemap (RFC 8620 section 5.5). Ids come
+// back in index-key order: for a property with OrderBy this is its
+// declared ordering then id (the stored order IS the answer - Thread's
+// emailIds reads it directly); otherwise it is plain id order. The
+// limit stops the scan itself, so a caller bounding its work never
+// materializes more than limit ids: passing budget+1 and refusing on
+// overflow caps both time and memory at the budget.
+func (db *DB) IdsWhereEqual(ctx context.Context, acct jmap.Id, typeName, prop string, value json.RawMessage, limit int) ([]jmap.Id, error) {
 	t := db.types[typeName]
 	if t == nil {
 		return nil, ErrUnknownType
@@ -1171,7 +1217,7 @@ func (db *DB) IdsWhereEqual(ctx context.Context, acct jmap.Id, typeName, prop st
 	var ids []jmap.Id
 	err = db.be.Scan(ctx, start, end, false, func(k, _ []byte) bool {
 		ids = append(ids, idFromObjKey(k))
-		return true
+		return limit == 0 || len(ids) < limit
 	})
 	return ids, err
 }
@@ -1202,6 +1248,40 @@ func (db *DB) IdsWhereAtMost(ctx context.Context, acct jmap.Id, typeName, prop s
 		// Everything with value <= max sorts before the successor of
 		// max's own subrange, so that successor is the exclusive bound.
 		_, end = prefixRange(seg(string(acct)), seg("x"), seg(typeName), seg(prop), v)
+	}
+	var ids []jmap.Id
+	err := db.be.Scan(ctx, start, end, false, func(k, _ []byte) bool {
+		ids = append(ids, idFromObjKey(k))
+		return limit <= 0 || len(ids) < limit
+	})
+	return ids, err
+}
+
+// IdsWhereAtLeast is IdsWhereAtMost's lower-bound mirror: the ids of
+// records whose indexed property is at least min, in ascending value
+// order, up to limit (0 means no limit). A nil min means no lower
+// bound. The property must be declared Indexed; ordering and the min
+// comparison follow the index encoding (RFC 8620 section 5.5 comparison
+// rules). Together the pair answers date-window conditions (RFC 8621
+// section 4.4.1 before/after) as index range reads.
+func (db *DB) IdsWhereAtLeast(ctx context.Context, acct jmap.Id, typeName, prop string, min json.RawMessage, limit int) ([]jmap.Id, error) {
+	t := db.types[typeName]
+	if t == nil {
+		return nil, ErrUnknownType
+	}
+	p, declared := t.Properties[prop]
+	if !declared || !p.Indexed {
+		return nil, fmt.Errorf("objectdb: property %s.%s is not indexed", typeName, prop)
+	}
+	start, end := prefixRange(seg(string(acct)), seg("x"), seg(typeName), seg(prop))
+	if min != nil {
+		v, err := indexValue(p, min)
+		if err != nil {
+			return nil, err
+		}
+		// Everything with value >= min sorts at or after the start of
+		// min's own subrange, so that start is the inclusive bound.
+		start, _ = prefixRange(seg(string(acct)), seg("x"), seg(typeName), seg(prop), v)
 	}
 	var ids []jmap.Id
 	err := db.be.Scan(ctx, start, end, false, func(k, _ []byte) bool {

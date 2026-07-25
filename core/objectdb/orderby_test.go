@@ -71,7 +71,7 @@ func TestOrderByScanOrder(t *testing.T) {
 	mid := createOrdered(t, db, "g1", rawStr("2026-07-17T10:00:00Z"))
 	other := createOrdered(t, db, "g2", rawStr("2026-07-17T00:00:00Z"))
 
-	got, err := db.IdsWhereEqual(ctx, acct, "TestOrdered", "group", rawStr("g1"))
+	got, err := db.IdsWhereEqual(ctx, acct, "TestOrdered", "group", rawStr("g1"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestOrderByScanOrder(t *testing.T) {
 		t.Fatalf("scan order = %v, want %v", got, want)
 	}
 	// The other group is untouched by g1's entries.
-	got, err = db.IdsWhereEqual(ctx, acct, "TestOrdered", "group", rawStr("g2"))
+	got, err = db.IdsWhereEqual(ctx, acct, "TestOrdered", "group", rawStr("g2"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestOrderByEqualDates(t *testing.T) {
 		createOrdered(t, db, "g1", at),
 		createOrdered(t, db, "g1", at),
 	}
-	got, err := db.IdsWhereEqual(context.Background(), acct, "TestOrdered", "group", rawStr("g1"))
+	got, err := db.IdsWhereEqual(context.Background(), acct, "TestOrdered", "group", rawStr("g1"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestOrderByAbsentValue(t *testing.T) {
 	db := orderedDB(t)
 	dated := createOrdered(t, db, "g1", rawStr("0000-01-01T00:00:00Z"))
 	blank := createOrdered(t, db, "g1", nil)
-	got, err := db.IdsWhereEqual(context.Background(), acct, "TestOrdered", "group", rawStr("g1"))
+	got, err := db.IdsWhereEqual(context.Background(), acct, "TestOrdered", "group", rawStr("g1"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func TestOrderByDeleteAndMove(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := db.IdsWhereEqual(ctx, acct, "TestOrdered", "group", rawStr("g1"))
+	got, err := db.IdsWhereEqual(ctx, acct, "TestOrdered", "group", rawStr("g1"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,14 +177,14 @@ func TestOrderByDeleteAndMove(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err = db.IdsWhereEqual(ctx, acct, "TestOrdered", "group", rawStr("g1"))
+	got, err = db.IdsWhereEqual(ctx, acct, "TestOrdered", "group", rawStr("g1"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 0 {
 		t.Fatalf("g1 after move = %v, want empty", got)
 	}
-	got, err = db.IdsWhereEqual(ctx, acct, "TestOrdered", "group", rawStr("g2"))
+	got, err = db.IdsWhereEqual(ctx, acct, "TestOrdered", "group", rawStr("g2"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}

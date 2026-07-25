@@ -44,6 +44,18 @@ func (db *DB) decodeStored(raw []byte) (Object, error) {
 	return Object(m), err
 }
 
+// decodeStoredSubset is decodeStored materializing only the wanted
+// property names. Acceptance is identical - the whole record is still
+// validated, preserving the untrusted-backend guarantee above - but an
+// unwanted property costs the validation scan and nothing else, so a
+// caller that needs three properties of a large record does not pay
+// for the rest. A nil wanted set is not a shortcut for "all"; callers
+// wanting the full record use decodeStored.
+func (db *DB) decodeStoredSubset(raw []byte, wanted map[string]bool) (Object, error) {
+	m, err := jsonscan.DecodeObjectSubset(raw, db.propNames, wanted)
+	return Object(m), err
+}
+
 // encodeObject encodes a record deterministically (member names sorted),
 // refusing any property value that is not exactly one valid JSON value -
 // see jsonscan.EncodeObject for the injection and depth guarantees.

@@ -101,6 +101,115 @@ func DecodeObject(raw []byte, names map[string]string) (map[string]json.RawMessa
 	}
 }
 
+// DecodeObjectSubset is DecodeObject restricted to the wanted member
+// names: acceptance is identical (the whole value is validated, so a
+// malformed member past the last wanted one is still an error, and a
+// duplicated wanted name keeps the last value like a map decode), but
+// only wanted members are materialized. An unwanted member costs the
+// validation scan and nothing else - its name is never decoded and its
+// value never stored - so a record padded with junk members cannot
+// inflate the result. A name carrying escapes or non-ASCII is decoded
+// before the wanted check, so it matches the same member name
+// DecodeObject would produce. A nil wanted set decodes nothing but
+// still validates; callers wanting everything use DecodeObject.
+func DecodeObjectSubset(raw []byte, names map[string]string, wanted map[string]bool) (map[string]json.RawMessage, error) {
+	s := &scanner{buf: raw}
+	s.skipSpace()
+	if s.pos >= len(s.buf) {
+		return nil, s.errAt("empty input")
+	}
+	if s.buf[s.pos] == 'n' {
+		if err := s.literal("null"); err != nil {
+			return nil, err
+		}
+		if err := s.end(); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	if s.buf[s.pos] != '{' {
+		return nil, s.errAt("record is not a JSON object")
+	}
+	s.pos++
+	obj := make(map[string]json.RawMessage, len(wanted))
+	s.skipSpace()
+	if s.pos < len(s.buf) && s.buf[s.pos] == '}' {
+		s.pos++
+		if err := s.end(); err != nil {
+			return nil, err
+		}
+		return obj, nil
+	}
+	for {
+		s.skipSpace()
+		start := s.pos
+		if err := s.skipString(); err != nil {
+			return nil, err
+		}
+		span := s.buf[start+1 : s.pos-1]
+		clean := true
+		for _, c := range span {
+			if c == '\\' || c >= utf8.RuneSelf {
+				clean = false
+				break
+			}
+		}
+		var key string
+		var keep bool
+		if clean {
+			// The map lookups on string(span) do not copy; an unwanted
+			// clean name allocates nothing.
+			if wanted[string(span)] {
+				keep = true
+				if interned, ok := names[string(span)]; ok {
+					key = interned
+				} else {
+					key = string(span)
+				}
+			}
+		} else {
+			v := unquote(span)
+			if wanted[v] {
+				keep = true
+				if interned, ok := names[v]; ok {
+					key = interned
+				} else {
+					key = v
+				}
+			}
+		}
+		s.skipSpace()
+		if s.pos >= len(s.buf) || s.buf[s.pos] != ':' {
+			return nil, s.errAt("expected ':' after member name")
+		}
+		s.pos++
+		s.skipSpace()
+		vstart := s.pos
+		if err := s.skipValue(1); err != nil {
+			return nil, err
+		}
+		if keep {
+			obj[key] = s.buf[vstart:s.pos]
+		}
+		s.skipSpace()
+		if s.pos >= len(s.buf) {
+			return nil, s.errAt("unterminated object")
+		}
+		switch s.buf[s.pos] {
+		case ',':
+			s.pos++
+		case '}':
+			s.pos++
+			if err := s.end(); err != nil {
+				return nil, err
+			}
+			return obj, nil
+		default:
+			return nil, s.errAt("expected ',' or '}' in object")
+		}
+	}
+}
+
 // EncodeObject encodes a record deterministically (member names sorted).
 // Every value is fully validated as exactly one JSON value before being
 // copied verbatim: a malformed value - trailing bytes, unbalanced
@@ -305,6 +414,80 @@ func EachKey(raw []byte, fn func(key string)) error {
 			return s.end()
 		default:
 			return s.errAt("expected ',' or '}' in object")
+		}
+	}
+}
+
+// HasKey reports whether a JSON object value has a member named key.
+// Acceptance matches EachKey exactly: the whole value is validated even
+// after a hit, so a malformed object is an error rather than a partial
+// answer, and a literal null is an objectless false. Only top-level
+// member names are compared; names inside nested values never match.
+// The escape-free ASCII common case compares the name bytes in place
+// and allocates nothing; a name carrying escapes or non-ASCII is
+// decoded first so the comparison sees the same member name EachKey
+// would report.
+func HasKey(raw []byte, key string) (bool, error) {
+	s := &scanner{buf: raw}
+	s.skipSpace()
+	if s.pos < len(s.buf) && s.buf[s.pos] == 'n' {
+		if err := s.literal("null"); err != nil {
+			return false, err
+		}
+		return false, s.end()
+	}
+	if s.pos >= len(s.buf) || s.buf[s.pos] != '{' {
+		return false, s.errAt("not an object")
+	}
+	s.pos++
+	s.skipSpace()
+	if s.pos < len(s.buf) && s.buf[s.pos] == '}' {
+		s.pos++
+		return false, s.end()
+	}
+	found := false
+	for {
+		s.skipSpace()
+		start := s.pos
+		if err := s.skipString(); err != nil {
+			return false, err
+		}
+		if !found {
+			span := s.buf[start+1 : s.pos-1]
+			clean := true
+			for _, c := range span {
+				if c == '\\' || c >= utf8.RuneSelf {
+					clean = false
+					break
+				}
+			}
+			if clean {
+				found = string(span) == key
+			} else {
+				found = unquote(span) == key
+			}
+		}
+		s.skipSpace()
+		if s.pos >= len(s.buf) || s.buf[s.pos] != ':' {
+			return false, s.errAt("expected ':' after member name")
+		}
+		s.pos++
+		s.skipSpace()
+		if err := s.skipValue(1); err != nil {
+			return false, err
+		}
+		s.skipSpace()
+		if s.pos >= len(s.buf) {
+			return false, s.errAt("unterminated object")
+		}
+		switch s.buf[s.pos] {
+		case ',':
+			s.pos++
+		case '}':
+			s.pos++
+			return found, s.end()
+		default:
+			return false, s.errAt("expected ',' or '}' in object")
 		}
 	}
 }

@@ -24,7 +24,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -70,35 +70,40 @@ func WithVacationResponder(q *SubmissionQueue) DelivererOption {
 // section 1: "in some circumstances it is acceptable"), and nothing about
 // it may affect the delivery that triggered it.
 func (d *Deliverer) maybeVacationReply(ctx context.Context, acct jmap.Id, rcpt string, env Envelope, msg *parsed, now time.Time) {
-	if !vacationShouldReply(env, msg, rcpt) {
+	if should, reason := vacationShouldReply(env, msg, rcpt); !should {
+		slog.Debug("naust-jmap vacation: not replying", "recipient", rcpt, "reason", reason)
 		return
 	}
 	full, _, err := loadVacation(ctx, d.db, acct)
 	if err != nil {
-		log.Printf("naust-jmap vacation: load: %v", err)
+		slog.Error("naust-jmap vacation: load", "err", err)
 		return
 	}
 	if !vacationEnabledNow(full, now) {
+		slog.Debug("naust-jmap vacation: not replying", "recipient", rcpt, "reason", "not enabled for now")
 		return
 	}
 	identityId, identityEmail, ok, err := d.vacationIdentity(ctx, acct, rcpt, env.MailFrom)
 	if err != nil {
-		log.Printf("naust-jmap vacation: identities: %v", err)
+		slog.Error("naust-jmap vacation: identities", "err", err)
 		return
 	}
 	if !ok {
-		return // no Identity for the delivered-to address (or the sender is ourselves)
+		// no Identity for the delivered-to address (or the sender is ourselves)
+		slog.Debug("naust-jmap vacation: not replying", "recipient", rcpt, "reason", "no matching identity")
+		return
 	}
 	// Best-effort suppression pre-check outside the lease, so the common
 	// repeated-sender case never builds a blob it will discard. The
 	// authoritative check re-runs under the lease in vacationCommit.
-	if ids, err := d.db.IdsWhereEqual(ctx, acct, TypeVacationNotified, "sender", mustJSON(env.MailFrom)); err == nil {
+	if ids, err := d.db.IdsWhereEqual(ctx, acct, TypeVacationNotified, "sender", mustJSON(env.MailFrom), 0); err == nil {
 		for _, id := range ids {
 			rec, err := d.db.Get(ctx, acct, TypeVacationNotified, id)
 			if err != nil {
 				continue
 			}
 			if at, err := parseUTCDateValue(rec["sentAt"]); err == nil && now.Sub(at) < vacationSuppressPeriod {
+				slog.Debug("naust-jmap vacation: not replying", "recipient", rcpt, "reason", "sender still within suppression period")
 				return
 			}
 		}
@@ -107,7 +112,7 @@ func (d *Deliverer) maybeVacationReply(ctx context.Context, acct jmap.Id, rcpt s
 	raw, replyMsgID := buildVacationReply(identityEmail, env.MailFrom, msg, full, now)
 	bw, err := d.store.Create(ctx, acct)
 	if err != nil {
-		log.Printf("naust-jmap vacation: blob create: %v", err)
+		slog.Error("naust-jmap vacation: blob create", "err", err)
 		return
 	}
 	committed := false
@@ -117,12 +122,12 @@ func (d *Deliverer) maybeVacationReply(ctx context.Context, acct jmap.Id, rcpt s
 		}
 	}()
 	if _, err := bw.Write([]byte(raw)); err != nil {
-		log.Printf("naust-jmap vacation: blob write: %v", err)
+		slog.Error("naust-jmap vacation: blob write", "err", err)
 		return
 	}
 	replyParsed, err := parseMessage(strings.NewReader(raw), func() *capture { c := newCapture(); c.preview = true; return c }())
 	if err != nil {
-		log.Printf("naust-jmap vacation: reply parse: %v", err)
+		slog.Error("naust-jmap vacation: reply parse", "err", err)
 		return
 	}
 
@@ -135,9 +140,11 @@ func (d *Deliverer) maybeVacationReply(ctx context.Context, acct jmap.Id, rcpt s
 		// Suppressed or no sent mailbox: nothing was queued. The blob was
 		// already published by the finalize half; unreferenced, it is
 		// reclaimed by the blob sweep like any abandoned upload.
+		slog.Debug("naust-jmap vacation: not replying", "recipient", rcpt,
+			"reason", "suppressed or no sent mailbox (authoritative check under lease)")
 		return
 	case err != nil || finalized == "":
-		log.Printf("naust-jmap vacation: commit: %v", err)
+		slog.Error("naust-jmap vacation: commit", "err", err)
 		return
 	}
 	d.vacationQ.ring()
@@ -245,29 +252,32 @@ func ptrString(s string) *string { return &s }
 //   - never to responder/owner addresses by local-part convention;
 //   - only when the delivered-to address appears in To or Cc (the
 //     message was addressed to this recipient, not merely delivered).
-func vacationShouldReply(env Envelope, msg *parsed, rcpt string) bool {
+//
+// vacationShouldReply reports whether to reply, and, when it refuses, a
+// short reason a debug log can show without the caller re-deriving it.
+func vacationShouldReply(env Envelope, msg *parsed, rcpt string) (bool, string) {
 	sender := env.MailFrom
 	if sender == "" {
-		return false
+		return false, "null reverse-path"
 	}
 	local, _, ok := splitAddr(sender)
 	if !ok {
-		return false
+		return false, "sender address unparsable"
 	}
 	lower := strings.ToLower(local)
 	if lower == "mailer-daemon" || strings.HasPrefix(lower, "owner-") || strings.HasSuffix(lower, "-request") {
-		return false
+		return false, "sender is a responder/owner address"
 	}
 	addressed := false
 	for _, h := range msg.msg.Headers {
 		name := strings.ToLower(h.Name)
 		if strings.HasPrefix(name, "list-") {
-			return false
+			return false, "list mail"
 		}
 		switch name {
 		case "auto-submitted":
 			if v := strings.ToLower(strings.TrimSpace(h.Value)); v != "" && v != "no" && !strings.HasPrefix(v, "no ") && !strings.HasPrefix(v, "no;") {
-				return false
+				return false, "sender is automatic (Auto-Submitted)"
 			}
 		case "to", "cc":
 			for _, a := range message.AddressesForm(h.Value) {
@@ -277,7 +287,10 @@ func vacationShouldReply(env Envelope, msg *parsed, rcpt string) bool {
 			}
 		}
 	}
-	return addressed
+	if !addressed {
+		return false, "recipient not in To/Cc"
+	}
+	return true, ""
 }
 
 // vacationIdentity finds the Identity the reply is sent as: one whose

@@ -27,7 +27,7 @@ package mail
 import (
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -218,9 +218,10 @@ func (d *Deliverer) ingestReport(u *objectdb.Update, rep *inboundReport, blobID 
 	}
 
 	if len(consumed) == 0 {
-		log.Printf("naust-jmap delivery: %s report for submission %s advanced nothing; swallowed", rep.kind, subId)
+		slog.Info("naust-jmap delivery: report advanced nothing, swallowed", "kind", rep.kind, "submissionId", subId)
 		return true, false, nil
 	}
+	slog.Debug("naust-jmap delivery: report matched", "kind", rep.kind, "submissionId", subId, "consumed", len(consumed))
 	at := mustJSON(now.UTC().Format(time.RFC3339))
 	for _, c := range consumed {
 		if _, err := u.Create(TypeSubmissionReport, objectdb.Object{

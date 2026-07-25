@@ -242,8 +242,9 @@ func TestEmailSubmissionGroupRecipients(t *testing.T) {
 
 // TestEmailSubmissionChanges: /changes (7.2) tracks the submission
 // lifecycle; /queryChanges (7.4) validates its arguments through the same
-// sort semantics as /query and then answers cannotCalculateChanges (this
-// server's /query always advertises canCalculateChanges: false).
+// sort semantics as /query; EmailSubmission's whole filter/sort surface
+// is record-local, so /query advertises canCalculateChanges: true and
+// /queryChanges answers real diffs (RFC 8620 sections 5.5-5.6).
 func TestEmailSubmissionChanges(t *testing.T) {
 	ts, db, store, _ := submissionServer(t)
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
@@ -256,7 +257,7 @@ func TestEmailSubmissionChanges(t *testing.T) {
 	r = callSub(t, ts, inv("EmailSubmission/query",
 		fmt.Sprintf(`{"accountId":%q}`, testAccount), "0"))
 	q := methodArgs(t, r, 0, "EmailSubmission/query")
-	if q["canCalculateChanges"] != false {
+	if q["canCalculateChanges"] != true {
 		t.Errorf("canCalculateChanges = %v", q["canCalculateChanges"])
 	}
 	queryState0 := q["queryState"].(string)
@@ -273,13 +274,15 @@ func TestEmailSubmissionChanges(t *testing.T) {
 	state1 := ch["newState"].(string)
 
 	// The "sentAt" sort alias is honored on /queryChanges exactly as on
-	// /query: the arguments pass validation, then the section 5.6 answer
-	// for an uncalculatable state applies.
+	// /query, and the new submission comes back as an added item with
+	// its position (section 5.6).
 	r = callSub(t, ts, inv("EmailSubmission/queryChanges",
 		fmt.Sprintf(`{"accountId":%q,"sinceQueryState":%q,"sort":[{"property":"sentAt"}]}`,
 			testAccount, queryState0), "0"))
-	if args := methodArgs(t, r, 0, "error"); args["type"] != "cannotCalculateChanges" {
-		t.Errorf("queryChanges = %v", args)
+	qc := methodArgs(t, r, 0, "EmailSubmission/queryChanges")
+	added, _ := qc["added"].([]any)
+	if len(added) != 1 || added[0].(map[string]any)["id"] != subId {
+		t.Errorf("queryChanges added = %v, want the new submission", qc)
 	}
 	r = callSub(t, ts, inv("EmailSubmission/queryChanges",
 		fmt.Sprintf(`{"accountId":%q,"sinceQueryState":%q,"sort":[{"property":"attempts"}]}`,

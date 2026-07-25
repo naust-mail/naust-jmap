@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
+	"github.com/naust-mail/naust-jmap/core/providers/backend/memory"
+	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/tuning"
 )
 
@@ -60,6 +62,87 @@ func TestGetManyChunksAcrossBatchBoundary(t *testing.T) {
 		}
 		if string(got[i]["subject"]) != string(want["subject"]) {
 			t.Errorf("index %d (%q): subject = %s, want %s", i, id, got[i]["subject"], want["subject"])
+		}
+	}
+}
+
+// TestGetManyProjected pins the projection contract against GetMany as
+// the executable specification: same order, same nil-for-missing, and
+// for each found record exactly the wanted-and-present properties with
+// byte-identical values. Unknown wanted names are harmless, a nil
+// wanted set is plain GetMany, and both the MultiGetter path and the
+// sequential fallback (exercised via a small chunk size) must agree.
+func TestGetManyProjected(t *testing.T) {
+	orig := tuning.MaxMultiGetBatch
+	tuning.MaxMultiGetBatch = 2
+	t.Cleanup(func() { tuning.MaxMultiGetBatch = orig })
+
+	for _, mode := range []string{"multigetter", "sequential-fallback"} {
+		t.Run(mode, func(t *testing.T) {
+			var db *DB
+			if mode == "multigetter" {
+				db = newDB(t)
+			} else {
+				// getCountBackend (readcache_test.go) hides MultiGetter,
+				// forcing the per-id Get path.
+				be := &getCountBackend{Backend: memory.New(), gets: map[string]int{}}
+				db = New(be, lease.NewInProcess(be), WithVerifyPreImages())
+				if err := db.RegisterType(noteType()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			testGetManyProjected(t, db)
+		})
+	}
+}
+
+func testGetManyProjected(t *testing.T, db *DB) {
+	ctx := context.Background()
+
+	var ids []jmap.Id
+	for i := 0; i < 5; i++ {
+		id, _ := create(t, db, note(fmt.Sprintf("subject-%d", i), fmt.Sprintf("body-%d", i)))
+		ids = append(ids, id)
+	}
+	requested := []jmap.Id{ids[0], "missing", ids[1], ids[2], ids[3], ids[4]}
+
+	full, err := db.GetMany(ctx, acct, "TestNote", requested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, wanted := range []map[string]bool{
+		{"id": true, "subject": true},
+		{"id": true, "subject": true, "no-such-property": true},
+		{"no-such-property": true},
+		nil,
+	} {
+		got, err := db.GetManyProjected(ctx, acct, "TestNote", requested, wanted)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != len(full) {
+			t.Fatalf("wanted %v: got %d results, want %d", wanted, len(got), len(full))
+		}
+		for i := range full {
+			if (got[i] == nil) != (full[i] == nil) {
+				t.Fatalf("wanted %v index %d: nil-ness mismatch", wanted, i)
+			}
+			if full[i] == nil {
+				continue
+			}
+			expect := 0
+			for name, v := range full[i] {
+				if wanted != nil && !wanted[name] {
+					continue
+				}
+				expect++
+				if g, ok := got[i][name]; !ok || string(g) != string(v) {
+					t.Errorf("wanted %v index %d property %q = %s, want %s", wanted, i, name, g, v)
+				}
+			}
+			if len(got[i]) != expect {
+				t.Errorf("wanted %v index %d: %d properties, want %d", wanted, i, len(got[i]), expect)
+			}
 		}
 	}
 }

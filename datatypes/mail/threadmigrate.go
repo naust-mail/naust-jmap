@@ -115,7 +115,7 @@ func MigrateThreadCounters(ctx context.Context, db *objectdb.DB, acct jmap.Id, m
 	// found by the next call, the same outcome as running a moment
 	// earlier, and the generation is re-read under the lease before the
 	// marker is ever retired.
-	markers, err := db.IdsWhereEqual(ctx, acct, typeCounterRules, "k", json.RawMessage(`"`+counterRulesKey+`"`))
+	markers, err := db.IdsWhereEqual(ctx, acct, typeCounterRules, "k", json.RawMessage(`"`+counterRulesKey+`"`), 0)
 	if err != nil {
 		return false, err
 	}

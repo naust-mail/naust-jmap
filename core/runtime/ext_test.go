@@ -78,6 +78,9 @@ func gadgetServerType(t *testing.T, typ *descriptor.Type, ext *Extensions) *http
 	be := memory.New()
 	db := objectdb.New(be, lease.NewInProcess(be))
 	p := NewProcessor()
+	// The assertion mode, so every projected query in these serial
+	// suites is cross-checked against a full decode.
+	p.VerifyQueryProjection()
 	if err := RegisterStandardTypeExt(p, db, typ, DefaultCoreCapabilities(), ext); err != nil {
 		t.Fatal(err)
 	}

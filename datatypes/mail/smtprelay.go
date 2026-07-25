@@ -446,6 +446,9 @@ func buildRcptCmd(r SubmissionRecipient, dsnOK bool) (string, error) {
 // printable US-ASCII except "=", no spaces); anything else cannot be
 // transmitted and is refused rather than silently altered.
 func appendParam(b *strings.Builder, key string, val *string) error {
+	if !paramValueWireSafe(key) {
+		return fmt.Errorf("parameter name %q has a value not expressible in an SMTP command", key)
+	}
 	if val == nil {
 		fmt.Fprintf(b, " %s", key)
 		return nil

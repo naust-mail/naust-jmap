@@ -3,12 +3,11 @@ package runtime
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
@@ -23,10 +22,11 @@ import (
 // rules) composed with AND/OR/NOT. The planner is rule-based and dumb:
 // a condition on an indexed property becomes an index range scan for
 // the candidate set; everything else evaluates in memory over the
-// loaded records. canCalculateChanges is always false: the runtime
-// keeps no per-query change history, so Foo/queryChanges (5.6) answers
-// cannotCalculateChanges after validating its arguments, and a client
-// re-runs the query as the spec directs.
+// loaded records. canCalculateChanges is per-query truth (5.5 defines it
+// per filter/sort combination): true exactly when the query is record-
+// local (see changeCalculable). Foo/queryChanges (5.6) currently still
+// answers cannotCalculateChanges after validating its arguments - always
+// a legal response - and a client re-runs the query as the spec directs.
 
 type queryArgs struct {
 	AccountId      jmap.Id           `json:"accountId"`
@@ -94,59 +94,9 @@ func (st *stdType) query(ctx context.Context, call *Call) []jmap.Invocation {
 		limit = *a.Limit
 	}
 
-	// Candidate set: the filter tree composed from index producers, a
-	// SUPERSET of the true matches (5.5). exact reports the set is precisely
-	// the match set, so no residual predicate could drop any; narrowed
-	// reports the producers narrowed at all (else scan everything).
-	set, exact, narrowed, err := st.candidateSet(ctx, a.AccountId, root)
+	results, err := st.evaluate(ctx, a.AccountId, root, compare, len(a.Sort) == 0, collapse, extra, nil, st.queryProjection(root, a.Sort, collapse))
 	if err != nil {
 		return fail(call.CallID, jmap.ErrServerFail, err.Error())
-	}
-
-	var results []jmap.Id
-	if narrowed && exact && len(a.Sort) == 0 && !collapse {
-		// Fast path: the candidate set is exactly the match set and needs no
-		// ordering beyond id order, so the ids are the answer with no record
-		// loads. RFC 8621 4.4's "total is fast for a single inMailbox
-		// filter" is this case. Trusting exact here without a per-record
-		// predicate recheck is the ONE place the narrow-then-verify
-		// invariant is waived; the metamorphic test guards it.
-		results = dedupSortIds(set)
-	} else {
-		candidates := set
-		if !narrowed {
-			candidates, err = st.db.AllIds(ctx, a.AccountId, st.t.Name, 0)
-			if err != nil {
-				return fail(call.CallID, jmap.ErrServerFail, err.Error())
-			}
-		}
-		matched, err := st.loadAndMatch(ctx, a.AccountId, root, candidates)
-		if err != nil {
-			return fail(call.CallID, jmap.ErrServerFail, err.Error())
-		}
-		// Ties (including the empty sort) fall back to id order, keeping the
-		// full order stable between calls as 5.5 requires. compare is that
-		// total order; collapse and Arrange receive records in it.
-		sort.SliceStable(matched, func(i, j int) bool {
-			return compare(matched[i].Obj, matched[j].Obj) < 0
-		})
-		// collapseThreads keeps only the first record of each grouping-key
-		// value in the sorted list (RFC 8621 4.4.3); core behaviour, the
-		// type supplies only the key name.
-		if collapse {
-			matched = collapseByKey(matched, collapseKey)
-		}
-		if st.ext != nil && st.ext.Query != nil && st.ext.Query.Arrange != nil {
-			results, err = st.ext.Query.Arrange(ctx, a.AccountId, matched, compare, extra)
-			if err != nil {
-				return fail(call.CallID, jmap.ErrServerFail, err.Error())
-			}
-		} else {
-			results = make([]jmap.Id, len(matched))
-			for i, m := range matched {
-				results[i] = m.Id
-			}
-		}
 	}
 	total := int64(len(results))
 
@@ -183,10 +133,21 @@ func (st *stdType) query(ctx context.Context, call *Call) []jmap.Invocation {
 		ids = results[position:windowEnd]
 	}
 
+	// The query state is a commit sequence number, not a fingerprint of
+	// the result list: section 5.5 requires the string to change whenever
+	// the results change - any such change is a commit that advances the
+	// number - and explicitly permits it to change when something changed
+	// on the server without affecting the results. Unlike a result hash,
+	// the number tells Foo/queryChanges exactly how far behind a client
+	// is before doing any work.
+	queryState, err := st.queryStateOf(ctx, a.AccountId)
+	if err != nil {
+		return fail(call.CallID, jmap.ErrServerFail, err.Error())
+	}
 	resp := queryResponse{
 		AccountId:           a.AccountId,
-		QueryState:          queryStateOf(results),
-		CanCalculateChanges: false,
+		QueryState:          queryState,
+		CanCalculateChanges: st.changeCalculable(root, a.Sort, collapse, len(extra) > 0),
 		Position:            position,
 		Ids:                 ids,
 	}
@@ -199,13 +160,35 @@ func (st *stdType) query(ctx context.Context, call *Call) []jmap.Invocation {
 	return reply(st.t.Name+"/query", call.CallID, resp)
 }
 
-// Foo/queryChanges (RFC 8620 section 5.6). /query always advertises
-// canCalculateChanges: false, so a spec-following client never calls
-// this; one that does anyway gets the section 5.6 answer for "the
-// server cannot calculate the changes from the queryState string" -
-// cannotCalculateChanges, telling it to refetch the query - rather
-// than unknownMethod. Arguments are still validated in full first
-// (section 3.9), with the same filter/sort rules as /query.
+// Foo/queryChanges (RFC 8620 section 5.6): update a cached query result
+// to the current state by reporting removed ids and added (id, index)
+// pairs the client splices into its cached list.
+//
+// The answer leans on two section 5.6 latitudes. First, removed may be
+// a superset: "the server MAY return the ids of extra Foos in addition
+// that may have been in the old results". Second, refusing with
+// cannotCalculateChanges is always legal and always safe - the client's
+// mandated fallback is re-running the query, which costs about what a
+// full recalculation here would have. So the implementation is built to
+// be never-wrong rather than always-complete: every uncertain path
+// refuses or over-reports removed, and only provable additions are
+// reported with positions.
+//
+// The correctness core: for a record-local query (the only kind that
+// reaches this code; see changeCalculable), an id's membership or
+// position in the results can only change if that record itself changed
+// - so the coalesced changed ids since the client's state cover every
+// possible difference between the old and new results. removed = the
+// changed ids (minus creations, which the old results never held) is
+// then a legal superset, and added = the changed ids present in the
+// current results, with their positions - which by 5.6's own wording
+// must include still-present ids from removed ("due to a filter or sort
+// based upon a mutable property"), and does so here by construction.
+// For a collapsed query the same argument holds after expanding every
+// changed group to its members: an untouched record's standing can only
+// move when a group sibling changed, and group membership changes -
+// including destroys, whose own records are gone from the log's view -
+// appear as companion-record updates in the same account log.
 type queryChangesArgs struct {
 	AccountId       jmap.Id           `json:"accountId"`
 	Filter          json.RawMessage   `json:"filter"`
@@ -219,6 +202,23 @@ type queryChangesArgs struct {
 	CollapseThreads *bool `json:"collapseThreads"`
 }
 
+type queryChangesResponse struct {
+	AccountId     jmap.Id   `json:"accountId"`
+	OldQueryState string    `json:"oldQueryState"`
+	NewQueryState string    `json:"newQueryState"`
+	Total         *int64    `json:"total,omitzero"`
+	Removed       []jmap.Id `json:"removed"`
+	// Added is sorted by index, lowest first (5.6).
+	Added []addedItem `json:"added"`
+}
+
+// addedItem is the section 5.6 AddedItem: an id and its absolute index
+// in the new results.
+type addedItem struct {
+	Id    jmap.Id `json:"id"`
+	Index int64   `json:"index"`
+}
+
 func (st *stdType) queryChanges(ctx context.Context, call *Call) []jmap.Invocation {
 	var a queryChangesArgs
 	if err := decodeArgs(call.Args, &a); err != nil {
@@ -230,6 +230,7 @@ func (st *stdType) queryChanges(ctx context.Context, call *Call) []jmap.Invocati
 	if a.CollapseThreads != nil && st.collapseKey() == "" {
 		return fail(call.CallID, jmap.ErrInvalidArguments, "unknown argument collapseThreads")
 	}
+	collapse := a.CollapseThreads != nil && *a.CollapseThreads
 	if a.SinceQueryState == nil {
 		return fail(call.CallID, jmap.ErrInvalidArguments, "sinceQueryState is required")
 	}
@@ -238,26 +239,391 @@ func (st *stdType) queryChanges(ctx context.Context, call *Call) []jmap.Invocati
 	if a.MaxChanges != nil && (*a.MaxChanges < 0 || !jmap.ValidUnsignedInt(*a.MaxChanges)) {
 		return fail(call.CallID, jmap.ErrInvalidArguments, "maxChanges must be an UnsignedInt")
 	}
-	if _, errType, desc := parseFilter(st.t, st.filterSemantics(), a.Filter); errType != "" {
+	root, errType, desc := parseFilter(st.t, st.filterSemantics(), a.Filter)
+	if errType != "" {
 		return fail(call.CallID, errType, desc)
 	}
 	// Sort validation goes through the same path as /query, so a type's
 	// SortSemantics answers identically on both methods.
-	if _, errType, desc := st.buildCompare(ctx, a.AccountId, a.Sort); errType != "" {
+	compare, errType, desc := st.buildCompare(ctx, a.AccountId, a.Sort)
+	if errType != "" {
 		return fail(call.CallID, errType, desc)
 	}
-	return fail(call.CallID, jmap.ErrCannotCalculateChanges, "")
+	// A query /query answers canCalculateChanges: false for gets the
+	// matching refusal here; the two verdicts are one function.
+	if !st.changeCalculable(root, a.Sort, collapse, false) {
+		return fail(call.CallID, jmap.ErrCannotCalculateChanges, "")
+	}
+
+	// The gates: three O(1) decisions before any real work. A state that
+	// is not one of this server's commit numbers, or is ahead of the
+	// account, was never issued (5.6: "cannot calculate the changes from
+	// the queryState string"); how far behind a valid one is, is plain
+	// subtraction, checked inside ChangedSince against the work budget.
+	since, err := strconv.ParseInt(*a.SinceQueryState, 10, 64)
+	if err != nil || since < 0 {
+		return fail(call.CallID, jmap.ErrCannotCalculateChanges, "")
+	}
+	global, err := st.db.Sequence(ctx, a.AccountId)
+	if err != nil {
+		return fail(call.CallID, jmap.ErrServerFail, err.Error())
+	}
+	if since > global {
+		return fail(call.CallID, jmap.ErrCannotCalculateChanges, "")
+	}
+
+	// Everything from the state read to the answer runs as one attempt:
+	// the diff window and the evaluation must describe the same
+	// sequence, and without backend snapshots the only way to know they
+	// did is to bracket the work with sequence reads and redo it when a
+	// commit slipped in between (the check before the reply below).
+	for attempt := 0; ; attempt++ {
+
+		// newQueryState is read BEFORE the log walk. The walk clamps at the
+		// sequence it reads on entry, which is at or past this one, so every
+		// change up to newQueryState is fully covered by the diff; commits
+		// racing in behind it are reported again on the client's next call
+		// (the removed superset makes re-reporting harmless), never lost.
+		newState, err := st.queryStateOf(ctx, a.AccountId)
+		if err != nil {
+			return fail(call.CallID, jmap.ErrServerFail, err.Error())
+		}
+		newNum, err := strconv.ParseInt(newState, 10, 64)
+		if err != nil {
+			return fail(call.CallID, jmap.ErrServerFail, err.Error())
+		}
+		resp := queryChangesResponse{
+			AccountId:     a.AccountId,
+			OldQueryState: *a.SinceQueryState,
+			NewQueryState: newState,
+			Removed:       []jmap.Id{},
+			Added:         []addedItem{},
+		}
+
+		// Tier 0: no commit this query can see landed after the client's
+		// number - the diff is empty, in O(1). The trim floor is irrelevant
+		// here: any trimmed entries described other types' changes, or this
+		// state number would be higher. calculateTotal forfeits the shortcut
+		// (the total requires an evaluation, 5.6 makes it opt-in for exactly
+		// that reason); a state between newQueryState and the account
+		// sequence can only come from a foreign state string, and answers
+		// empty here rather than pretending to compute from it.
+		if newNum <= since && !a.CalculateTotal {
+			return reply(st.t.Name+"/queryChanges", call.CallID, resp)
+		}
+
+		// One work budget covers the whole answer: commits walked, changed
+		// ids held, and group members expanded. Exceeding it refuses before
+		// the expensive work happens - the client's re-run costs about the
+		// same as the answer the budget disallowed.
+		budget := tuning.QueryChangesMaxWork
+		q := st.queryHooks()
+		types := []string{st.t.Name}
+		if collapse {
+			types = append(types, q.GroupCompanion)
+		}
+		changed, upTo, err := st.db.ChangedSince(ctx, a.AccountId, types, since, budget, budget)
+		if errors.Is(err, objectdb.ErrCannotCalculateChanges) {
+			return fail(call.CallID, jmap.ErrCannotCalculateChanges, "")
+		}
+		if err != nil {
+			return fail(call.CallID, jmap.ErrServerFail, err.Error())
+		}
+		primary := changed[st.t.Name]
+		created := sliceToSet(primary.Created)
+		updated := sliceToSet(primary.Updated)
+		destroyed := sliceToSet(primary.Destroyed)
+
+		// Collapsed queries: expand every changed group to its current
+		// members through the collapse-key index. A destroyed member is
+		// absent from the index, but its own destroy is in the primary sets;
+		// an untouched sibling whose standing may have moved (a displaced
+		// representative) is exactly what this pulls in.
+		expanded := map[jmap.Id]bool{}
+		if collapse {
+			comp := changed[q.GroupCompanion]
+			spent := len(created) + len(updated) + len(destroyed)
+			for _, groups := range [][]jmap.Id{comp.Created, comp.Updated, comp.Destroyed} {
+				for _, gid := range groups {
+					key, err := json.Marshal(string(gid))
+					if err != nil {
+						return fail(call.CallID, jmap.ErrServerFail, err.Error())
+					}
+					// budget-spent+1 bounds the scan itself: one oversized
+					// group can neither be materialized past the budget nor
+					// slip through it, mirroring the mid-walk refusal in
+					// ChangedSince.
+					members, err := st.db.IdsWhereEqual(ctx, a.AccountId, st.t.Name, q.CollapseKey, key, budget-spent+1)
+					if err != nil {
+						return fail(call.CallID, jmap.ErrServerFail, err.Error())
+					}
+					spent += len(members)
+					if spent > budget {
+						return fail(call.CallID, jmap.ErrCannotCalculateChanges, "")
+					}
+					for _, id := range members {
+						expanded[id] = true
+					}
+				}
+			}
+		}
+
+		// The immutable-query diet: when every property the filter and sort
+		// read is declared Immutable, a live record can never enter, leave,
+		// or move - updated ids are droppable entirely, so removed shrinks
+		// to the destroys and only creations can have been added. (A
+		// collapsed query stays on the general path: its representative
+		// depends on which siblings exist, not only on each record's own
+		// immutable properties.)
+		reads, readsKnown := st.queryReads(root, a.Sort)
+		immutable := readsKnown && !collapse
+		if immutable {
+			for _, p := range reads {
+				if !st.t.Properties[p].Immutable {
+					immutable = false
+					break
+				}
+			}
+		}
+
+		removedSet := destroyed
+		addCand := created
+		if !immutable {
+			removedSet = make(map[jmap.Id]bool, len(updated)+len(destroyed)+len(expanded))
+			addCand = make(map[jmap.Id]bool, len(created)+len(updated)+len(expanded))
+			for id := range destroyed {
+				removedSet[id] = true
+			}
+			for id := range updated {
+				removedSet[id] = true
+				addCand[id] = true
+			}
+			for id := range created {
+				addCand[id] = true
+			}
+			for id := range expanded {
+				if !created[id] {
+					removedSet[id] = true
+				}
+				addCand[id] = true
+			}
+		}
+		resp.Removed = setToSortedIds(removedSet)
+		// tooManyChanges compares every removed or added item against the
+		// CLIENT's number (5.6) - and removed alone deciding it means the
+		// evaluation below never runs for a client that cannot accept the
+		// answer anyway. maxChanges of zero is valid on this method (unlike
+		// /changes, whose section 5.2 text excludes it): any change at all
+		// is then too many.
+		tooMany := func(count int) bool {
+			return a.MaxChanges != nil && int64(count) > *a.MaxChanges
+		}
+		if tooMany(len(resp.Removed)) {
+			return fail(call.CallID, jmap.ErrTooManyChanges, "")
+		}
+
+		// Tier 1: predicate-check ONLY the changed records (their count is
+		// already inside the budget). If none of them matches the filter
+		// now, nothing was added to the results - removed already covers
+		// every possible departure as a superset - and no evaluation is
+		// needed at all. calculateTotal forfeits the shortcut.
+		wanted := st.queryProjection(root, a.Sort, collapse)
+		if !a.CalculateTotal {
+			matched, err := st.loadAndMatch(ctx, a.AccountId, root, setToSortedIds(addCand), wanted)
+			if err != nil {
+				return fail(call.CallID, jmap.ErrServerFail, err.Error())
+			}
+			if len(matched) == 0 {
+				return reply(st.t.Name+"/queryChanges", call.CallID, resp)
+			}
+		}
+
+		// Tier 2: the full evaluation - the same pipeline /query answers
+		// from, so the positions reported here are exactly the positions a
+		// re-run of the query would show. This is the tier whose cost equals
+		// the refetch the client would otherwise do; it is not waste.
+		//
+		// upToId (5.6): honored only when the whole filter and sort are
+		// proven immutable - for a mutable query the spec commands ignoring
+		// it. When additionally the sort is a single ascending comparator on
+		// an indexed property under the default collation (so index order is
+		// comparator order) and the anchor record still exists and provably
+		// matches, the evaluation itself is narrowed to the ids at or before
+		// the anchor's sort key: every result at or before the anchor is
+		// inside that range, so positions inside it are exact, and nothing
+		// past the anchor was going to be reported anyway.
+		var restrict map[jmap.Id]bool
+		anchored := false
+		if a.UpToId != nil && immutable {
+			anchored = true
+			if !a.CalculateTotal {
+				if prop, ok := st.narrowableSort(a.Sort); ok {
+					if anchorObj, err := st.db.Get(ctx, a.AccountId, st.t.Name, *a.UpToId); err == nil {
+						if matches, err := root.matches(ctx, a.AccountId, st.t, st.filterSemantics(), anchorObj); err == nil && matches {
+							if val, has := anchorObj[prop]; has {
+								ids, err := st.db.IdsWhereAtMost(ctx, a.AccountId, st.t.Name, prop, val, 0)
+								if err != nil {
+									return fail(call.CallID, jmap.ErrServerFail, err.Error())
+								}
+								restrict = sliceToSet(ids)
+							}
+						}
+					}
+				}
+			}
+		}
+		results, err := st.evaluate(ctx, a.AccountId, root, compare, len(a.Sort) == 0, collapse, nil, restrict, wanted)
+		if err != nil {
+			return fail(call.CallID, jmap.ErrServerFail, err.Error())
+		}
+		if a.CalculateTotal {
+			total := int64(len(results))
+			resp.Total = &total
+		}
+
+		// The anchor's index bounds the report: added ids past it are
+		// omitted (5.6 SHOULD, applicable because the anchor was found in
+		// the results). Removed is left whole: a destroyed record's old
+		// position is unprovable without its record, and 5.6's SHOULD
+		// tolerates reporting it; under the immutable diet removed is
+		// destroys only, so there is nothing else to trim.
+		trimIdx := int64(-1)
+		if anchored {
+			for i, id := range results {
+				if id == *a.UpToId {
+					trimIdx = int64(i)
+					break
+				}
+			}
+		}
+		count := len(resp.Removed)
+		for i, id := range results {
+			if trimIdx >= 0 && int64(i) > trimIdx {
+				break
+			}
+			if !addCand[id] {
+				continue
+			}
+			resp.Added = append(resp.Added, addedItem{Id: id, Index: int64(i)})
+			count++
+			if tooMany(count) {
+				return fail(call.CallID, jmap.ErrTooManyChanges, "")
+			}
+		}
+
+		// The walk was clamped at upTo, but the evaluation reads live state
+		// with no snapshot: a commit landing between them can shift absolute
+		// positions, and an added index (or a total) is only correct against
+		// NewQueryState - 5.6's client splice has no tolerance for a wrong
+		// index, unlike the removed superset. Answers carrying no positions
+		// are immune and skip the read. On a detected race, one redo against
+		// the moved sequence; a second collision refuses, and the client's
+		// refetch then costs about what this evaluation did.
+		if len(resp.Added) > 0 || a.CalculateTotal {
+			after, err := st.db.Sequence(ctx, a.AccountId)
+			if err != nil {
+				return fail(call.CallID, jmap.ErrServerFail, err.Error())
+			}
+			if after > upTo {
+				if attempt == 0 {
+					continue
+				}
+				return fail(call.CallID, jmap.ErrCannotCalculateChanges, "")
+			}
+		}
+		return reply(st.t.Name+"/queryChanges", call.CallID, resp)
+
+	}
 }
 
-// queryStateOf derives the query state from the ordered result ids: it
-// changes exactly when the matching ids or their order change (5.5).
-func queryStateOf(ids []jmap.Id) string {
-	h := sha256.New()
-	for _, id := range ids {
-		h.Write([]byte(id))
-		h.Write([]byte{0})
+// queryReads returns the stored properties this query's filter and sort
+// read, and whether that set is fully known. Core conditions and
+// comparators read exactly the property they name; a type's own
+// semantics read what their declaration enumerates, and a declared name
+// with a nil list makes the set unknowable (still calculable, never
+// immutability-proven). Only called for queries changeCalculable
+// accepted, so every name has its declaration.
+func (st *stdType) queryReads(root *filterNode, sortRaw []json.RawMessage) ([]string, bool) {
+	var props []string
+	known := true
+	q := st.queryHooks()
+	var walk func(n *filterNode)
+	walk = func(n *filterNode) {
+		if n == nil {
+			return
+		}
+		for _, c := range n.children {
+			walk(c)
+		}
+		for name := range n.cond {
+			if q != nil && q.Filter != nil {
+				reads := q.LocalConditions[name]
+				if reads == nil {
+					known = false
+				}
+				props = append(props, reads...)
+				continue
+			}
+			props = append(props, name)
+		}
 	}
-	return hex.EncodeToString(h.Sum(nil)[:8])
+	walk(root)
+	for _, raw := range sortRaw {
+		var c struct {
+			Property string `json:"property"`
+		}
+		if json.Unmarshal(raw, &c) != nil || c.Property == "" {
+			return nil, false
+		}
+		if q != nil && q.Sort != nil {
+			reads := q.LocalSorts[c.Property]
+			if reads == nil {
+				known = false
+			}
+			props = append(props, reads...)
+			continue
+		}
+		props = append(props, c.Property)
+	}
+	return props, known
+}
+
+// narrowableSort reports whether the sort is a single ascending core
+// comparator on an indexed property under the default collation - the
+// shape where the property index's order IS the result order, so an
+// index range read can bound the evaluation. An empty sort (pure id
+// order) is not narrowed: ids have no property index to range over.
+func (st *stdType) narrowableSort(sortRaw []json.RawMessage) (string, bool) {
+	if len(sortRaw) != 1 {
+		return "", false
+	}
+	if q := st.queryHooks(); q != nil && q.Sort != nil {
+		return "", false // a Sort override owns its order; no index promise
+	}
+	var c struct {
+		Property    string `json:"property"`
+		IsAscending *bool  `json:"isAscending"`
+		Collation   string `json:"collation"`
+	}
+	if json.Unmarshal(sortRaw[0], &c) != nil || c.Property == "" || c.Collation != "" {
+		return "", false
+	}
+	if c.IsAscending != nil && !*c.IsAscending {
+		return "", false
+	}
+	if p, declared := st.t.Properties[c.Property]; !declared || !p.Indexed {
+		return "", false
+	}
+	return c.Property, true
+}
+
+func setToSortedIds(set map[jmap.Id]bool) []jmap.Id {
+	out := make([]jmap.Id, 0, len(set))
+	for id := range set {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // ---- filter ----
@@ -270,6 +636,104 @@ type filterNode struct {
 	cond     map[string]json.RawMessage
 }
 
+// evaluate runs the full query pipeline (RFC 8620 section 5.5) and
+// returns the complete ordered result ids: candidate narrowing from the
+// index producers, authoritative load-and-match, stable sort, any
+// collapse (RFC 8621 section 4.4.3), and any Arrange hook. It is the
+// one evaluation both Foo/query and Foo/queryChanges answer from, so
+// the two methods can never disagree about what the results are.
+// emptySort reports the sort argument was empty (the fast path may then
+// answer in id order). restrict, when non-nil, drops every candidate
+// outside it before records are loaded - the queryChanges range
+// narrowing under an immutable sort, where positions inside the range
+// are provably unaffected by anything outside it; the fast path is
+// skipped then, since restrict changes what the candidate set means.
+// wanted, when non-nil, narrows what each loaded record materializes
+// to the properties the query provably reads (see queryProjection);
+// nil loads full records.
+func (st *stdType) evaluate(ctx context.Context, acct jmap.Id, root *filterNode, compare func(a, b objectdb.Object) int, emptySort, collapse bool, extra map[string]json.RawMessage, restrict map[jmap.Id]bool, wanted map[string]bool) ([]jmap.Id, error) {
+	results, err := st.evaluateWith(ctx, acct, root, compare, emptySort, collapse, extra, restrict, wanted)
+	if err != nil || wanted == nil || !st.p.verifyQueryProjection {
+		return results, err
+	}
+	// Assertion mode (Processor.VerifyQueryProjection): the projected
+	// answer must equal the full-decode answer, or a reads declaration
+	// omitted a property its hook reads.
+	full, err := st.evaluateWith(ctx, acct, root, compare, emptySort, collapse, extra, restrict, nil)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) != len(full) {
+		return nil, fmt.Errorf("runtime: %s: projected query evaluation diverged from full evaluation (%d vs %d results): a LocalConditions/LocalSorts reads list omits a property its hook reads", st.t.Name, len(results), len(full))
+	}
+	for i := range results {
+		if results[i] != full[i] {
+			return nil, fmt.Errorf("runtime: %s: projected query evaluation diverged from full evaluation at index %d (%s vs %s): a LocalConditions/LocalSorts reads list omits a property its hook reads", st.t.Name, i, results[i], full[i])
+		}
+	}
+	return results, nil
+}
+
+func (st *stdType) evaluateWith(ctx context.Context, acct jmap.Id, root *filterNode, compare func(a, b objectdb.Object) int, emptySort, collapse bool, extra map[string]json.RawMessage, restrict map[jmap.Id]bool, wanted map[string]bool) ([]jmap.Id, error) {
+	// Candidate set: the filter tree composed from index producers, a
+	// SUPERSET of the true matches (5.5). exact reports the set is precisely
+	// the match set, so no residual predicate could drop any; narrowed
+	// reports the producers narrowed at all (else scan everything).
+	set, exact, narrowed, err := st.candidateSet(ctx, acct, root)
+	if err != nil {
+		return nil, err
+	}
+	if narrowed && exact && emptySort && !collapse && restrict == nil {
+		// Fast path: the candidate set is exactly the match set and needs no
+		// ordering beyond id order, so the ids are the answer with no record
+		// loads. RFC 8621 4.4's "total is fast for a single inMailbox
+		// filter" is this case. Trusting exact here without a per-record
+		// predicate recheck is the ONE place the narrow-then-verify
+		// invariant is waived; the metamorphic test guards it.
+		return dedupSortIds(set), nil
+	}
+	candidates := set
+	if !narrowed {
+		candidates, err = st.db.AllIds(ctx, acct, st.t.Name, 0)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if restrict != nil {
+		kept := make([]jmap.Id, 0, len(candidates))
+		for _, id := range candidates {
+			if restrict[id] {
+				kept = append(kept, id)
+			}
+		}
+		candidates = kept
+	}
+	matched, err := st.loadAndMatch(ctx, acct, root, candidates, wanted)
+	if err != nil {
+		return nil, err
+	}
+	// Ties (including the empty sort) fall back to id order, keeping the
+	// full order stable between calls as 5.5 requires. compare is that
+	// total order; collapse and Arrange receive records in it.
+	sort.SliceStable(matched, func(i, j int) bool {
+		return compare(matched[i].Obj, matched[j].Obj) < 0
+	})
+	// collapseThreads keeps only the first record of each grouping-key
+	// value in the sorted list (RFC 8621 4.4.3); core behaviour, the
+	// type supplies only the key name.
+	if collapse {
+		matched = collapseByKey(matched, st.collapseKey())
+	}
+	if q := st.queryHooks(); q != nil && q.Arrange != nil {
+		return q.Arrange(ctx, acct, matched, compare, extra)
+	}
+	results := make([]jmap.Id, len(matched))
+	for i, m := range matched {
+		results[i] = m.Id
+	}
+	return results, nil
+}
+
 // filterSemantics returns the type's custom FilterCondition semantics,
 // or nil for the core equality language.
 func (st *stdType) filterSemantics() FilterSemantics {
@@ -277,6 +741,114 @@ func (st *stdType) filterSemantics() FilterSemantics {
 		return nil
 	}
 	return st.ext.Query.Filter
+}
+
+// queryHooks returns the type's QueryHooks, or nil.
+func (st *stdType) queryHooks() *QueryHooks {
+	if st.ext == nil {
+		return nil
+	}
+	return st.ext.Query
+}
+
+// changeCalculable reports whether Foo/queryChanges can answer for this
+// exact filter/sort/collapse combination. RFC 8620 section 5.5 defines
+// canCalculateChanges per query ("with these "filter"/"sort" parameters"),
+// so the verdict is computed per call, not per type. The calculation is
+// sound only for a record-local query (see the QueryHooks declaration
+// fields): every filter condition and sort property must be record-local
+// - by construction for the core language, by declaration for a type's
+// own Filter/Sort semantics - a collapsed query additionally needs the
+// group companion that makes sibling-driven changes visible, and a query
+// carrying extra arguments is never calculable because the core cannot
+// know what an extras-driven arrangement reads.
+func (st *stdType) changeCalculable(root *filterNode, sortRaw []json.RawMessage, collapse, hasExtras bool) bool {
+	if hasExtras {
+		return false
+	}
+	q := st.queryHooks()
+	if q == nil {
+		return true // pure core language: record-local by construction
+	}
+	if q.Arrange != nil && !q.LocalArrange {
+		return false
+	}
+	if collapse && q.GroupCompanion == "" {
+		return false
+	}
+	if q.Filter != nil && !condsDeclared(root, q.LocalConditions) {
+		return false
+	}
+	if q.Sort != nil {
+		for _, raw := range sortRaw {
+			var c struct {
+				Property string `json:"property"`
+			}
+			// buildCompare already validated the comparators; a name the
+			// declaration map lacks simply answers false.
+			if json.Unmarshal(raw, &c) != nil {
+				return false
+			}
+			if _, ok := q.LocalSorts[c.Property]; !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// condsDeclared walks the filter tree and reports whether every
+// FilterCondition name appears in the declared record-local set.
+func condsDeclared(n *filterNode, declared map[string][]string) bool {
+	if n == nil {
+		return true
+	}
+	if n.op != "" {
+		for _, c := range n.children {
+			if !condsDeclared(c, declared) {
+				return false
+			}
+		}
+		return true
+	}
+	for name := range n.cond {
+		if _, ok := declared[name]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// queryStateOf returns the query state: the queried type's current state
+// (its last-touching commit sequence, the number space Foo/get reports;
+// RFC 8620 section 5.1), joined with the group companion's when one is
+// declared. A collapsed result can change through a commit that touches
+// only the companion (a group member destroyed elsewhere moves the
+// representative), so the state that MUST change when results change
+// (section 5.5) is the later of the two; section 5.5 explicitly permits
+// the extra movement this costs uncollapsed queries.
+func (st *stdType) queryStateOf(ctx context.Context, acct jmap.Id) (string, error) {
+	state, err := st.db.TypeState(ctx, acct, st.t.Name)
+	if err != nil {
+		return "", err
+	}
+	q := st.queryHooks()
+	if q == nil || q.GroupCompanion == "" {
+		return state, nil
+	}
+	comp, err := st.db.TypeState(ctx, acct, q.GroupCompanion)
+	if err != nil {
+		return "", err
+	}
+	a, errA := strconv.ParseInt(state, 10, 64)
+	b, errB := strconv.ParseInt(comp, 10, 64)
+	if errA != nil || errB != nil {
+		return "", fmt.Errorf("runtime: non-numeric type state (%q, %q)", state, comp)
+	}
+	if b > a {
+		return comp, nil
+	}
+	return state, nil
 }
 
 // parseFilter validates the filter argument. Structural violations
@@ -567,7 +1139,9 @@ func (st *stdType) produceCondition(ctx context.Context, acct jmap.Id, name stri
 	if !declared || !p.Indexed {
 		return nil, false, false, nil
 	}
-	ids, err := st.db.IdsWhereEqual(ctx, acct, st.t.Name, name, value)
+	// Unbounded: this feeds the /query candidate set, whose size is the
+	// account's own matching records - the cost a /query answer is.
+	ids, err := st.db.IdsWhereEqual(ctx, acct, st.t.Name, name, value, 0)
 	if err != nil {
 		return nil, false, false, err
 	}
@@ -591,10 +1165,10 @@ type RecordScoper interface {
 // GetMany, not one Get per id: on a backend fronted by a network database
 // this is one round trip for the whole candidate set instead of one per
 // candidate - see objectdb.DB.GetMany and backend.MultiGetter.
-func (st *stdType) loadAndMatch(ctx context.Context, acct jmap.Id, root *filterNode, ids []jmap.Id) ([]QueryRecord, error) {
+func (st *stdType) loadAndMatch(ctx context.Context, acct jmap.Id, root *filterNode, ids []jmap.Id, wanted map[string]bool) ([]QueryRecord, error) {
 	sem := st.filterSemantics()
 	scoper, _ := sem.(RecordScoper)
-	objs, err := st.db.GetMany(ctx, acct, st.t.Name, ids)
+	objs, err := st.db.GetManyProjected(ctx, acct, st.t.Name, ids, wanted)
 	if err != nil {
 		return nil, err
 	}
@@ -679,6 +1253,91 @@ func dedupSortIds(ids []jmap.Id) []jmap.Id {
 	// dedup pass is needed; sorting gives the stable id order the empty-sort
 	// result requires (5.5).
 	return out
+}
+
+// queryProjection returns the stored-property set sufficient for
+// evaluate to answer this query - the union of what its conditions,
+// comparators, and collapse read, always including id - or nil when
+// only a full decode is provably sufficient: an Arrange hook (its
+// reads are undeclared), a condition or sort a custom semantics has
+// not declared, or a declaration whose reads list is unenumerated
+// (nil). Projection makes a reads list load-bearing for correctness,
+// not just for the section 5.6 immutability proofs: a list omitting a
+// property its hook reads makes the hook see the property as absent.
+// Processor.VerifyQueryProjection is the harness that catches such a
+// declaration.
+func (st *stdType) queryProjection(root *filterNode, sortRaw []json.RawMessage, collapse bool) map[string]bool {
+	q := st.queryHooks()
+	if q != nil && q.Arrange != nil {
+		return nil
+	}
+	wanted := map[string]bool{"id": true}
+	if !st.projectConds(root, wanted) {
+		return nil
+	}
+	for _, raw := range sortRaw {
+		var c struct {
+			Property string `json:"property"`
+		}
+		// buildCompare already validated the comparators; this parse
+		// cannot newly fail, but a failure simply forfeits projection.
+		if json.Unmarshal(raw, &c) != nil {
+			return nil
+		}
+		if q != nil && q.Sort != nil {
+			reads, ok := q.LocalSorts[c.Property]
+			if !ok || reads == nil {
+				return nil
+			}
+			for _, r := range reads {
+				wanted[r] = true
+			}
+			continue
+		}
+		// Core comparators read exactly their property (and the id
+		// tiebreak, always included).
+		wanted[c.Property] = true
+	}
+	if collapse {
+		wanted[st.collapseKey()] = true
+	}
+	return wanted
+}
+
+// projectConds accumulates the stored properties every condition in the
+// tree reads, reporting false when any condition's reads cannot be
+// enumerated. A custom FilterSemantics evaluates every condition, so
+// its LocalConditions declarations decide; the core equality language
+// reads exactly the condition's property.
+func (st *stdType) projectConds(n *filterNode, wanted map[string]bool) bool {
+	if n == nil {
+		return true
+	}
+	for _, c := range n.children {
+		if !st.projectConds(c, wanted) {
+			return false
+		}
+	}
+	sem := st.filterSemantics()
+	q := st.queryHooks()
+	for name := range n.cond {
+		if sem != nil {
+			var reads []string
+			ok := false
+			if q != nil {
+				reads, ok = q.LocalConditions[name]
+			}
+			if !ok || reads == nil {
+				return false
+			}
+			for _, r := range reads {
+				wanted[r] = true
+			}
+			continue
+		}
+		wanted[name] = true
+	}
+	return true
 }
 
 // ---- sort ----

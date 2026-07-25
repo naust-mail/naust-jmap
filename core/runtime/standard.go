@@ -37,6 +37,15 @@ func RegisterStandardTypeExt(p *Processor, db *objectdb.DB, t *descriptor.Type, 
 		if err := ext.validate(t); err != nil {
 			return err
 		}
+		// The group companion must already be registered with the same
+		// database: its states and change log are read on every /query and
+		// /queryChanges for this type, so a name that resolves to nothing
+		// must fail here, loudly, not degrade at request time.
+		if ext.Query != nil && ext.Query.GroupCompanion != "" {
+			if comp := ext.Query.GroupCompanion; comp == t.Name || db.Type(comp) == nil {
+				return fmt.Errorf("runtime: %s: Query.GroupCompanion %q is not a previously registered type", t.Name, comp)
+			}
+		}
 	}
 	if err := db.RegisterType(t); err != nil {
 		return err
@@ -220,8 +229,18 @@ func (st *stdType) get(ctx context.Context, call *Call) []jmap.Invocation {
 	}
 	// GetMany, not one Get per id: see loadAndMatch's identical comment in
 	// query.go - one round trip for the whole requested id list on a backend
-	// fronted by a network database, instead of one per id.
-	objs, err := st.db.GetMany(ctx, a.AccountId, st.t.Name, ids)
+	// fronted by a network database, instead of one per id. With no computed
+	// properties requested, the load materializes exactly the stored
+	// properties the response keeps (props was validated against the
+	// declared, non-internal names above), so the per-record copy below is
+	// skipped too; a computed property's resolver may read any stored
+	// property (ComputedProperties.Resolve), so only then is the full
+	// record decoded.
+	projection := props
+	if len(computed) > 0 {
+		projection = nil
+	}
+	objs, err := st.db.GetManyProjected(ctx, a.AccountId, st.t.Name, ids, projection)
 	if err != nil {
 		return fail(call.CallID, jmap.ErrServerFail, err.Error())
 	}
@@ -231,14 +250,11 @@ func (st *stdType) get(ctx context.Context, call *Call) []jmap.Invocation {
 			resp.NotFound = append(resp.NotFound, id)
 			continue
 		}
-		var resolved map[string]json.RawMessage
 		if len(computed) > 0 {
-			resolved, err = st.ext.Computed.Resolve(ctx, a.AccountId, obj, computed, extra)
+			resolved, err := st.ext.Computed.Resolve(ctx, a.AccountId, obj, computed, extra)
 			if err != nil {
 				return fail(call.CallID, jmap.ErrServerFail, err.Error())
 			}
-		}
-		if props != nil {
 			filtered := make(objectdb.Object, len(props))
 			for name := range props {
 				if v, has := obj[name]; has {
