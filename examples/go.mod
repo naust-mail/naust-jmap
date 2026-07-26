@@ -3,11 +3,11 @@ module github.com/naust-mail/naust-jmap/examples
 go 1.25.0
 
 require (
-	github.com/naust-mail/naust-jmap/capabilities/websocket v0.0.0
-	github.com/naust-mail/naust-jmap/core v0.0.0
-	github.com/naust-mail/naust-jmap/datatypes/mail v0.0.0
-	github.com/naust-mail/naust-jmap/drivers/postgres v0.0.0
-	github.com/naust-mail/naust-jmap/drivers/sqlite v0.0.0
+	github.com/naust-mail/naust-jmap/capabilities/websocket v0.1.0
+	github.com/naust-mail/naust-jmap/core v0.1.0
+	github.com/naust-mail/naust-jmap/datatypes/mail v0.1.0
+	github.com/naust-mail/naust-jmap/drivers/postgres v0.1.0
+	github.com/naust-mail/naust-jmap/drivers/sqlite v0.1.0
 	golang.org/x/crypto v0.54.0
 )
 
@@ -28,14 +28,4 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 	modernc.org/sqlite v1.54.0 // indirect
-)
-
-// The naust-jmap modules are unpublished pre-release; drop these replaces
-// once they have tagged versions.
-replace (
-	github.com/naust-mail/naust-jmap/capabilities/websocket => ../capabilities/websocket
-	github.com/naust-mail/naust-jmap/core => ../core
-	github.com/naust-mail/naust-jmap/datatypes/mail => ../datatypes/mail
-	github.com/naust-mail/naust-jmap/drivers/postgres => ../drivers/postgres
-	github.com/naust-mail/naust-jmap/drivers/sqlite => ../drivers/sqlite
 )

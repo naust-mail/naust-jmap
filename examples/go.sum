@@ -19,6 +19,16 @@ github.com/jackc/puddle/v2 v2.2.2 h1:PR8nw+E/1w0GLuRFSmiioY6UooMp6KJv0/61nB7icHo
 github.com/jackc/puddle/v2 v2.2.2/go.mod h1:vriiEXHvEE654aYKXXjOvZM39qJ0q+azkZFrfEOc3H4=
 github.com/mattn/go-isatty v0.0.23 h1:cYwCQTQf3HB6xUC+BtyCLZNr7IzbOmoZbmssVNzSyiQ=
 github.com/mattn/go-isatty v0.0.23/go.mod h1:nMCL3Zebbrt45jsMDgnfIwz6ydEQApk5oEI3HqDio6A=
+github.com/naust-mail/naust-jmap/capabilities/websocket v0.1.0 h1:zqOrTOrszSieCGLFQGQgB1DyOj7S/WX62hRbV1kxnDs=
+github.com/naust-mail/naust-jmap/capabilities/websocket v0.1.0/go.mod h1:oeHimblyUxCg+Hw6twigPfEALEIUHZszqO/8fvNEzLU=
+github.com/naust-mail/naust-jmap/core v0.1.0 h1:XIZTaZSDeDrUc947st+a9GScIebD+yXjUgDEvKfHVd0=
+github.com/naust-mail/naust-jmap/core v0.1.0/go.mod h1:TjPDhlaN8mGxYdE3iWAcTsn5Wl1b7rxZ6C8xe3YuzSM=
+github.com/naust-mail/naust-jmap/datatypes/mail v0.1.0 h1:suCD+BqWeW1JkWMtmr/1Fmu6Q3WDPDPfEuyn7R2WQyE=
+github.com/naust-mail/naust-jmap/datatypes/mail v0.1.0/go.mod h1:LeMzygjjj/2Djun5amvWexUjuaqabn5qCZGeqXJ/caU=
+github.com/naust-mail/naust-jmap/drivers/postgres v0.1.0 h1:ujM3a1OXGuI1QtYmh1R58g6OQ7ix2Y9WjFgCjezC2zE=
+github.com/naust-mail/naust-jmap/drivers/postgres v0.1.0/go.mod h1:fJiZ+ewFMDRUXwWjRgMJQFieEx0oSmDBf13r0D5OmnU=
+github.com/naust-mail/naust-jmap/drivers/sqlite v0.1.0 h1:T8EpBpVhZuk+5wrVzkItR8EDWZXTxC7Egw9NCdX5pzo=
+github.com/naust-mail/naust-jmap/drivers/sqlite v0.1.0/go.mod h1:1ZL/nA9vv8M9Ab+R648CYh0hJlWaT73KIca7Zt6BiNA=
 github.com/ncruces/go-strftime v1.0.0 h1:HMFp8mLCTPp341M/ZnA4qaf7ZlsbTc+miZjCLOFAw7w=
 github.com/ncruces/go-strftime v1.0.0/go.mod h1:Fwc5htZGVVkseilnfgOVb9mKy6w1naJmn9CehxcKcls=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=

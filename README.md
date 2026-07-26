@@ -9,6 +9,8 @@ Not a mail server - a library that executes the JMAP protocol\
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.24%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![CI](https://github.com/naust-mail/naust-jmap/actions/workflows/ci.yml/badge.svg)](https://github.com/naust-mail/naust-jmap/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/naust-mail/naust-jmap/core.svg)](https://pkg.go.dev/github.com/naust-mail/naust-jmap/core)
 
 </div>
 

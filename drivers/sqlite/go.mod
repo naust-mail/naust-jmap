@@ -3,7 +3,7 @@ module github.com/naust-mail/naust-jmap/drivers/sqlite
 go 1.25.0
 
 require (
-	github.com/naust-mail/naust-jmap/core v0.0.0
+	github.com/naust-mail/naust-jmap/core v0.1.0
 	modernc.org/sqlite v1.53.0
 )
 
@@ -18,7 +18,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-// The core module is unpublished pre-release; drop this once it has
-// tagged versions.
-replace github.com/naust-mail/naust-jmap/core => ../../core
