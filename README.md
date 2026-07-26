@@ -325,7 +325,8 @@ is case-insensitive substring matching. MDN (RFC 9007), S/MIME verification
 
 ## Roadmap
 
-naust-jmap is pre-release: no tagged versions yet. The mail module (see Mail
+naust-jmap is pre-release: tagged at v0.1.0 (pre-1.0, breaking changes may
+still land in minor bumps). The mail module (see Mail
 above) reads, composes and sends, over either the sqlite or postgres driver
 (the latter including a multi-node cluster hint layer). Coming next, in
 order:
