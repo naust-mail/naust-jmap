@@ -23,7 +23,7 @@ import (
 // This is the runtime's central promise:
 // a plugin declares a type; the protocol machinery is generated. The
 // capability must additionally be advertised in the session via
-// Server.RegisterCapability.
+// Server.Capability(...).Advertise(...).
 func RegisterStandardType(p *Processor, db *objectdb.DB, t *descriptor.Type, core jmap.CoreCapabilities) error {
 	return RegisterStandardTypeExt(p, db, t, core, nil)
 }

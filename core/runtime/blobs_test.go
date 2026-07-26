@@ -78,7 +78,7 @@ func blobServer(t *testing.T, core jmap.CoreCapabilities) (*httptest.Server, *ob
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.RegisterCapability("urn:example:testdoc", struct{}{}, struct{}{}); err != nil {
+	if err := srv.Capability("urn:example:testdoc").Advertise(struct{}{}, struct{}{}).Err(); err != nil {
 		t.Fatal(err)
 	}
 	srv.EnableBlobs(db, store)

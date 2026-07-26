@@ -205,10 +205,10 @@ func newInstance(t *testing.T, dsn string, accts []testAccount, cfg instanceConf
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.RegisterCapability(mail.CapabilityURI, struct{}{}, acctCap); err != nil {
+	if err := srv.Capability(mail.CapabilityURI).Advertise(struct{}{}, acctCap).Err(); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.RegisterCapability(mail.SubmissionCapabilityURI, struct{}{}, mail.SubmissionAccountCapabilityFor(limits)); err != nil {
+	if err := srv.Capability(mail.SubmissionCapabilityURI).Advertise(struct{}{}, mail.SubmissionAccountCapabilityFor(limits)).Err(); err != nil {
 		t.Fatal(err)
 	}
 	srv.EnableBlobs(db, blobs)

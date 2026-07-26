@@ -48,7 +48,7 @@ func copyEmailServer(t *testing.T) (*httptest.Server, *objectdb.DB, blob.Store) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.RegisterCapability(CapabilityURI, struct{}{}, DefaultAccountCapability()); err != nil {
+	if err := srv.Capability(CapabilityURI).Advertise(struct{}{}, DefaultAccountCapability()).Err(); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv)

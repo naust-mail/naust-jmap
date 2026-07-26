@@ -90,6 +90,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/naust-mail/naust-jmap/capabilities/websocket"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
 	"github.com/naust-mail/naust-jmap/core/objectdb/maintain"
@@ -246,8 +247,9 @@ func main() {
 	// every non-Postgres backend) runs the in-process lease and notifier.
 	var leases lease.Manager
 	var notifier notify.Notifier
+	var hints *postgres.Hints
 	if pgStore != nil {
-		hints, err := postgres.OpenHints(context.Background(), pgStore)
+		hints, err = postgres.OpenHints(context.Background(), pgStore)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -287,6 +289,21 @@ func main() {
 	users.AddUser("demo@example.com", "demo", "Ademo")
 	resolve := staticResolver{"demo@example.com": "Ademo"}
 
+	// Fleet revocation: with -postgres, a credential revoked on ANY
+	// instance (postgres.PublishRevocation inside the credential-change
+	// transaction) reaches every box - including this one, since
+	// revocation hints carry no self-origin filter - and lands in the
+	// local authenticator, which deletes the user's tokens and emits on
+	// its own auth.Revoker stream so the runtime closes the user's live
+	// EventSource streams and WebSocket connections.
+	if hints != nil {
+		go func() {
+			for username := range hints.Revoker().Revocations(context.Background()) {
+				users.RevokeUser(username)
+			}
+		}()
+	}
+
 	// The mail plugin: Mailbox, Thread and Email registered on the processor,
 	// enforcing (and advertising) the same AccountCapability limits. A nil
 	// searcher uses the built-in substring Searcher.
@@ -325,13 +342,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := srv.RegisterCapability(mail.CapabilityURI, struct{}{}, acctCap); err != nil {
+	if err := srv.Capability(mail.CapabilityURI).Advertise(struct{}{}, acctCap).Err(); err != nil {
 		log.Fatal(err)
 	}
-	if err := srv.RegisterCapability(mail.SubmissionCapabilityURI, struct{}{}, mail.SubmissionAccountCapabilityFor(limits)); err != nil {
+	if err := srv.Capability(mail.SubmissionCapabilityURI).Advertise(struct{}{}, mail.SubmissionAccountCapabilityFor(limits)).Err(); err != nil {
 		log.Fatal(err)
 	}
-	if err := srv.RegisterCapability(mail.VacationCapabilityURI, struct{}{}, struct{}{}); err != nil {
+	if err := srv.Capability(mail.VacationCapabilityURI).Advertise(struct{}{}, struct{}{}).Err(); err != nil {
 		log.Fatal(err)
 	}
 	// Binary data (RFC 8620 section 6) and push (section 7): blob
@@ -366,6 +383,22 @@ func main() {
 	} else if err := srv.EnablePush(db, notifier, nil, nil); err != nil {
 		// Single node: event source only (no webpush subscriptions or sender),
 		// webpush trivially active, no election.
+		log.Fatal(err)
+	}
+
+	// JMAP over WebSocket (RFC 8887): an optional capability, present in
+	// this binary purely because it is imported. It registers through the
+	// same capability registrar as everything else: the session object
+	// advertises the ws URL with supportsPush, and /ws upgrades to the
+	// jmap subprotocol. It authenticates with the same bearer tokens, and
+	// because tokenauth implements auth.Revoker, RevokeUser kills live
+	// sockets instantly - no re-auth polling needed.
+	ws := websocket.NewHandler(srv, users)
+	ws.EnablePush(db, notifier)
+	if err := srv.Capability(websocket.CapabilityURI).
+		Advertise(websocket.SessionCapability(srv.BaseURL(), "/ws", ws.SupportsPush()), struct{}{}).
+		Handle("/ws", ws).
+		Err(); err != nil {
 		log.Fatal(err)
 	}
 

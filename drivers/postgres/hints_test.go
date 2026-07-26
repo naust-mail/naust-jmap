@@ -60,6 +60,59 @@ func TestDecodeLease(t *testing.T) {
 	}
 }
 
+func TestDecodeRevoke(t *testing.T) {
+	p, err := decodeRevoke([]byte(`{"u":"john@example.com"}`))
+	if err != nil {
+		t.Fatalf("valid revocation: %v", err)
+	}
+	if p.Username != "john@example.com" {
+		t.Fatalf("decoded %+v", p)
+	}
+	bad := []string{
+		``,
+		`{}`,
+		`not json`,
+		`[]`,
+		`{"u":""}`,
+		`{"u":123}`,
+		`{"u":"x"}{}`, // trailing garbage
+	}
+	for _, s := range bad {
+		if _, err := decodeRevoke([]byte(s)); err == nil {
+			t.Errorf("decodeRevoke(%q) accepted, want error", s)
+		}
+	}
+}
+
+// PublishRevocation and the listener share one wire shape: whatever
+// Marshal produces for a revokePayload must decode back losslessly,
+// including non-ASCII, escaped, and long usernames.
+func TestRevokePayloadRoundTrip(t *testing.T) {
+	long := ""
+	for i := 0; i < 512; i++ {
+		long += "a"
+	}
+	for _, u := range []string{
+		"john@example.com",
+		"j\u00f8rn@example.org",                // o with stroke
+		"\u4e2d\u6587\u7528\u6237@example.net", // CJK username
+		"quote\"back\\slash@example.com",
+		long + "@example.com",
+	} {
+		b, err := json.Marshal(revokePayload{Username: u})
+		if err != nil {
+			t.Fatalf("marshal %q: %v", u, err)
+		}
+		p, err := decodeRevoke(b)
+		if err != nil {
+			t.Fatalf("decode of our own payload for %q failed: %v", u, err)
+		}
+		if p.Username != u {
+			t.Errorf("round trip mangled %q into %q", u, p.Username)
+		}
+	}
+}
+
 // FuzzDecodeChange asserts the decoder never panics on arbitrary bytes and
 // never accepts a payload that violates its invariants (payloads are untrusted:
 // any database role can forge one).
@@ -89,6 +142,22 @@ func FuzzDecodeLease(f *testing.F) {
 		p, err := decodeLease(data)
 		if err == nil && (p.Origin == "" || p.Account == "") {
 			t.Fatalf("accepted a payload with empty origin/account: %+v", p)
+		}
+	})
+}
+
+// FuzzDecodeRevoke is the revocation-payload counterpart: payloads are
+// untrusted, so the decoder must never panic and never accept a blank.
+func FuzzDecodeRevoke(f *testing.F) {
+	for _, seed := range []string{
+		`{"u":"john@example.com"}`, `{}`, ``, `not json`, `{"u":123}`, `[1]`,
+	} {
+		f.Add([]byte(seed))
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		p, err := decodeRevoke(data)
+		if err == nil && p.Username == "" {
+			t.Fatalf("accepted a payload with an empty username: %+v", p)
 		}
 	})
 }
@@ -365,5 +434,43 @@ func TestDispatchFloodShedding(t *testing.T) {
 	}
 	if got := delivered(); got != 10 {
 		t.Fatalf("post-flood second delivered %d, want 10", got)
+	}
+}
+
+// TestHintsRevokerFleet proves the revocation path end to end across a
+// two-process fleet sharing one database: a revocation published on one
+// store is delivered to subscribers on BOTH transports - including the
+// publisher's own, because the publishing box must kill its own live
+// connections too (revocations carry no origin filter).
+func TestHintsRevokerFleet(t *testing.T) {
+	hA, hB, _ := openHintsPair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	subA := hA.Revoker().Revocations(ctx)
+	subB := hB.Revoker().Revocations(ctx)
+
+	if err := PublishRevocation(context.Background(), hA.store.pool, "john@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	for name, sub := range map[string]<-chan string{"publisher": subA, "peer": subB} {
+		select {
+		case got := <-sub:
+			if got != "john@example.com" {
+				t.Errorf("%s received %q", name, got)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s never received the revocation", name)
+		}
+	}
+
+	// Ending the subscriber context unregisters and closes the stream.
+	cancel()
+	select {
+	case _, open := <-subA:
+		if open {
+			t.Error("value after context end")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream not closed after context end")
 	}
 }

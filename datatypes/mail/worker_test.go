@@ -138,10 +138,10 @@ func newWorkerServer(t *testing.T, limits SubmissionLimits, wcfg SubmissionWorke
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.RegisterCapability(CapabilityURI, struct{}{}, DefaultAccountCapability()); err != nil {
+	if err := srv.Capability(CapabilityURI).Advertise(struct{}{}, DefaultAccountCapability()).Err(); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.RegisterCapability(SubmissionCapabilityURI, struct{}{}, SubmissionAccountCapabilityFor(limits)); err != nil {
+	if err := srv.Capability(SubmissionCapabilityURI).Advertise(struct{}{}, SubmissionAccountCapabilityFor(limits)).Err(); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv)

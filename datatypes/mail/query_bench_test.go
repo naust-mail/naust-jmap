@@ -54,7 +54,7 @@ func benchEmailServer(b *testing.B) (*httptest.Server, *objectdb.DB, blob.Store,
 	if err != nil {
 		b.Fatal(err)
 	}
-	if err := srv.RegisterCapability(CapabilityURI, struct{}{}, DefaultAccountCapability()); err != nil {
+	if err := srv.Capability(CapabilityURI).Advertise(struct{}{}, DefaultAccountCapability()).Err(); err != nil {
 		b.Fatal(err)
 	}
 	ts := httptest.NewServer(srv)

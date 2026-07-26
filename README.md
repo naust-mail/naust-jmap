@@ -38,6 +38,7 @@ runtime.
 | `core/providers/` | The interfaces the runtime needs (storage, blobs, leases, notifications, auth), each with a built-in in-process implementation | pick or implement         |
 | `drivers/`        | Provider implementations that need third-party dependencies (sqlite, postgres), each its own module                            | import at most one or two |
 | `datatypes/`      | JMAP datatypes served on top of the runtime (mail arrives here first), each its own module                                     | import what you serve     |
+| `capabilities/`   | Optional protocol capabilities beside the core endpoints (the RFC 8887 WebSocket transport first), each its own module         | import what you want      |
 | `examples/`       | Runnable servers: the quickstart below and a full mail server (`examples/mailserver`)                                          | read                      |
 
 ## Quickstart
@@ -126,6 +127,9 @@ The core protocol (RFC 8620) is implemented end to end:
 - Push (`Server.EnablePush`): the event-source endpoint, plus verified
   `PushSubscription` webhooks with RFC 8291 encryption when given a
   subscription store and sender.
+- JMAP over WebSocket (RFC 8887): the optional, stdlib-only
+  `capabilities/websocket` module, sharing `maxConcurrentRequests` with
+  the HTTP endpoint and adding StateChange push over the socket.
 
 <details>
 <summary>Full RFC 8620 support matrix</summary>
@@ -133,25 +137,26 @@ The core protocol (RFC 8620) is implemented end to end:
 `Foo` below stands for any registered datatype; the methods are derived
 from its descriptor, not written per type.
 
-| Category   | Feature                                | Status   | Notes                                                                                                                 |
-|------------|----------------------------------------|----------|-----------------------------------------------------------------------------------------------------------------------|
-| Session    | Session resource (`/.well-known/jmap`) | Yes      | Accounts, capabilities, URLs, `sessionState` on every response                                                        |
-| Session    | Authentication                         | Yes      | Pluggable via the `providers/auth` interface; quickstart uses Basic, mailserver uses bearer tokens                    |
-| Session    | Advertised limits                      | Yes      | `maxSizeUpload`, `maxSizeRequest`, `maxCallsInRequest`, `maxObjectsInGet/Set`, etc. (section 2), enforced server-side |
-| Core       | Capability negotiation (`using`)       | Yes      | Non-opted capabilities behave as absent                                                                               |
-| Core       | `Core/echo`                            | Yes      |                                                                                                                       |
-| API        | Request envelope (`/api`)              | Yes      | Batched method calls, strict I-JSON, request limits                                                                   |
-| API        | Request- and method-level errors       | Yes      | Full RFC 8620 error catalog                                                                                           |
-| References | Back-references (`#arg`)               | Yes      | JSON Pointer evaluation with `*` array flattening                                                                     |
-| References | Creation-id references (`#creationId`) | Yes      | Request-wide `createdIds` map                                                                                         |
-| Methods    | `Foo/get`, `Foo/changes`, `Foo/set`    | Yes      | PatchObject validation, change coalescing, per-record atomicity                                                       |
-| Methods    | `Foo/copy`                             | Yes      | Cross-account copy with `onSuccessDestroyOriginal`                                                                    |
-| Methods    | `Foo/query`                            | Yes      | Indexed range scans, in-memory residual, anchors, windowing                                                           |
-| Methods    | `Foo/queryChanges`                     | Yes      | Real diffs for record-local queries (declared via `QueryHooks`), tiered answering, `upToId`, work-budget refusals     |
-| State      | State strings and `ifInState`          | Yes      | Optimistic concurrency with `stateMismatch`                                                                           |
-| Blobs      | Upload/download endpoints, `Blob/copy` | Yes      | Reference tracking and unreferenced-blob sweeping                                                                     |
-| Push       | EventSource (`/eventsource`)           | Yes      | `types`, `closeafter`, `ping` arguments                                                                               |
-| Push       | `PushSubscription` webhooks            | Yes      | Verification flow, RFC 8291 payload encryption                                                                        |
+| Category   | Feature                                | Status | Notes                                                                                                                 |
+|------------|----------------------------------------|--------|-----------------------------------------------------------------------------------------------------------------------|
+| Session    | Session resource (`/.well-known/jmap`) | Yes    | Accounts, capabilities, URLs, `sessionState` on every response                                                        |
+| Session    | Authentication                         | Yes    | Pluggable via the `providers/auth` interface; quickstart uses Basic, mailserver uses bearer tokens                    |
+| Session    | Advertised limits                      | Yes    | `maxSizeUpload`, `maxSizeRequest`, `maxCallsInRequest`, `maxObjectsInGet/Set`, etc. (section 2), enforced server-side |
+| Core       | Capability negotiation (`using`)       | Yes    | Non-opted capabilities behave as absent                                                                               |
+| Core       | `Core/echo`                            | Yes    |                                                                                                                       |
+| API        | Request envelope (`/api`)              | Yes    | Batched method calls, strict I-JSON, request limits                                                                   |
+| API        | Request- and method-level errors       | Yes    | Full RFC 8620 error catalog                                                                                           |
+| References | Back-references (`#arg`)               | Yes    | JSON Pointer evaluation with `*` array flattening                                                                     |
+| References | Creation-id references (`#creationId`) | Yes    | Request-wide `createdIds` map                                                                                         |
+| Methods    | `Foo/get`, `Foo/changes`, `Foo/set`    | Yes    | PatchObject validation, change coalescing, per-record atomicity                                                       |
+| Methods    | `Foo/copy`                             | Yes    | Cross-account copy with `onSuccessDestroyOriginal`                                                                    |
+| Methods    | `Foo/query`                            | Yes    | Indexed range scans, in-memory residual, anchors, windowing                                                           |
+| Methods    | `Foo/queryChanges`                     | Yes    | Real diffs for record-local queries (declared via `QueryHooks`), tiered answering, `upToId`, work-budget refusals     |
+| State      | State strings and `ifInState`          | Yes    | Optimistic concurrency with `stateMismatch`                                                                           |
+| Blobs      | Upload/download endpoints, `Blob/copy` | Yes    | Reference tracking and unreferenced-blob sweeping                                                                     |
+| Push       | EventSource (`/eventsource`)           | Yes    | `types`, `closeafter`, `ping` arguments                                                                               |
+| Push       | `PushSubscription` webhooks            | Yes    | Verification flow, RFC 8291 payload encryption                                                                        |
+| Transport  | JMAP over WebSocket (RFC 8887)         | Yes    | `jmap` subprotocol, request `id` correlation, socket push; no `pushState` (snapshot covers reconnection)              |
 
 </details>
 

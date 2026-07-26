@@ -69,13 +69,13 @@ func newVacationServer(t *testing.T) (*httptest.Server, *objectdb.DB, blob.Store
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.RegisterCapability(CapabilityURI, struct{}{}, DefaultAccountCapability()); err != nil {
+	if err := srv.Capability(CapabilityURI).Advertise(struct{}{}, DefaultAccountCapability()).Err(); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.RegisterCapability(SubmissionCapabilityURI, struct{}{}, SubmissionAccountCapabilityFor(limits)); err != nil {
+	if err := srv.Capability(SubmissionCapabilityURI).Advertise(struct{}{}, SubmissionAccountCapabilityFor(limits)).Err(); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.RegisterCapability(VacationCapabilityURI, struct{}{}, struct{}{}); err != nil {
+	if err := srv.Capability(VacationCapabilityURI).Advertise(struct{}{}, struct{}{}).Err(); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv)

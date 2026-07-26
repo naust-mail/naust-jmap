@@ -5,6 +5,7 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"net/http"
 
@@ -58,6 +59,27 @@ var ErrUnauthenticated = errors.New("auth: unauthenticated")
 // caller or reject with ErrUnauthenticated.
 type Authenticator interface {
 	Authenticate(r *http.Request) (*Identity, error)
+}
+
+// Revoker is an optional Authenticator extension for credential
+// revocation. Authenticate is per-request, so a revoked credential
+// simply fails the next request - but a long-lived connection (an
+// EventSource stream, a WebSocket) authenticates once and then holds
+// open, and without a push signal it would keep serving a credential
+// its owner already killed. An Authenticator that implements Revoker
+// tells the runtime the moment an identity's credentials are revoked,
+// and the runtime closes that identity's live connections and cancels
+// their in-flight work.
+//
+// In a multi-process deployment every process's subscription must see
+// every revocation, wherever it originated - fan-out across the fleet
+// is the implementation's responsibility, not the runtime's.
+type Revoker interface {
+	// Revocations returns a stream of usernames (Identity.Username)
+	// whose credentials have been revoked. The implementation closes
+	// the channel when ctx is done. The runtime consumes promptly and
+	// ignores usernames with no live connection in this process.
+	Revocations(ctx context.Context) <-chan string
 }
 
 // Challenger is an optional Authenticator extension that names the scheme

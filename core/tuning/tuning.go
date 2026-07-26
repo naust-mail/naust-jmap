@@ -134,6 +134,15 @@ var ChangeLogMaxEntries = 100000
 // long-absent client from turning the change log into unbounded work.
 var QueryChangesMaxWork = 4096
 
+// MaxConcurrentRequestsPerUser bounds how many of the session's
+// maxConcurrentRequests execution slots one username may hold at once,
+// across every transport, so a single user cannot occupy the whole
+// shared pool and starve every other user (RFC 8620 section 8.5's
+// denial-of-service guidance). Zero (the default) derives the bound
+// from the pool size at server construction: half of
+// maxConcurrentRequests, floored at one.
+var MaxConcurrentRequestsPerUser = 0
+
 // MaxFilterNodes bounds a filter tree's total node count (operators plus
 // condition leaves) in a Foo/query. CheckIJSON caps the request's JSON
 // nesting depth but not a FilterOperator's breadth: a client can pack tens of

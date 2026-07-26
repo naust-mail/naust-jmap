@@ -89,7 +89,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := srv.RegisterCapability("urn:example:todo", struct{}{}, struct{}{}); err != nil {
+	if err := srv.Capability("urn:example:todo").Advertise(struct{}{}, struct{}{}).Err(); err != nil {
 		log.Fatal(err)
 	}
 

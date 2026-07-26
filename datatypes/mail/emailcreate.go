@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 
@@ -126,12 +127,43 @@ func (h emailCreate) prepare(ctx context.Context, call *runtime.Call, acct, cid 
 	if err != nil {
 		return nil, nil, err // our own fresh blob must open
 	}
+	mailboxIds, serr := resolveMailboxIdRefs(obj["mailboxIds"], call.CreatedIds)
+	if serr != nil {
+		return nil, serr, nil
+	}
 	return &preparedEmailCreate{
 		pe:         pe,
-		mailboxIds: obj["mailboxIds"],
+		mailboxIds: mailboxIds,
 		keywords:   obj["keywords"],
 		receivedAt: receivedAt,
 	}, nil, nil
+}
+
+// resolveMailboxIdRefs substitutes "#creationId" references in mailboxIds
+// keys against the request-wide creation-id map (RFC 8620 section 5.3).
+// mailboxIds is an Id-keyed map (descriptor.KindObject), which falls
+// outside the runtime's own KindId substitution for the standard create
+// path, so Email's create override resolves it itself against
+// call.CreatedIds - the same primitive runtime.ResolveIdArg exposes to
+// custom method handlers for a scalar id.
+func resolveMailboxIdRefs(raw json.RawMessage, createdIds map[jmap.Id]jmap.Id) (json.RawMessage, *jmap.SetError) {
+	members, ok := decodeBoolMap(raw)
+	if !ok {
+		return raw, nil // missing/null/malformed: validateMailboxIds reports it
+	}
+	resolved := make(map[string]bool, len(members))
+	for id, val := range members {
+		real, ok := runtime.ResolveIdArg(jmap.Id(id), createdIds)
+		if !ok {
+			return nil, invalidProp("mailboxIds", fmt.Sprintf("reference to unknown creation id %q", id))
+		}
+		resolved[string(real)] = val
+	}
+	out, err := json.Marshal(resolved)
+	if err != nil {
+		return nil, invalidProp("mailboxIds", "must be an object of Mailbox id to true")
+	}
+	return out, nil
 }
 
 // commit implements SetHooks.CommitCreate: the seam validates the

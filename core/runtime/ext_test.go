@@ -88,7 +88,7 @@ func gadgetServerType(t *testing.T, typ *descriptor.Type, ext *Extensions) *http
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.RegisterCapability("urn:example:gadget", struct{}{}, struct{}{}); err != nil {
+	if err := srv.Capability("urn:example:gadget").Advertise(struct{}{}, struct{}{}).Err(); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv)

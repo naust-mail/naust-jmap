@@ -40,7 +40,7 @@ func mailServer(t *testing.T) (*httptest.Server, *objectdb.DB) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.RegisterCapability(CapabilityURI, struct{}{}, DefaultAccountCapability()); err != nil {
+	if err := srv.Capability(CapabilityURI).Advertise(struct{}{}, DefaultAccountCapability()).Err(); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv)
@@ -227,7 +227,6 @@ func TestMailboxCreateInvariants(t *testing.T) {
 		{"unregistered role", `{"name":"Boss","role":"boss"}`, "role"},
 		{"role wrong case", `{"name":"In","role":"Inbox"}`, "role"},
 		{"duplicate role", `{"name":"Second","role":"inbox"}`, "role"},
-		{"duplicate sibling name", `{"name":"Inbox"}`, "name"},
 		{"missing parent", `{"name":"Orphan","parentId":"Znope"}`, "parentId"},
 		{"sortOrder over 2^31", `{"name":"Big","sortOrder":2147483648}`, "sortOrder"},
 	}
@@ -241,6 +240,19 @@ func TestMailboxCreateInvariants(t *testing.T) {
 		if props, _ := serr["properties"].([]any); len(props) != 1 || props[0] != tc.prop {
 			t.Fatalf("%s: properties %v, want [%s]", tc.name, serr["properties"], tc.prop)
 		}
+	}
+
+	// A sibling name collision is "alreadyExists" with the colliding
+	// record's id (RFC 9661 section 2.4 generalizes this beyond /copy),
+	// not "invalidProperties".
+	dupSerr := setError(t, ts,
+		fmt.Sprintf(`{"accountId":%q,"create":{"c":{"name":"Inbox"}}}`, testAccount),
+		"notCreated", "c")
+	if dupSerr["type"] != "alreadyExists" {
+		t.Fatalf("duplicate sibling name: type %v, want alreadyExists", dupSerr["type"])
+	}
+	if dupSerr["existingId"] != inbox {
+		t.Fatalf("duplicate sibling name: existingId %v, want %s", dupSerr["existingId"], inbox)
 	}
 
 	// The same name under a different parent is fine.

@@ -59,7 +59,7 @@ func newEmailServer(t *testing.T, acctCap AccountCapability) (*httptest.Server, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.RegisterCapability(CapabilityURI, struct{}{}, acctCap); err != nil {
+	if err := srv.Capability(CapabilityURI).Advertise(struct{}{}, acctCap).Err(); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv)

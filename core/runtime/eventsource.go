@@ -68,6 +68,14 @@ func (s *Server) handleEventSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The stream authenticates once and then holds open, so it must die
+	// with its credentials: registering the cancel lets a revocation of
+	// this username (auth.Revoker) end the stream immediately.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	unregister := s.RegisterConnection(ident.Username, cancel)
+	defer unregister()
+
 	// Changes are pushed for every account the user has access to
 	// (section 7.1). Subscribe before reading current state so no
 	// commit can fall between the two.
@@ -75,7 +83,7 @@ func (s *Server) handleEventSource(w http.ResponseWriter, r *http.Request) {
 	for id := range ident.Accounts {
 		accounts = append(accounts, id)
 	}
-	sub, err := s.push.n.Subscribe(r.Context(), accounts)
+	sub, err := s.push.n.Subscribe(ctx, accounts)
 	if err != nil {
 		http.Error(w, "subscribe failed", http.StatusInternalServerError)
 		return
@@ -96,7 +104,7 @@ func (s *Server) handleEventSource(w http.ResponseWriter, r *http.Request) {
 	for _, acct := range accounts {
 		ts := make(jmap.TypeState, len(types))
 		for _, name := range types {
-			state, err := s.push.db.TypeState(r.Context(), acct, name)
+			state, err := s.push.db.TypeState(ctx, acct, name)
 			if err != nil {
 				return // headers are sent; nothing left but to drop the stream
 			}
@@ -114,15 +122,15 @@ func (s *Server) handleEventSource(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for {
-		waitCtx, cancel := r.Context(), context.CancelFunc(func() {})
+		waitCtx, waitCancel := ctx, context.CancelFunc(func() {})
 		if ping > 0 {
-			waitCtx, cancel = context.WithTimeout(waitCtx, time.Duration(ping)*time.Second)
+			waitCtx, waitCancel = context.WithTimeout(waitCtx, time.Duration(ping)*time.Second)
 		}
 		changes, err := sub.Wait(waitCtx)
-		cancel()
+		waitCancel()
 		switch {
 		case err == nil:
-		case errors.Is(err, context.DeadlineExceeded) && r.Context().Err() == nil:
+		case errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil:
 			// The ping interval elapsed since the previous event: send a
 			// ping event carrying the interval in use, with no event id
 			// (section 7.3).

@@ -49,7 +49,7 @@ func relayServer(t *testing.T, core jmap.CoreCapabilities) *httptest.Server {
 		t.Fatal(err)
 	}
 	for _, c := range []string{"urn:example:testnote", "urn:example:relay"} {
-		if err := srv.RegisterCapability(c, struct{}{}, struct{}{}); err != nil {
+		if err := srv.Capability(c).Advertise(struct{}{}, struct{}{}).Err(); err != nil {
 			t.Fatal(err)
 		}
 	}

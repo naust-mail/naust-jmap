@@ -40,7 +40,7 @@ func identityServer(t *testing.T) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.RegisterCapability(SubmissionCapabilityURI, struct{}{}, struct{}{}); err != nil {
+	if err := srv.Capability(SubmissionCapabilityURI).Advertise(struct{}{}, struct{}{}).Err(); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv)

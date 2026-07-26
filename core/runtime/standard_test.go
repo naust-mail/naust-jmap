@@ -51,7 +51,7 @@ func noteServer(t *testing.T, core jmap.CoreCapabilities) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.RegisterCapability("urn:example:testnote", struct{}{}, struct{}{}); err != nil {
+	if err := srv.Capability("urn:example:testnote").Advertise(struct{}{}, struct{}{}).Err(); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv)
@@ -534,7 +534,7 @@ func TestSetOnReadOnlyAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.RegisterCapability("urn:example:testnote", struct{}{}, struct{}{}); err != nil {
+	if err := srv.Capability("urn:example:testnote").Advertise(struct{}{}, struct{}{}).Err(); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv)

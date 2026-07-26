@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
+	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/providers/notify"
 )
@@ -40,6 +42,14 @@ import (
 const (
 	chanChanges = "naust_changes"
 	chanLease   = "naust_lease"
+	chanRevoke  = "naust_revoke"
+
+	// revokeSubQueueDepth buffers each revocation subscriber. Unlike change
+	// and lease hints, a revocation is not latency-only - but the runtime
+	// consumer drains promptly (it only closes connections), so a full
+	// buffer means a pathological flood, and dropping with a loud log beats
+	// letting a hostile NOTIFY flood park the listener goroutine.
+	revokeSubQueueDepth = 64
 
 	// notifyPayloadBudget keeps a single NOTIFY payload well under Postgres's
 	// ~8000-byte cap; a change carrying more type states than fits is split
@@ -82,6 +92,14 @@ type leasePayload struct {
 	Account jmap.Id `json:"a"`
 }
 
+// revokePayload is the wire form of a credential revocation. It carries
+// no origin: revocations are deliberately delivered back to the
+// publishing process too, because the box that revoked the credential
+// must kill its own live connections just like every other box.
+type revokePayload struct {
+	Username string `json:"u"`
+}
+
 // decodeChange parses an untrusted change payload. A malformed payload, or one
 // missing its origin or account, is rejected so the listener can drop it.
 func decodeChange(payload []byte) (changePayload, error) {
@@ -91,6 +109,19 @@ func decodeChange(payload []byte) (changePayload, error) {
 	}
 	if p.Origin == "" || p.Account == "" {
 		return changePayload{}, errors.New("postgres: change hint missing origin or account")
+	}
+	return p, nil
+}
+
+// decodeRevoke parses an untrusted revocation payload; empty usernames
+// are rejected so the listener can drop malformed or forged blanks.
+func decodeRevoke(payload []byte) (revokePayload, error) {
+	var p revokePayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return revokePayload{}, err
+	}
+	if p.Username == "" {
+		return revokePayload{}, errors.New("postgres: revocation hint missing username")
 	}
 	return p, nil
 }
@@ -125,8 +156,12 @@ type Hints struct {
 	wmu     sync.Mutex
 	waiters map[jmap.Id][]chan struct{}
 
+	rmu     sync.Mutex
+	revSubs map[chan string]struct{}
+
 	notifier *hintsNotifier
 	waker    *hintsWaker
+	revoker  *hintsRevoker
 
 	// Flood-shed state, touched only by the listener goroutine (see shed).
 	// shedNow is a test seam; time.Now outside tests.
@@ -160,12 +195,14 @@ func OpenHints(ctx context.Context, store *Store) (*Hints, error) {
 		local:       notify.NewInProcess(),
 		pub:         make(chan publishReq, publishQueueDepth),
 		waiters:     make(map[jmap.Id][]chan struct{}),
+		revSubs:     make(map[chan string]struct{}),
 		shedNow:     time.Now,
 		listenDone:  make(chan struct{}),
 		publishDone: make(chan struct{}),
 	}
 	h.notifier = &hintsNotifier{h: h}
 	h.waker = &hintsWaker{h: h}
+	h.revoker = &hintsRevoker{h: h}
 
 	loopCtx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
@@ -192,6 +229,12 @@ func (h *Hints) Notifier() notify.Notifier { return h.notifier }
 
 // Waker returns the cross-instance lease Waker backed by this transport.
 func (h *Hints) Waker() lease.Waker { return h.waker }
+
+// Revoker returns the cross-instance credential Revoker backed by this
+// transport: every revocation published on the fleet's database (see
+// PublishRevocation) is delivered to every subscriber in every process,
+// including the one that published it.
+func (h *Hints) Revoker() auth.Revoker { return h.revoker }
 
 // Close stops the listener and publisher loops and closes the listener
 // connection. Local subscriptions are owned by their callers and are not force
@@ -296,7 +339,7 @@ func (h *Hints) dialListener(ctx context.Context) (*pgx.Conn, error) {
 		return nil, err
 	}
 	// Channel names are fixed constants, never user input.
-	for _, ch := range []string{chanChanges, chanLease} {
+	for _, ch := range []string{chanChanges, chanLease, chanRevoke} {
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			_ = conn.Close(context.Background())
 			return nil, err
@@ -344,6 +387,32 @@ func (h *Hints) dispatch(channel, payload string) {
 			return
 		}
 		h.signalWaiters(p.Account)
+	case chanRevoke:
+		p, err := decodeRevoke([]byte(payload))
+		if err != nil {
+			slog.Warn("postgres: dropping malformed revocation hint", "err", err)
+			return
+		}
+		// No self-origin filter, deliberately: the publishing process
+		// must close its own live connections too, and its runtime's
+		// connection index is only reached through this delivery.
+		h.deliverRevocation(p.Username)
+	}
+}
+
+// deliverRevocation fans one revocation out to every subscriber. Sends
+// are non-blocking under the lock: a subscriber whose buffer is full is
+// skipped with a loud log rather than allowed to stall the listener
+// goroutine (see revokeSubQueueDepth).
+func (h *Hints) deliverRevocation(username string) {
+	h.rmu.Lock()
+	defer h.rmu.Unlock()
+	for ch := range h.revSubs {
+		select {
+		case ch <- username:
+		default:
+			slog.Error("postgres: revocation subscriber queue full, dropping a revocation")
+		}
 	}
 }
 
@@ -494,6 +563,54 @@ func (w *hintsWaker) removeWaiter(account jmap.Id, ch chan struct{}) {
 			return
 		}
 	}
+}
+
+// hintsRevoker implements auth.Revoker over the listener connection.
+type hintsRevoker struct{ h *Hints }
+
+// Revocations subscribes to the fleet's revocation stream. The channel
+// is buffered (revokeSubQueueDepth) and is closed, after unregistering,
+// when ctx ends.
+func (r *hintsRevoker) Revocations(ctx context.Context) <-chan string {
+	ch := make(chan string, revokeSubQueueDepth)
+	r.h.rmu.Lock()
+	r.h.revSubs[ch] = struct{}{}
+	r.h.rmu.Unlock()
+	go func() {
+		<-ctx.Done()
+		r.h.rmu.Lock()
+		delete(r.h.revSubs, ch)
+		r.h.rmu.Unlock()
+		// Safe to close now: deliverRevocation only sends while ch is
+		// registered, and both run under rmu.
+		close(ch)
+	}()
+	return ch
+}
+
+// RevocationExecer is the slice of pgx this package needs to publish a
+// revocation: pgxpool.Pool, pgx.Conn, and pgx.Tx all satisfy it.
+type RevocationExecer interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+}
+
+// PublishRevocation announces that username's credentials are revoked,
+// so every process subscribed through Hints.Revoker closes that
+// identity's live connections. Call it on the same transaction that
+// commits the credential change: NOTIFY only fires when the
+// transaction commits, so the revocation and the credential change
+// become one atomic event - no window where one is visible without the
+// other, and a rolled-back change never kills connections.
+func PublishRevocation(ctx context.Context, db RevocationExecer, username string) error {
+	if username == "" {
+		return errors.New("postgres: cannot publish a revocation for an empty username")
+	}
+	b, err := json.Marshal(revokePayload{Username: username})
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(ctx, "SELECT pg_notify($1, $2)", chanRevoke, string(b))
+	return err
 }
 
 // sleepCtx sleeps for d, returning true if ctx ended first.

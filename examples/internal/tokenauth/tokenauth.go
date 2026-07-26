@@ -16,19 +16,27 @@
 // sufficient check on the hot path - there is nothing low-entropy left to
 // brute-force, so no KDF belongs here.
 //
-// What a real deployment adds and this omits to stay small: token expiry,
-// rotation and revocation; a persistent token store (these live in memory,
-// so a restart logs everyone out); and rate limiting on the login endpoint.
+// Revocation is NOT omitted: long-lived connections (EventSource,
+// WebSocket) authenticate once and hold open, so killing a credential
+// must reach them by push. RevokeUser deletes the user's tokens (new
+// requests fail immediately) and emits on the auth.Revoker stream (the
+// runtime closes the user's live connections).
+//
+// What a real deployment adds and this omits to stay small: token expiry
+// and rotation; a persistent token store (these live in memory, so a
+// restart logs everyone out); and rate limiting on the login endpoint.
 // A deployment may instead skip minting entirely and verify tokens issued
 // by an external identity provider here.
 package tokenauth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -71,13 +79,18 @@ type Authenticator struct {
 	// runtime as logins mint tokens, so it is guarded.
 	mu     sync.RWMutex
 	tokens map[string]auth.Identity
+
+	// revSubs holds the auth.Revoker subscribers RevokeUser emits to.
+	rvMu    sync.Mutex
+	revSubs map[chan string]struct{}
 }
 
 // New returns an empty Authenticator.
 func New() *Authenticator {
 	return &Authenticator{
-		users:  make(map[string]credential),
-		tokens: make(map[string]auth.Identity),
+		users:   make(map[string]credential),
+		tokens:  make(map[string]auth.Identity),
+		revSubs: make(map[chan string]struct{}),
 	}
 }
 
@@ -155,6 +168,51 @@ func (a *Authenticator) mint(id auth.Identity) string {
 	a.tokens[string(sum[:])] = id
 	a.mu.Unlock()
 	return token
+}
+
+// RevokeUser kills a user's access immediately: every minted token is
+// deleted (the next request fails), and the revocation is emitted so
+// the runtime closes the user's live long-lived connections - a token
+// check on the next request never reaches a connection that does not
+// make one.
+func (a *Authenticator) RevokeUser(username string) {
+	a.mu.Lock()
+	for sum, id := range a.tokens {
+		if id.Username == username {
+			delete(a.tokens, sum)
+		}
+	}
+	a.mu.Unlock()
+
+	a.rvMu.Lock()
+	defer a.rvMu.Unlock()
+	for ch := range a.revSubs {
+		select {
+		case ch <- username:
+		default:
+			// The runtime consumer drains promptly; a full buffer means it
+			// is gone or wedged. Dropping beats blocking the revoker, and
+			// it must be loud: a dropped revocation leaves connections up.
+			slog.Error("tokenauth: revocation subscriber queue full, dropping a revocation")
+		}
+	}
+}
+
+// Revocations implements auth.Revoker. The channel is buffered and is
+// closed, after unregistering, when ctx ends.
+func (a *Authenticator) Revocations(ctx context.Context) <-chan string {
+	ch := make(chan string, 64)
+	a.rvMu.Lock()
+	a.revSubs[ch] = struct{}{}
+	a.rvMu.Unlock()
+	go func() {
+		<-ctx.Done()
+		a.rvMu.Lock()
+		delete(a.revSubs, ch)
+		a.rvMu.Unlock()
+		close(ch)
+	}()
+	return ch
 }
 
 // Challenge implements auth.Challenger: requests to /api, /eventsource, etc.

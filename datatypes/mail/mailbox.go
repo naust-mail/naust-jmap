@@ -218,7 +218,8 @@ func mailboxValidate(u *objectdb.Update, old, new objectdb.Object, extra map[str
 			return nil, err
 		}
 		if sibName, ok := decodeString(obj["name"]); ok && sibName == name {
-			return invalidProp("name", "a sibling mailbox already has this name"), nil
+			return &jmap.SetError{Type: "alreadyExists", ExistingId: sib,
+				Description: "a sibling mailbox already has this name"}, nil
 		}
 	}
 
