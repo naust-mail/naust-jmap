@@ -26,6 +26,17 @@ naust-jmap is pre-1.0. Security fixes land on the default branch and the latest
 tag; there is no backport line until a stable release exists. Pin a commit or
 tag and update to pick up fixes.
 
+## Known dependency findings
+
+`govulncheck` reports GO-2026-5970 against `datatypes/mail`: a loop in
+`golang.org/x/text/unicode/norm`, reached only through `norm.Iter`. This module
+calls `NFC.String` and `NFC.IsNormalString`, neither of which constructs an
+`Iter`, and every `x/text` release carrying the fix requires Go 1.25 while this
+module supports Go 1.24. Both halves of that are enforced by
+`TestNormSurfaceIsStringAndIsNormalOnly` and `TestNormLoopStaysBehindIter` in
+`datatypes/mail/internal/depsguard`, which fail if either stops holding. On
+Go 1.25 or later, require `x/text` v0.39.0 in your own `go.mod` to clear it.
+
 ## Scope
 
 naust-jmap is a library that executes the JMAP protocol. It owns protocol

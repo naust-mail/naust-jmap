@@ -1,4 +1,4 @@
-// Package blob defines the BlobStore socket: persistence for the
+// Package blob defines the blob-store provider: persistence for the
 // immutable binary data that blobIds represent (RFC 8620 section 6).
 //
 // The runtime owns blobId semantics: ids are content addresses computed
@@ -27,7 +27,8 @@ import (
 // ErrNotFound reports a blob that does not exist in the account.
 var ErrNotFound = errors.New("blob: not found")
 
-// Store is the socket. All methods must be safe for concurrent use.
+// Store is the provider interface. All methods must be safe for
+// concurrent use.
 type Store interface {
 	// Create begins a streaming write into acct. The caller feeds the blob's
 	// bytes to the returned writer and calls Commit to store them under their

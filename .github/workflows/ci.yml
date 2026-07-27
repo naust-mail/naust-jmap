@@ -1,17 +1,16 @@
 name: CI
 
-# Builds, vets, and tests every module in the workspace on each push and pull
-# request that touches Go code or the build files. This is a go.work
-# multi-module workspace, so `go build ./...` from the root fails by design:
-# each module is built and tested in its own directory, which is exactly how
-# the modules are developed. A matrix runs the modules in parallel and reports
-# per-module signal.
+# go.work multi-module workspace. `go build ./...` from the root fails by
+# design, but naming each module's package pattern works, so the workspace
+# checks are ordinary single commands.
 #
-# A Postgres service is attached to every job and its DSN exported as
-# PG_TEST_DSN. The Postgres driver and the cluster suite read it and exercise a
-# real server (a shared database, LISTEN/NOTIFY, the store lease); every other
-# module ignores it. Tests that need it SKIP rather than fail when it is
-# absent, so this is the only place they actually run.
+#   gate     - modules built against the sibling code in this checkout.
+#   consumer - GOWORK=off, so each module resolves the graph its own go.mod
+#              declares. go.work unifies the build list, so workspace mode can
+#              test against a dependency version no consumer selects; that hid
+#              an x/text advisory. Build and vulncheck only: gate already
+#              tested this source.
+#   minimum  - the Go 1.24 support claim, on a real 1.24 toolchain.
 
 on:
   push:
@@ -31,24 +30,18 @@ on:
       - 'go.work.sum'
       - '.github/workflows/ci.yml'
 
-# Read-only CI: build, vet, and test. No writes to the repo or releases.
 permissions:
   contents: read
+
+env:
+  PKGS: ./core/... ./datatypes/mail/... ./capabilities/websocket/... ./drivers/sqlite/... ./drivers/postgres/... ./examples/...
 
 jobs:
   gate:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        module:
-          - core
-          - datatypes/mail
-          - capabilities/websocket
-          - drivers/sqlite
-          - drivers/postgres
-          - examples
 
+    # Only this job runs tests, so it is the only one needing a server. The
+    # Postgres driver and cluster suite read PG_TEST_DSN and skip without it.
     services:
       postgres:
         image: postgres:17-alpine
@@ -56,8 +49,6 @@ jobs:
           POSTGRES_PASSWORD: test
         ports:
           - 5432:5432
-        # Hold the job until the server accepts connections, so the first
-        # test does not race the container's startup.
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 10s
@@ -68,40 +59,108 @@ jobs:
       PG_TEST_DSN: postgres://postgres:test@localhost:5432/postgres
 
     steps:
-      # Actions are pinned to full commit SHAs (the trailing comment names the
-      # tag the SHA was resolved from), so a moved or compromised tag cannot
-      # change what runs here. Bump by resolving the new tag's commit.
+      # Actions pinned to full commit SHAs (trailing comment names the tag the
+      # SHA came from), so a moved tag cannot change what runs here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      # One toolchain for every module: the workspace's go directive is the
-      # single source of truth and satisfies each module's own (a module may
-      # ask for an older Go, never a newer one than the workspace pins).
+      # stable, not go-version-file: go.work pins an exact patch release, and
+      # an unpatched toolchain makes govulncheck report every stdlib advisory
+      # fixed since it.
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version-file: go.work
+          go-version: stable
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          [ -z "$unformatted" ] || { echo "not gofmt'd: $unformatted"; exit 1; }
 
       - name: Build
-        working-directory: ${{ matrix.module }}
-        run: go build ./...
+        run: go build $PKGS
 
       - name: Vet
-        working-directory: ${{ matrix.module }}
-        run: go vet ./...
+        run: go vet $PKGS
 
-      - name: gofmt check
-        working-directory: ${{ matrix.module }}
-        run: |
-          UNFORMATTED=$(gofmt -l .)
-          if [ -n "$UNFORMATTED" ]; then
-            echo "The following files are not gofmt'd:"
-            echo "$UNFORMATTED"
-            exit 1
-          fi
-
-      # -race across every module: it is the whole point of the concurrency
-      # here (the store lease, the hint transport, the submission worker, and
-      # the cluster suite all run goroutines that contend), and it is what the
-      # local development gate runs.
+      # -v and the summary because a skipped test is not a passing test. Some
+      # skip on a precondition the runner does not meet (root cannot provoke a
+      # permission failure; the Postgres suites need PG_TEST_DSN), and the
+      # default output reports the package ok either way.
       - name: Test
-        working-directory: ${{ matrix.module }}
-        run: go test ./... -race
+        run: |
+          set -o pipefail
+          go test -race -v $PKGS 2>&1 | tee test.log
+          status=$?
+          echo "::group::skipped"
+          grep -E '^\s*--- SKIP' test.log || echo "(none)"
+          echo "::endgroup::"
+          exit $status
+
+  consumer:
+    runs-on: ubuntu-latest
+
+    # Quoted: bare off is a YAML boolean, and Go rejects GOWORK=false.
+    env:
+      GOWORK: "off"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: stable
+
+      # Pinned rather than @latest: an unpinned installer is a supply-chain
+      # hole, same reasoning as the action SHAs.
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+
+      # Own stdlib-only module, outside go.work. vulngate fails on anything
+      # unaccepted, and on an accepted advisory that becomes reachable through a
+      # symbol nobody reviewed. See .github/SECURITY.md.
+      - name: Build vulngate
+        working-directory: .github/tools/vulngate
+        run: go build -o "$RUNNER_TEMP/vulngate" .
+
+      # datatypes/mail carries the x/text pin and the accepted advisory, and is
+      # imported directly. examples has the largest dependency closure, so it
+      # covers the drivers' published graphs. core and capabilities/websocket
+      # are stdlib-only, so their consumer graph is empty.
+      - name: datatypes/mail
+        working-directory: datatypes/mail
+        run: go build ./... && "$RUNNER_TEMP/vulngate"
+
+      - name: examples
+        working-directory: examples
+        run: go build ./... && "$RUNNER_TEMP/vulngate"
+
+  # core, capabilities/websocket and datatypes/mail declare go 1.24. The rest
+  # require 1.25.0 because modernc.org/sqlite, modernc.org/libc and
+  # jackc/pgx/v5 do.
+  #
+  # GOWORK=off is required, not preferred: go.work declares 1.25.0, and in
+  # workspace mode that floor applies to every member. It also means each
+  # module must be built from its own directory.
+  minimum:
+    runs-on: ubuntu-latest
+
+    env:
+      GOWORK: "off"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.24"
+
+      - name: core
+        working-directory: core
+        run: go build ./...
+
+      - name: capabilities/websocket
+        working-directory: capabilities/websocket
+        run: go build ./...
+
+      - name: datatypes/mail
+        working-directory: datatypes/mail
+        run: go build ./...

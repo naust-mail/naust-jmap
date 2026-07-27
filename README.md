@@ -2,10 +2,10 @@
 
 # naust-jmap
 
-**A Go runtime for building JMAP servers.**
+**The Go framework for building JMAP servers.**
 
-Not a mail server - a library that executes the JMAP protocol\
-(RFC 8620 and friends) correctly, and leaves everything else to you.
+Build production JMAP servers with RFC 8620 (Core), RFC 8621 (Mail), and more with\
+pluggable storage, authentication, search, and delivery. Stdlib-only core.
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.24%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
@@ -16,7 +16,7 @@ Not a mail server - a library that executes the JMAP protocol\
 
 ---
 
-<!-- Badges to add once public: CI workflow, pkg.go.dev reference. -->
+Build complete JMAP servers without implementing the protocol yourself.
 
 naust-jmap has no opinion about anything the RFCs are silent on. You supply
 object types, storage, authentication, search, and delivery through small
@@ -24,96 +24,212 @@ interfaces; the runtime supplies protocol correctness: the session resource,
 request dispatch, standard method semantics, change tracking, state strings,
 and push.
 
-- The runtime owns correctness. Plugins own meaning. Backends own persistence.
-- The library module is `github.com/naust-mail/naust-jmap/core` and depends on
-  the Go standard library only. Anything needing third-party code lives in a
-  separate module; you import only what you use.
+- **Datatypes are data, not code.** Describe a type once and the runtime derives
+  its `/get`, `/changes`, `/set`, `/copy`, `/query` and `/queryChanges` methods.
+- **Protocol-complete.** RFC 8620 end to end: session resource, batched requests,
+  back-references, the full error catalog, blobs, and push.
+- **Bring your own infrastructure.** Storage, authentication, blob persistence,
+  leases, notifications and search are small interfaces with working defaults.
+- **No dependencies in `core`.** Standard library only, forever. Anything needing
+  third-party code is a separate module, so you import only what you use.
+- **The runtime owns correctness.** Plugins own meaning. Backends own persistence.
+- **One node or a fleet.** SQLite for a single process, Postgres with cross-
+  instance leases and push for several.
+- **Mail included.** `datatypes/mail` implements RFC 8621 - reading, composing,
+  sending, and delivery over LMTP or HTTP ingest, and a tracked RFC compliance matrix.
 
-## Layout
+```mermaid
+flowchart TB
+    C["JMAP clients"]
 
-One module per component. Drivers implement providers. Datatypes consume the
-runtime.
+    subgraph TR["transport"]
+        H["HTTP<br/>/api, /eventsource"]
+        WS["websocket<br/>RFC 8887, optional"]
+    end
 
-| Directory         | What lives there                                                                                                               | You...                    |
-|-------------------|--------------------------------------------------------------------------------------------------------------------------------|---------------------------|
-| `core/`           | The runtime library, one Go module, stdlib-only forever                                                                        | import always             |
-| `core/providers/` | The interfaces the runtime needs (storage, blobs, leases, notifications, auth), each with a built-in in-process implementation | pick or implement         |
-| `drivers/`        | Provider implementations that need third-party dependencies (sqlite, postgres), each its own module                            | import at most one or two |
-| `datatypes/`      | JMAP datatypes served on top of the runtime (mail arrives here first), each its own module                                     | import what you serve     |
-| `capabilities/`   | Optional protocol capabilities beside the core endpoints (the RFC 8887 WebSocket transport first), each its own module         | import what you want      |
-| `examples/`       | Runnable servers: the quickstart below and a full mail server (`examples/mailserver`)                                          | read                      |
+    RT["Naust-JMAP (core)<br/>session, dispatch,<br/>the standard methods,<br/>state, blobs, push"]
 
-## Quickstart
+    subgraph EXT["what you plug in"]
+        DT["datatypes<br/>mail (RFC 8621), your own"]
+        PV["providers<br/>auth, backend, blob, lease, notify"]
+    end
 
-A complete runnable server lives in
-[`examples/quickstart`](examples/quickstart/main.go). The whole idea in one
-screen: describe a datatype as data (the Todo type from the RFC's own
-examples), and the runtime derives its `/get`, `/changes`, `/set`, `/copy`,
-`/query`, and `/queryChanges` methods with full RFC 8620 semantics.
+    C --> TR
+    TR --> RT
+    RT --> EXT
+
+    style WS stroke-dasharray: 5 5
+```
+
+`core` is the only required import. Everything below it is an interface with a
+working in-process default, and everything beside it is a module you take only
+if you want it - unimported code is absent from the binary and from the
+dependency graph.
+
+## Table of contents
+
+- [Get started](#get-started)
+  - [1. Install](#1-install)
+  - [2. Run a server](#2-run-a-server)
+- [Documentation](#documentation)
+- [Usage examples](#usage-examples)
+  - [Define a datatype](#define-a-datatype)
+  - [Serve mail](#serve-mail)
+  - [Choose persistence](#choose-persistence)
+  - [Add the WebSocket transport](#add-the-websocket-transport)
+- [Layout](#layout)
+- [JMAP support](#jmap-support)
+- [Mail (RFC 8621)](#mail-rfc-8621)
+- [Roadmap](#roadmap)
+- [License](#license)
+
+## Get started
+
+### 1. Install
+
+The runtime is the only required module:
+
+```sh
+go get github.com/naust-mail/naust-jmap/core
+```
+
+Add what you actually serve. Each is its own module, and an unimported module
+never enters your binary or your dependency graph:
+
+```sh
+go get github.com/naust-mail/naust-jmap/datatypes/mail          # RFC 8621 mail
+go get github.com/naust-mail/naust-jmap/drivers/sqlite          # single-node storage
+go get github.com/naust-mail/naust-jmap/drivers/postgres        # fleet storage
+go get github.com/naust-mail/naust-jmap/capabilities/websocket  # RFC 8887 transport
+```
+
+> `core` and `capabilities/websocket` build on Go 1.24. `datatypes/mail`, both
+> drivers and the examples require **Go 1.25**.
+
+### 2. Run a server
+
+```sh
+git clone https://github.com/naust-mail/naust-jmap
+cd naust-jmap
+go run ./examples/quickstart
+```
+
+Then speak JMAP to it (user `demo@example.com`, password `demo`):
+
+```sh
+curl -su demo@example.com:demo http://localhost:8080/.well-known/jmap
+```
+
+[`examples/quickstart`](examples/quickstart) has the full request: it creates a
+record, queries for it, and fetches it via a back-reference in one round trip.
+
+## Documentation
+
+Each module documents its own public API; the package documentation is the API
+reference; the site covers tasks. Nothing is duplicated across the three.
+
+| You want                                  | Look in                                                                                                                                                                                                   |
+|-------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| What a module provides and its public API | That module's README - [`core`](core), [`datatypes/mail`](datatypes/mail), [`drivers/sqlite`](drivers/sqlite), [`drivers/postgres`](drivers/postgres), [`capabilities/websocket`](capabilities/websocket) |
+| The API reference                         | [pkg.go.dev](https://pkg.go.dev/github.com/naust-mail/naust-jmap/core)                                                                                                                                    |
+| Working code                              | [`examples/`](examples) - quickstart, a full mail server, a two-instance cluster proof                                                                                                                    |
+| How to accomplish a task                  | [naust.email/naust-jmap](https://naust.email/naust-jmap) - quickstart, auth, mail, websocket, fleet, reference                                                                                            |
+| Method-by-method RFC status               | [reference matrices](https://naust.email/naust-jmap/reference)                                                                                                                                            |
+| Reporting a vulnerability                 | [SECURITY.md](.github/SECURITY.md), [HARDENING.md](.github/HARDENING.md)                                                                                                                                  |
+
+## Usage examples
+
+Error handling is elided for brevity; the linked files check every call.
+
+### Define a datatype
+
+Describe it, register it, and the six standard methods exist. No method code:
 
 ```go
-// Persistence: the in-memory backend and its in-process lease manager.
-// Swap these two lines for a real driver module (e.g. drivers/sqlite)
-// and the rest is unchanged.
-be := memory.New()
-db := objectdb.New(be, lease.NewInProcess(be))
-
-// Authentication: a demo user list with argon2id-hashed passwords. Real
-// embedders implement auth.Authenticator against their own credential
-// store, verifying a token per request rather than a password.
-users := demoauth.New(demoauth.Default())
-users.AddUser("demo@example.com", "demo", "Ademo")
-
+// Define a type with two properties, one indexed and one with a default value
 todo := &descriptor.Type{
     Name:       "Todo",
     Capability: "urn:example:todo",
     Properties: map[string]descriptor.Property{
         "title": {Kind: descriptor.KindString, Indexed: true},
         "done":  {Kind: descriptor.KindBool, Indexed: true, Default: json.RawMessage(`false`)},
-        "notes": {Kind: descriptor.KindString},
     },
 }
 
+// Register it with the runtime, which derives the standard methods
 proc := runtime.NewProcessor()
 core := runtime.DefaultCoreCapabilities()
 runtime.RegisterStandardType(proc, db, todo, core)
 
+// Serve it over HTTP
 srv, _ := runtime.NewServer(users, proc, "http://localhost:8080", core)
-srv.RegisterCapability("urn:example:todo", struct{}{}, struct{}{})
-srv.EnableBlobs(db, kvstore.New(be))                     // uploads, downloads, Blob/copy
-                                                         // (one of three stores; see below)
-srv.EnablePush(db, notify.NewInProcess(), nil, nil)      // event-source push
+srv.Capability("urn:example:todo").Advertise(struct{}{}, struct{}{})
 http.ListenAndServe("localhost:8080", srv)
 ```
 
-(Error handling on each call is elided above for brevity; see the real file, linked above, which
-checks every one.)
+Full file: [`examples/quickstart`](examples/quickstart).
 
-Run it and speak JMAP:
+### Serve mail
 
-```sh
-go run ./examples/quickstart
+The RFC 8621 types register the same way, into the same processor:
 
-curl -su demo@example.com:demo http://localhost:8080/.well-known/jmap
-
-curl -su demo@example.com:demo http://localhost:8080/api \
-  -H 'Content-Type: application/json' -d '{
-    "using": ["urn:ietf:params:jmap:core", "urn:example:todo"],
-    "methodCalls": [
-      ["Todo/set", {"accountId": "Ademo", "create":
-        {"t1": {"title": "try JMAP"}}}, "0"],
-      ["Todo/query", {"accountId": "Ademo", "filter":
-        {"done": false}, "sort": [{"property": "title"}]}, "1"],
-      ["Todo/get", {"accountId": "Ademo",
-        "#ids": {"resultOf": "1", "name": "Todo/query", "path": "/ids"}}, "2"]
-    ]
-  }'
+```go
+// Register the five RFC 8621 (mail) types, plus the submission queue
+mail.RegisterMailbox(proc, db, core)
+mail.RegisterThread(proc, db, core)
+mail.RegisterEmail(proc, db, blobs, core, mail.DefaultAccountCapability(), nil)
+mail.RegisterIdentity(proc, db, policy, core)
+queue, _ := mail.RegisterEmailSubmission(proc, db, blobs, core, policy, limits)
 ```
 
-That request creates a record, queries for it, and fetches it via a
-back-reference, in one round trip. Patches (`Todo/set` with `update`),
-sync (`Todo/changes`), creation-id references (`"#t1"`), and query
-windowing (`position`, `anchor`, `limit`) all work as the RFC specifies.
+Full file: [`examples/mailserver`](examples/mailserver), which also wires LMTP
+and HTTP ingest so mail can actually arrive.
+
+### Choose persistence
+
+Storage is two lines, and nothing above them changes:
+
+```go
+// Pick one backend:
+store, _ := sqlite.Open("./naust-mail.db")        // single process
+// store, _ := postgres.Open(ctx, "postgres://...")  // several processes
+
+db := objectdb.New(store, lease.NewInProcess(store))
+blobs, _ := chunkstore.New(store)                 // one of three blob stores
+```
+
+See [choosing a blob store](core#choosing-a-blob-store), and
+[`examples/cluster`](examples/cluster) for what changes with more than one node.
+
+Neither driver fits? A backend is four methods over an ordered key-value store,
+and [`drivers/`](drivers) is the guide to writing one.
+
+### Add the WebSocket transport
+
+Requests and push on one connection instead of `/api` plus `/eventsource`:
+
+```go
+ws := websocket.NewHandler(srv, users)
+srv.Capability(websocket.CapabilityURI).
+    Advertise(websocket.SessionCapability(srv.BaseURL(), "/ws", ws.SupportsPush()), struct{}{})
+mux.Handle("/ws", ws)
+```
+
+Full module: [`capabilities/websocket`](capabilities/websocket).
+
+## Layout
+
+One module per component. Drivers implement providers. Datatypes consume the
+runtime.
+
+| Directory               | What lives there                                                                                                                                                              | You...                    |
+|-------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------|
+| [`core/`](core)         | The runtime library, one Go module, stdlib-only forever                                                                                                                       | import always             |
+| `core/providers/`       | The interfaces the runtime needs (storage, blobs, leases, notifications, auth), each with a built-in in-process implementation                                                | pick or implement         |
+| [`drivers/`](drivers)   | Provider implementations that need third-party dependencies ([sqlite](drivers/sqlite), [postgres](drivers/postgres)), each its own module - and the guide to writing your own | import at most one or two |
+| `datatypes/`            | JMAP datatypes served on top of the runtime ([mail](datatypes/mail) arrives here first), each its own module                                                                  | import what you serve     |
+| `capabilities/`         | Optional protocol capabilities beside the core endpoints (the RFC 8887 [WebSocket](capabilities/websocket) transport first), each its own module                              | import what you want      |
+| [`examples/`](examples) | Runnable servers: the quickstart above, a full mail server, and a two-instance cluster proof                                                                                  | read                      |
 
 ## JMAP support
 
@@ -121,11 +237,11 @@ The core protocol (RFC 8620) is implemented end to end:
 
 - The core protocol: session resource, request envelope, back-references,
   capability gating, request limits, strict I-JSON.
-- The six derived standard methods over any registered datatype: `/get`,
+- The RFC derived standard methods over any registered datatype: `/get`,
   `/changes`, `/set`, `/copy`, `/query`, `/queryChanges`.
 - Binary data (`Server.EnableBlobs`): streaming upload/download endpoints and
   `Blob/copy`, with reference tracking and unreferenced-blob sweeping. Three blob
-  stores ship, all behind `blob.Store` (see [choosing one](#choosing-a-blob-store)).
+  stores ship, all behind `blob.Store` (see [choosing one](core#choosing-a-blob-store)).
 - Push (`Server.EnablePush`): the event-source endpoint, plus verified
   `PushSubscription` webhooks with RFC 8291 encryption when given a
   subscription store and sender.
@@ -133,197 +249,26 @@ The core protocol (RFC 8620) is implemented end to end:
   `capabilities/websocket` module, sharing `maxConcurrentRequests` with
   the HTTP endpoint and adding StateChange push over the socket.
 
-<details>
-<summary>Full RFC 8620 support matrix</summary>
-
-`Foo` below stands for any registered datatype; the methods are derived
-from its descriptor, not written per type.
-
-| Category   | Feature                                | Status | Notes                                                                                                                 |
-|------------|----------------------------------------|--------|-----------------------------------------------------------------------------------------------------------------------|
-| Session    | Session resource (`/.well-known/jmap`) | Yes    | Accounts, capabilities, URLs, `sessionState` on every response                                                        |
-| Session    | Authentication                         | Yes    | Pluggable via the `providers/auth` interface; quickstart uses Basic, mailserver uses bearer tokens                    |
-| Session    | Advertised limits                      | Yes    | `maxSizeUpload`, `maxSizeRequest`, `maxCallsInRequest`, `maxObjectsInGet/Set`, etc. (section 2), enforced server-side |
-| Core       | Capability negotiation (`using`)       | Yes    | Non-opted capabilities behave as absent                                                                               |
-| Core       | `Core/echo`                            | Yes    |                                                                                                                       |
-| API        | Request envelope (`/api`)              | Yes    | Batched method calls, strict I-JSON, request limits                                                                   |
-| API        | Request- and method-level errors       | Yes    | Full RFC 8620 error catalog                                                                                           |
-| References | Back-references (`#arg`)               | Yes    | JSON Pointer evaluation with `*` array flattening                                                                     |
-| References | Creation-id references (`#creationId`) | Yes    | Request-wide `createdIds` map                                                                                         |
-| Methods    | `Foo/get`, `Foo/changes`, `Foo/set`    | Yes    | PatchObject validation, change coalescing, per-record atomicity                                                       |
-| Methods    | `Foo/copy`                             | Yes    | Cross-account copy with `onSuccessDestroyOriginal`                                                                    |
-| Methods    | `Foo/query`                            | Yes    | Indexed range scans, in-memory residual, anchors, windowing                                                           |
-| Methods    | `Foo/queryChanges`                     | Yes    | Real diffs for record-local queries (declared via `QueryHooks`), tiered answering, `upToId`, work-budget refusals     |
-| State      | State strings and `ifInState`          | Yes    | Optimistic concurrency with `stateMismatch`                                                                           |
-| Blobs      | Upload/download endpoints, `Blob/copy` | Yes    | Reference tracking and unreferenced-blob sweeping                                                                     |
-| Push       | EventSource (`/eventsource`)           | Yes    | `types`, `closeafter`, `ping` arguments                                                                               |
-| Push       | `PushSubscription` webhooks            | Yes    | Verification flow, RFC 8291 payload encryption                                                                        |
-| Transport  | JMAP over WebSocket (RFC 8887)         | Yes    | `jmap` subprotocol, request `id` correlation, socket push; no `pushState` (snapshot covers reconnection)              |
-
-</details>
-
-<details>
-<summary>Design decisions worth knowing about</summary>
-
-Where the RFCs leave a behavior to the server, the choice is recorded here so
-embedders know what to expect. The first entry concerns the core runtime;
-the rest concern the mail module (RFC 8621); see Mail below.
-
-**queryChanges answers only what it can prove.** `Foo/queryChanges` computes
-real diffs for record-local queries: those whose filter and sort verdicts
-depend only on each record's own data, declared per name on
-`runtime.QueryHooks` (core-language queries qualify by construction, and
-`runtime.CheckRecordLocal` is the shipped checker a datatype's tests prove
-declarations with). Anything undeclared - Email's thread-keyword conditions,
-Mailbox tree arrangements - answers `cannotCalculateChanges`, the section
-5.6 escape that costs the client one refetch; a forgotten declaration
-degrades service but can never corrupt a client's cached list. States are
-plain commit numbers, so how far behind a client is costs a subtraction, and
-a single work budget refuses oversized answers before the expensive work
-happens. Collapsed Email queries stay sound through the Thread group
-companion: every membership change updates the Thread record, so a destroyed
-representative's untouched sibling is still re-reported. Ordered streaming
-evaluation for mutable queries (bounding tier-2 work by index order) is a
-recognized future extension of the query planner, not built.
-
-**Threads never merge.** Emails are grouped into Threads by their
-References/In-Reply-To chain plus a normalized subject. If two existing
-Threads later turn out to be one conversation (the message linking them
-arrives late), they stay separate: the late message joins the first Thread
-it matches. RFC 8621 section 3 leaves the algorithm server-defined, and this
-matches Gmail's behavior. Merging would require destroying and re-creating
-Email objects, because a Thread id is immutable once assigned. Splits are
-rare in practice: replies carry their full ancestor chain in References, so
-one missing message almost never breaks the link. The message-id index is
-stored permanently, so opt-in merging can be added later as a configuration
-option (default off) without a data-model change.
-
-**Unread Thread counts use the trash-aware rules.** RFC 8621 section 2 does
-not mandate how a Mailbox's unreadThreads count is calculated and sketches
-both a simple and a quality method. This runtime implements the quality
-method: Emails that are only in the trash do not make a conversation look
-unread in other Mailboxes, and vice versa. There is deliberately no flag to
-select the simple method: counts are stored and maintained incrementally, so
-switching semantics would require a full recount, and one correct behavior
-beats two switchable ones. Accounts with no trash-role Mailbox naturally get
-the simple behavior.
-
-**Composing rejects, never repairs.** `Email/set` create generates the RFC
-5322 message exactly from the properties given: anything the generator cannot
-represent faithfully is an `invalidProperties` SetError, not a silent fix-up.
-The server adds only what the spec assigns it, including missing `Date` and
-`Message-ID` headers; the domain synthesized Message-IDs live under is
-configuration (`mail.WithMessageIDDomain`), never guessed from a hostname.
-
-**The submission records are the queue.** There is no separate outbound queue
-store: an `EmailSubmission` with work remaining carries a due-time index
-entry, and the sending worker is a reader of that index. The database is the
-coordination point - any process sharing the store discovers queued work
-through a periodic scan of a tag worklist (worst case one scan interval,
-default a minute), an in-process bell is only a latency optimization, and
-claims are wall-clock stamps verified under the account lease, so workers
-never double-send and a crashed claim is reclaimed after a window. Retries
-follow a backoff schedule; abandonment requires both an age past
-`GiveUpAfter` and at least `MinAttempts` real attempts, so a long worker
-outage cannot instantly bounce stale mail. `ProcessDue` is the manual crank
-over the same engine (a queue flush, a pacer, a deterministic test).
-
-**Undo send is cancellation before relay.** `undoStatus` stays `pending`
-until a recipient is irrevocably handed to the smarthost, so a client can
-cancel any queued submission - including one held by FUTURERELEASE (RFC
-4865), which this module implements natively: the hold is `sendAt` in the
-queue, nothing is parked on the smarthost. Holds beyond `maxDelayedSend` are
-rejected, not clamped.
-
-</details>
-
-### Choosing a blob store
-
-Three implementations of `blob.Store` ship. Nothing above the interface can tell
-them apart, so this is an operational choice, not an architectural one - pick by
-importing, since a store you do not import is absent from the binary and from
-the dependency graph.
-
-| Store        | Shape                                 | Choose it when                                                                                                                                                                                                                                                                                                            |
-|--------------|---------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `kvstore`    | Each blob is one value in the backend | Blobs are reliably small **and you can bound both blob size and ingress concurrency**. Fewest writes per blob, and blobs commit in the same transaction as the objects referencing them. Cost: an arriving blob is held whole in memory, so peak scales with blob size times concurrent writers - see the warning below.  |
-| `chunkstore` | Fixed-size pieces plus a manifest     | Blobs can be large or the size is not known in advance. Memory stays flat regardless of blob size, still transactional, at the cost of several writes per blob. The default for mail.                                                                                                                                     |
-| `fsstore`    | One file per blob, tmp-then-rename    | Throughput on large blobs matters more than transactional coupling. A transactional store has to journal every byte it takes; this does not. Cost: blobs no longer commit with the objects referencing them (the ordering is chosen so the survivable inconsistency is an unreferenced blob, which the sweeper reclaims). |
-
-> **`kvstore`'s memory is attacker-controlled.** It holds each arriving blob whole
-> in memory, and both factors in `size x concurrency` are normally chosen by the
-> client: blob size up to `maxSizeUpload`, concurrency up to whatever the ingress
-> allows. Measured at 16 concurrent deliveries of a 16 MiB message, peak RSS was
-> about **162 MiB** with `chunkstore` and about **1.1 GiB** with `kvstore`; at the
-> shipped mail defaults (64 concurrent LMTP connections, a 50 MB size cap) the
-> same arithmetic reaches several gigabytes. That is a denial-of-service vector,
-> not a tuning preference. Choose `kvstore` only where you can bound both factors
-> - `chunkstore`'s peak depends on neither.
-
-The crossover between `kvstore` and `chunkstore` is real but not a fixed number:
-it moves with the backend's per-row overhead and its own out-of-line policy
-(Postgres already moves large values out of line via TOAST), with blob size, and
-with write concurrency. As one data point, on SQLite at 32 concurrent writers
-`kvstore` ingested roughly 40% faster at 4 KiB, the two were level around 64 KiB,
-and `chunkstore` was roughly 3x faster at 1 MiB. Measure on your own backend
-before treating any threshold as settled.
+The [`core/` README](core#protocol-support) carries the full RFC 8620 support
+matrix and the runtime's recorded design decisions; [`datatypes/mail`](datatypes/mail#design-decisions)
+carries the mail ones.
 
 ## Mail (RFC 8621)
 
-The first datatype module, `datatypes/mail`, implements RFC 8621: Mailbox,
-Thread, Email, Identity and EmailSubmission as descriptor types over the
-derived RFC 8620 machinery - reading, composing and sending - plus message
-delivery (which sits below the JMAP protocol) through LMTP and HTTP ingest
-adapters, and a sending worker that relays queued submissions through a
-`Submitter` socket (a reference SMTP relay ships; sending is gated by a
-deny-by-default `SendPolicy`).
+The first datatype module, [`datatypes/mail`](datatypes/mail), implements RFC
+8621: Mailbox, Thread, Email, Identity and EmailSubmission as descriptor types
+over the derived RFC 8620 machinery, plus message delivery through LMTP and
+HTTP ingest adapters and a sending worker. Its README carries the public API,
+the RFC 8621 support matrix, and the calls the module makes where the spec is
+silent.
 
 A complete, persistent mail server - the sqlite driver, all five types, both
 delivery adapters, sending, and push - is in
-[`examples/mailserver`](examples/mailserver/main.go):
+[`examples/mailserver`](examples/mailserver):
 
 ```sh
 go run ./examples/mailserver
 ```
-
-It serves JMAP on `:8080`, accepts LMTP on `127.0.0.1:2400`, and takes an HTTP
-ingest `POST` on `/ingest`; the file's header walks through creating an Inbox,
-delivering a message both ways, and reading it back over JMAP. With no
-`-relay` flag it "sends" by delivering to local accounts (loopback mode);
-`-relay host:port` relays outbound through a real smarthost.
-
-<details>
-<summary>RFC 8621 support matrix</summary>
-
-| Object / method                             | Status | Notes                                                                                                  |
-|---------------------------------------------|--------|--------------------------------------------------------------------------------------------------------|
-| `Mailbox/get`, `/query`, `/changes`         | Yes    | 18 IANA roles, tree with a depth limit, computed `myRights`                                            |
-| `Mailbox/set`                               | Yes    | create/update/destroy, `onDestroyRemoveEmails` cascade                                                 |
-| Mailbox counters                            | Yes    | `totalEmails`, `unreadEmails`, `totalThreads`, `unreadThreads` (section 2.1, trash-aware)              |
-| `Thread/get`, `/changes`                    | Yes    | References + subject grouping; Threads never merge (see Design decisions)                              |
-| `Email/get`                                 | Yes    | stored fast fields + on-demand MIME parse; `header:{name}:as{Form}:all` parsed forms                   |
-| `Email/query`                               | Yes    | every section 4.4.1 condition, section 4.4.2 sort, `collapseThreads`, fast total                       |
-| `Email/set` (keywords, mailboxIds, destroy) | Yes    | flag and file existing mail; per-record atomic                                                         |
-| `Email/set` (create / compose)              | Yes    | strict-reject message generation from parts (see Design decisions)                                     |
-| `Email/import`, `Email/parse`               | Yes    | ingest a blob; parse without storing (`notParsable`, section 4.9, not yet split from serverFail)       |
-| `Email/copy`                                | Yes    | cross-account copy with `onSuccessDestroyOriginal`                                                     |
-| `SearchSnippet/get`                         | Yes    | highlighted subject and body preview                                                                   |
-| Delivery (LMTP, HTTP ingest)                | Yes    | transport-agnostic `Deliverer`; RFC 2033 LMTP; host-provided recipient `Resolver`                      |
-| `EmailDelivery` push type                   | Yes    | section 1.5 method-less push; state advances on new mail only                                          |
-| `Identity/get`, `/changes`, `/set`          | Yes    | section 6 defaults, `SendPolicy`-gated creation, immutable `email`                                     |
-| `EmailSubmission` (all methods)             | Yes    | section 7 envelope derivation, section 7.5 error taxonomy, `onSuccessUpdateEmail/Destroy`              |
-| Sending worker + SMTP relay                 | Yes    | records-as-queue worker (see Design decisions); reference `Submitter` over SMTP, RFC 3461              |
-| FUTURERELEASE (RFC 4865)                    | Yes    | native holds via `sendAt`; over-limit or conflicting holds rejected, not clamped                       |
-| Trace stamping at delivery                  | Yes    | `Return-Path` + `Received` prefixed as the message streams in (RFC 5321 section 4.4); no FOR clause    |
-| DSN/MDN ingestion                           | Yes    | ENVID = submission id (RFC 3461); RFC 3464/8098 parsed into `deliveryStatus`/`dsnBlobIds`/`mdnBlobIds` |
-| `VacationResponse/get`, `/set`              | Yes    | section 8 singleton; delivery-side responder per RFC 3834 through the one submission queue             |
-| Mail/Submission capability objects          | Yes    | `maxMailboxesPerEmail`, `maxSizeAttachmentsPerEmail`, `maxDelayedSend`, etc. (sections 1.3.1/1.3.2)    |
-
-Search is a swappable interface (`mail.Searcher`); the built-in implementation
-is case-insensitive substring matching. MDN (RFC 9007), S/MIME verification
-(RFC 9219), and quotas (RFC 9425) are later datatype modules.
-
-</details>
 
 ## Roadmap
 
@@ -338,4 +283,8 @@ order:
 
 ## License
 
-[Apache-2.0](LICENSE). See also [NOTICE](NOTICE).
+<div align="center">
+
+Released under the [Apache-2.0](LICENSE) license. See also [NOTICE](NOTICE).
+
+</div>

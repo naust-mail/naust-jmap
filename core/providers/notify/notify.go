@@ -1,4 +1,4 @@
-// Package notify defines the Notifier socket: post-commit change
+// Package notify defines the Notifier provider: post-commit change
 // fan-out feeding push (RFC 8620 section 7).
 //
 // The Notifier is the ephemeral, best-effort tier of the runtime's
@@ -13,6 +13,10 @@
 // It is deliberately named Notifier, not EventBus: it must never be
 // used as a durable stream. Durable consumers (search indexing, audit,
 // replication) follow the change log with a cursor instead.
+//
+// An implementation is correct when it passes notifytest.Run, the
+// shared contract suite; a notifier that links separate processes also
+// passes notifytest.RunLinked.
 package notify
 
 import (

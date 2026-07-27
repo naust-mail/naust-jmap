@@ -1,6 +1,19 @@
-// Package runtime executes the JMAP protocol: request dispatch,
-// back-reference resolution, capability enforcement, and (in later
-// steps) the session endpoint and standard method derivation.
+// Package runtime executes the JMAP protocol (RFC 8620): the session
+// resource, the API endpoint, request dispatch, back-reference
+// resolution, capability enforcement, and the standard methods derived
+// from a datatype's descriptor.
+//
+// A datatype is registered as data rather than as code:
+// RegisterStandardType derives /get, /changes, /set, /copy, /query and
+// /queryChanges from a descriptor.Type, and a plugin writes method code
+// only where the spec gives the type meaning a schema cannot express
+// (RegisterStandardTypeExt, with SetHooks and QueryHooks).
+//
+// Server is the HTTP face: mount it as an http.Handler, and turn on the
+// optional endpoints with EnableBlobs (RFC 8620 section 6) and
+// EnablePush (section 7). Everything the runtime does not own - storage,
+// authentication, blob persistence, leases, notification fan-out -
+// arrives through the interfaces in core/providers.
 package runtime
 
 import (

@@ -1,6 +1,26 @@
 // Package backendtest is the shared contract suite: every Backend
 // implementation must pass the identical tests. A backend that passes
 // is behaviorally interchangeable with every other.
+//
+// Write this test before writing the engine. It is the specification;
+// the interface's method set is only its shape.
+//
+//	func TestContract(t *testing.T) {
+//		backendtest.Run(t, backendtest.Config{
+//			Open: func(t *testing.T) backend.Backend {
+//				s, err := mydriver.Open(filepath.Join(t.TempDir(), "test.db"))
+//				if err != nil {
+//					t.Fatal(err)
+//				}
+//				return s
+//			},
+//			// Reopen proves durability across a close. Leave it nil for
+//			// an in-memory backend and the persistence tests are skipped.
+//			Reopen: func(t *testing.T, b backend.Backend) backend.Backend {
+//				...
+//			},
+//		})
+//	}
 package backendtest
 
 import (

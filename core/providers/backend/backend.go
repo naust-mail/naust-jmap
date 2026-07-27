@@ -1,4 +1,4 @@
-// Package backend defines the storage socket: a small ordered
+// Package backend defines the storage provider: a small ordered
 // key-value contract that any engine can implement in a weekend.
 // Everything JMAP-shaped (collections, indexes, change log) is built
 // once ABOVE this interface by the objectdb package; backends never see
@@ -9,6 +9,10 @@
 // the lease key. Backends therefore need atomic batches but NO
 // interactive transactions and NO isolation between concurrent batches
 // to different accounts.
+//
+// An implementation is correct when it passes backendtest.Run, the
+// shared contract suite every Backend must satisfy; write that call
+// before writing the engine.
 package backend
 
 import (
@@ -29,8 +33,10 @@ var ErrAssertFailed = errors.New("backend: assertion failed")
 // applied nothing. A backend without a capacity limit never returns it.
 var ErrNoSpace = errors.New("backend: capacity exceeded")
 
-// Backend is the six-operation storage contract. Keys are ordered by
-// bytes.Compare; values are opaque.
+// Backend is the six-operation storage contract: Get and Scan, plus the
+// four batch ops Set, Delete, Add and Assert. Those six arrive through
+// four methods, because writes are always submitted as a batch. Keys are
+// ordered by bytes.Compare; values are opaque.
 type Backend interface {
 	// Get returns the value at key, or ErrNotFound. The returned slice
 	// belongs to the caller: the backend must not retain, reuse, or

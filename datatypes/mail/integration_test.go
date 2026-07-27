@@ -1,6 +1,6 @@
 package mail
 
-// End-to-end integration: the whole M2 mail slice driven as one system over
+// End-to-end integration: the whole mail read path driven as one system over
 // the real HTTP JMAP server. Mail arrives through both delivery adapters
 // (HTTP ingest and LMTP), threads together, advances the EmailDelivery push
 // state on new mail alone (RFC 8621 section 1.5), and is then read back and

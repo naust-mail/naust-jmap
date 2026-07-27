@@ -35,8 +35,8 @@ func DefaultCoreCapabilities() jmap.CoreCapabilities {
 }
 
 // Server is the HTTP face of the runtime: the session resource, the API
-// endpoint, and (from M1) the binary and push endpoints. It assumes TLS
-// is terminated by the embedder (RFC 8620 section 8.1 requires TLS on
+// endpoint, and the binary and push endpoints. It assumes TLS is
+// terminated by the embedder (RFC 8620 section 8.1 requires TLS on
 // the wire; the library has no opinion on where).
 type Server struct {
 	authn auth.Authenticator

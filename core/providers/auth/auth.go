@@ -1,4 +1,4 @@
-// Package auth defines the authentication socket. The runtime forces
+// Package auth defines the authentication provider. The runtime forces
 // authentication to exist (RFC 8620 requires it) but not its nature:
 // embedders implement Authenticator however they like; the runtime only
 // ever asks "whose request is this, and which accounts may it touch?".
@@ -55,7 +55,7 @@ func (i *Identity) CredentialKey() string {
 // credentials; the server answers 401.
 var ErrUnauthenticated = errors.New("auth: unauthenticated")
 
-// Authenticator is the socket: given an HTTP request, identify the
+// Authenticator is the provider interface: given an HTTP request, identify the
 // caller or reject with ErrUnauthenticated.
 type Authenticator interface {
 	Authenticate(r *http.Request) (*Identity, error)

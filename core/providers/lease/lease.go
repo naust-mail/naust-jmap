@@ -4,9 +4,12 @@
 // fencing assertion, so backends need atomic batches but no isolation
 // (see package backend).
 //
-// Manager is a socket: the in-process implementation here is the
+// Manager is a provider interface: the in-process implementation here is the
 // single-node default; cluster deployments plug a store-backed lease
 // (e.g. Postgres) with the same interface and fencing semantics.
+//
+// An implementation is correct when it passes leasetest.Run, the shared
+// contract suite both the in-process and store-backed managers satisfy.
 package lease
 
 import (

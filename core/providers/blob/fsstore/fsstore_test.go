@@ -581,6 +581,19 @@ func chmodCleanup(t *testing.T, path string, restore os.FileMode) {
 	t.Cleanup(func() { os.Chmod(path, restore) })
 }
 
+// skipIfRoot skips a test that induces its failure by clamping permissions.
+// Root is exempt from the permission checks, so the operation under test
+// succeeds, no error is produced, and the assertion is vacuous. Reporting
+// that as a pass would claim coverage the run did not have, so it is skipped
+// instead: the error propagation these tests guard is real, it just cannot be
+// provoked this way by a user the kernel never refuses.
+func skipIfRoot(t *testing.T) {
+	t.Helper()
+	if os.Getuid() == 0 {
+		t.Skip("running as root: permission bits are not enforced, so the failure this test induces cannot occur")
+	}
+}
+
 // New propagates a failure to create its tmp directory: root is a plain
 // file, so MkdirAll cannot descend into it.
 func TestNewFailsWhenRootIsAFile(t *testing.T) {
@@ -599,6 +612,7 @@ func TestNewFailsWhenRootIsAFile(t *testing.T) {
 // an operator or a broken deploy) must fail New rather than silently
 // starting with debris New could not inspect.
 func TestNewPropagatesSweepFailure(t *testing.T) {
+	skipIfRoot(t)
 	root := t.TempDir()
 	tmp := filepath.Join(root, "tmp")
 	if err := os.MkdirAll(tmp, 0o700); err != nil {
@@ -617,6 +631,7 @@ func TestNewPropagatesSweepFailure(t *testing.T) {
 // Sweep itself, not just New's startup call, must propagate a permission
 // failure reading tmp/ rather than reporting a false "nothing to reclaim".
 func TestSweepPropagatesReadDirFailure(t *testing.T) {
+	skipIfRoot(t)
 	s, root := newStore(t)
 	tmp := filepath.Join(root, "tmp")
 	if err := os.Chmod(tmp, 0o000); err != nil {
@@ -633,6 +648,7 @@ func TestSweepPropagatesReadDirFailure(t *testing.T) {
 // directory - an operator lockdown, a misconfigured mount) rather than
 // silently reporting the file reclaimed.
 func TestSweepPropagatesRemoveFailure(t *testing.T) {
+	skipIfRoot(t)
 	s, root := newStore(t)
 	w, err := s.Create(context.Background(), acct)
 	if err != nil {
@@ -833,6 +849,7 @@ func TestPutFailsWhenDestinationIsADirectory(t *testing.T) {
 // directory is read-only, so the file exists and is readable but cannot be
 // removed - distinct from the already-covered "missing, so a no-op" path.
 func TestDeletePropagatesRemoveFailure(t *testing.T) {
+	skipIfRoot(t)
 	s, root := newStore(t)
 	id := write(t, s, []byte("undeletable"))
 	shard := filepath.Join(root, string(acct), string(id[1:3]))
@@ -849,6 +866,7 @@ func TestDeletePropagatesRemoveFailure(t *testing.T) {
 // Open propagates a permission failure distinctly from ErrNotFound: the
 // blob exists but this process cannot read it.
 func TestOpenPropagatesPermissionFailure(t *testing.T) {
+	skipIfRoot(t)
 	s, root := newStore(t)
 	id := write(t, s, []byte("unreadable"))
 	path := filepath.Join(root, string(acct), string(id[1:3]), string(id))
