@@ -87,7 +87,14 @@ func (s *Server) handleEventSource(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithCancel(base)
 	defer cancel()
-	unregister := s.RegisterConnection(ident.Username, cancel)
+	unregister, err := s.RegisterConnection(ident.Username, cancel)
+	if err != nil {
+		// Registration doubles as per-user admission (RFC 8620 section
+		// 8.5): this user already holds their full connection quota, so
+		// the stream is refused before any of it is committed.
+		http.Error(w, "too many open connections for this user", http.StatusTooManyRequests)
+		return
+	}
 	defer unregister()
 
 	// Changes are pushed for every account the user has access to

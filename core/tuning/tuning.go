@@ -143,6 +143,17 @@ var QueryChangesMaxWork = 4096
 // maxConcurrentRequests, floored at one.
 var MaxConcurrentRequestsPerUser = 0
 
+// MaxConnectionsPerUser bounds how many registered long-lived
+// connections (EventSource streams, and any streaming transport a
+// capability mounts) one username may hold open at once, per process.
+// Each such connection costs a goroutine, a socket, and a push
+// subscription for as long as it stays open, so without a bound a
+// single authenticated user can exhaust a process's file descriptors
+// (RFC 8620 section 8.5's denial-of-service guidance). The default is
+// far above what a person's devices and tabs reach together; zero or
+// negative disables the bound.
+var MaxConnectionsPerUser = 64
+
 // MaxFilterNodes bounds a filter tree's total node count (operators plus
 // condition leaves) in a Foo/query. CheckIJSON caps the request's JSON
 // nesting depth but not a FilterOperator's breadth: a client can pack tens of

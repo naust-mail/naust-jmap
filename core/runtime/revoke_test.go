@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"net/http/httptest"
 	"sync"
 	"sync/atomic"
@@ -14,6 +16,7 @@ import (
 	"github.com/naust-mail/naust-jmap/core/providers/backend/memory"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/providers/notify"
+	"github.com/naust-mail/naust-jmap/core/tuning"
 )
 
 // revokingAuth is authtest.Static plus an auth.Revoker stream driven by
@@ -24,6 +27,17 @@ type revokingAuth struct {
 }
 
 func (a *revokingAuth) Revocations(_ context.Context) <-chan auth.Revocation { return a.events }
+
+// mustRegister registers a connection in tests that are not about
+// admission; under the default per-user cap it cannot fail.
+func mustRegister(t *testing.T, srv *Server, username string, close func()) func() {
+	t.Helper()
+	unregister, err := srv.RegisterConnection(username, close)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return unregister
+}
 
 // A revocation must kill an already-established EventSource stream, not
 // just fail the next request: the stream authenticated once and would
@@ -78,9 +92,9 @@ func TestRevocationClosesEventSource(t *testing.T) {
 func TestRevocationScopedToUsername(t *testing.T) {
 	srv := registrarServer(t)
 	var johnClosed, janeClosed atomic.Int32
-	unregJohn := srv.RegisterConnection("john@example.com", func() { johnClosed.Add(1) })
+	unregJohn := mustRegister(t, srv, "john@example.com", func() { johnClosed.Add(1) })
 	defer unregJohn()
-	unregJane := srv.RegisterConnection("jane@example.com", func() { janeClosed.Add(1) })
+	unregJane := mustRegister(t, srv, "jane@example.com", func() { janeClosed.Add(1) })
 	defer unregJane()
 
 	srv.revokeConnections("ghost@example.com", time.Now())
@@ -119,7 +133,11 @@ func TestConnectionRegistryChurn(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < 500; j++ {
 				var closed atomic.Int32
-				unreg := srv.RegisterConnection("churn@example.com", func() { closed.Add(1) })
+				unreg, err := srv.RegisterConnection("churn@example.com", func() { closed.Add(1) })
+				if err != nil {
+					t.Error(err)
+					return
+				}
 				unreg()
 				unreg() // idempotent by contract
 				if closed.Load() > 1 {
@@ -153,7 +171,7 @@ func TestRevocationIdempotentByTime(t *testing.T) {
 	// now, safely beyond at+slack.
 	at := time.Now().Add(-2 * revocationClockSlack)
 
-	unregOld := srv.RegisterConnection("kim@example.com", func() { oldClosed.Add(1) })
+	unregOld := mustRegister(t, srv, "kim@example.com", func() { oldClosed.Add(1) })
 	defer unregOld()
 	srv.connMu.Lock()
 	for e := range srv.conns["kim@example.com"] {
@@ -161,7 +179,7 @@ func TestRevocationIdempotentByTime(t *testing.T) {
 	}
 	srv.connMu.Unlock()
 
-	unregNew := srv.RegisterConnection("kim@example.com", func() { newClosed.Add(1) })
+	unregNew := mustRegister(t, srv, "kim@example.com", func() { newClosed.Add(1) })
 	defer unregNew()
 
 	srv.revokeConnections("kim@example.com", at)
@@ -181,7 +199,7 @@ func TestRevocationIdempotentByTime(t *testing.T) {
 func TestRevocationSlackBiasesTowardClosing(t *testing.T) {
 	srv := registrarServer(t)
 	var closed atomic.Int32
-	unreg := srv.RegisterConnection("lee@example.com", func() { closed.Add(1) })
+	unreg := mustRegister(t, srv, "lee@example.com", func() { closed.Add(1) })
 	defer unreg()
 
 	// Revocation stamped before the registration but within slack.
@@ -190,5 +208,67 @@ func TestRevocationSlackBiasesTowardClosing(t *testing.T) {
 
 	if got := closed.Load(); got != 1 {
 		t.Errorf("in-slack connection close calls = %d, want 1", got)
+	}
+}
+
+// Registration is the per-user admission point (RFC 8620 section 8.5):
+// a username at tuning.MaxConnectionsPerUser is refused, the count is
+// per username, unregistering frees a slot, and a non-positive cap
+// disables the bound.
+func TestConnectionCapPerUser(t *testing.T) {
+	old := tuning.MaxConnectionsPerUser
+	tuning.MaxConnectionsPerUser = 2
+	t.Cleanup(func() { tuning.MaxConnectionsPerUser = old })
+	srv := registrarServer(t)
+
+	unreg1 := mustRegister(t, srv, "max@example.com", func() {})
+	defer unreg1()
+	unreg2 := mustRegister(t, srv, "max@example.com", func() {})
+	defer unreg2()
+
+	if _, err := srv.RegisterConnection("max@example.com", func() {}); !errors.Is(err, ErrTooManyConnections) {
+		t.Fatalf("third registration err = %v, want ErrTooManyConnections", err)
+	}
+
+	// The bound is per username, not global.
+	unregOther := mustRegister(t, srv, "other@example.com", func() {})
+	defer unregOther()
+
+	// Unregistering releases the slot.
+	unreg2()
+	unreg3 := mustRegister(t, srv, "max@example.com", func() {})
+	defer unreg3()
+
+	// A non-positive cap disables admission entirely.
+	tuning.MaxConnectionsPerUser = 0
+	unreg4 := mustRegister(t, srv, "max@example.com", func() {})
+	defer unreg4()
+}
+
+// An EventSource request from a user already holding their full
+// connection quota is refused with 429 before the stream starts.
+func TestConnectionCapRefusesEventSource(t *testing.T) {
+	old := tuning.MaxConnectionsPerUser
+	tuning.MaxConnectionsPerUser = 1
+	t.Cleanup(func() { tuning.MaxConnectionsPerUser = old })
+	ts := pushServer(t)
+
+	c := openEventSource(t, ts, "types=*&closeafter=no&ping=0")
+	if name, _, err := c.readEvent(); err != nil || name != "state" {
+		t.Fatalf("initial event: %q, %v", name, err)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/eventsource?types=*&closeafter=no&ping=0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth("john@example.com", "secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second stream status = %d, want 429", resp.StatusCode)
 	}
 }

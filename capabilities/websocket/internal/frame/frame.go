@@ -39,6 +39,10 @@ const (
 	ClosePolicyViolation uint16 = 1008
 	CloseTooBig          uint16 = 1009
 	CloseInternalError   uint16 = 1011
+	// CloseTryAgainLater is from the IANA WebSocket Close Code Number
+	// registry rather than section 7.4.1: the server is overloaded or
+	// the client is over a quota, and reconnecting later may succeed.
+	CloseTryAgainLater uint16 = 1013
 )
 
 // ProtocolError reports input that fails RFC 6455 validation. Code is

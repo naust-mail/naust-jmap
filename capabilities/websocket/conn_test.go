@@ -19,6 +19,7 @@ import (
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/runtime"
+	"github.com/naust-mail/naust-jmap/core/tuning"
 )
 
 // staticAuth authenticates HTTP Basic john@example.com/secret; the
@@ -589,6 +590,10 @@ func TestRevocationClosesSocket(t *testing.T) {
 	}
 	env.ts = httptest.NewServer(srv)
 	t.Cleanup(env.ts.Close)
+	// Hijacked handlers outlive ts.Close; Shutdown waits for them, so a
+	// later test's write to a package tuning var cannot race this
+	// connection's registration-time reads.
+	t.Cleanup(env.handler.Shutdown)
 
 	c := dialWS(t, env)
 	// Prove liveness, then revoke.
@@ -603,6 +608,34 @@ func TestRevocationClosesSocket(t *testing.T) {
 	if code := binary.BigEndian.Uint16(payload[:2]); code != 1008 {
 		t.Fatalf("close code %d, want 1008", code)
 	}
+}
+
+// A user already holding their full per-user connection quota (RFC 8620
+// section 8.5) is turned away with 1013 right after the handshake; the
+// first connection stays usable.
+func TestConnectionCapClosesSocket(t *testing.T) {
+	old := tuning.MaxConnectionsPerUser
+	tuning.MaxConnectionsPerUser = 1
+	t.Cleanup(func() { tuning.MaxConnectionsPerUser = old })
+	env := newTestServer(t)
+
+	c1 := dialWS(t, env)
+	// Prove the first connection is admitted and live.
+	c1.send(frame.OpText, request("R1", "Core/echo", "c0"))
+	c1.recvText(5 * time.Second)
+
+	c2 := dialWS(t, env)
+	op, payload, err := c2.recv(5 * time.Second)
+	if err != nil || op != frame.OpClose {
+		t.Fatalf("op %d err %v, want a close frame", op, err)
+	}
+	if code := binary.BigEndian.Uint16(payload[:2]); code != frame.CloseTryAgainLater {
+		t.Fatalf("close code %d, want %d", code, frame.CloseTryAgainLater)
+	}
+
+	// The admitted connection is unaffected by the refusal.
+	c1.send(frame.OpText, request("R2", "Core/echo", "c1"))
+	c1.recvText(5 * time.Second)
 }
 
 // Graceful shutdown: in-flight work drains and flushes, then 1001.

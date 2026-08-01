@@ -99,7 +99,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// section 4.2's credential-expiry policy) and cancels its in-flight
 	// work through the connection context; the closing write runs off
 	// the revocation dispatcher's goroutine (see conn.revoked).
-	unregister := h.srv.RegisterConnection(ident.Username, c.revoked)
+	unregister, err := h.srv.RegisterConnection(ident.Username, c.revoked)
+	if err != nil {
+		// Per-user connection admission (RFC 8620 section 8.5) happens
+		// at registration, after the upgrade: the handshake is already
+		// committed, so the refusal is a Close frame the client can
+		// read, with 1013 saying a later retry may be admitted.
+		c.writeClose(frame.CloseTryAgainLater, "too many open connections for this user")
+		c.abort()
+		return
+	}
 	defer unregister()
 
 	if h.reauthEvery > 0 {
