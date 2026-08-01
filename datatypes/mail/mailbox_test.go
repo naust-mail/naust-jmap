@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/testsupport"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -27,7 +28,7 @@ const testAccount = "Atest1"
 // server-side changes (counter updates) the API cannot express yet.
 func mailServer(t *testing.T) (*httptest.Server, *objectdb.DB) {
 	t.Helper()
-	a := newStaticAuth()
+	a := testsupport.NewStaticAuth()
 	a.AddUser("john@example.com", "secret", testAccount)
 	be := memory.New()
 	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())

@@ -94,7 +94,7 @@ floor, at the cost of one `Authenticate` per connection per interval.
 
 ## Status and compatibility
 
-Pre-release, tagged v0.1.0. Requires `core` v0.1.0 or later.
+Pre-release, tagged v0.1.2. Requires `core` v0.3.0 or later.
 
 Deviation from RFC 8887 worth knowing: no `pushState` is emitted or accepted.
 

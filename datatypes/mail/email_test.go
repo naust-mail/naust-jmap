@@ -6,10 +6,8 @@ package mail
 // by emailcreate_test.go.
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -23,6 +21,8 @@ import (
 	"github.com/naust-mail/naust-jmap/core/providers/blob/kvstore"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/runtime"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/testsupport"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/search"
 )
 
 var testReceivedAt = time.Date(2021, 3, 4, 12, 0, 0, 0, time.UTC)
@@ -31,7 +31,7 @@ var testReceivedAt = time.Date(2021, 3, 4, 12, 0, 0, 0, time.UTC)
 // for both the advertised capability and the enforced limits.
 func newEmailServer(t *testing.T, acctCap AccountCapability) (*httptest.Server, *objectdb.DB, blob.Store) {
 	t.Helper()
-	a := newStaticAuth()
+	a := testsupport.NewStaticAuth()
 	a.AddUser("john@example.com", "secret", testAccount)
 	// jane shares the account without having uploaded anything, for the
 	// RFC 8620 section 6.1 unreferenced-blob visibility tests.
@@ -52,7 +52,7 @@ func newEmailServer(t *testing.T, acctCap AccountCapability) (*httptest.Server, 
 	if err := RegisterThread(p, db, core); err != nil {
 		t.Fatal(err)
 	}
-	if err := RegisterEmail(p, db, store, core, acctCap, nil); err != nil {
+	if err := RegisterEmail(p, db, store, core, acctCap, search.New(store)); err != nil {
 		t.Fatal(err)
 	}
 	srv, err := runtime.NewServer(a, p, "https://jmap.example.com", core)
@@ -76,20 +76,7 @@ func emailServer(t *testing.T) (*httptest.Server, *objectdb.DB, blob.Store) {
 // message's blob, and returns its content-addressed id. The record must
 // exist or the referential blobId check rejects later Email updates.
 func storeAndRecord(t *testing.T, db *objectdb.DB, store blob.Store, content string, at time.Time) jmap.Id {
-	t.Helper()
-	ctx := context.Background()
-	bw, err := store.Create(ctx, testAccount)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := io.WriteString(bw, content); err != nil {
-		t.Fatal(err)
-	}
-	id, err := db.FinalizeBlobUpload(ctx, testAccount, bw, "john@example.com", at)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return id
+	return testsupport.StoreAndRecord(t, db, store, testAccount, "john@example.com", content, at)
 }
 
 // putEmail parses raw, stores its blob, and creates the Email record in
@@ -104,32 +91,7 @@ func putEmail(t *testing.T, db *objectdb.DB, store blob.Store, raw string, mailb
 // the Mailbox counters are exercised exactly as delivery will exercise
 // them.
 func putEmailAt(t *testing.T, db *objectdb.DB, store blob.Store, raw string, mailboxIds map[string]bool, keywords map[string]bool, receivedAt time.Time) string {
-	t.Helper()
-	ctx := context.Background()
-	blobID := storeAndRecord(t, db, store, raw, receivedAt)
-	mb, _ := json.Marshal(mailboxIds)
-	var kw json.RawMessage
-	if keywords != nil {
-		kw, _ = json.Marshal(keywords)
-	}
-	c := newCapture()
-	c.preview = true
-	msg, err := parseMessage(strings.NewReader(raw), c)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var id jmap.Id
-	if _, err := db.Update(ctx, testAccount, func(u *objectdb.Update) error {
-		created, err := insertEmail(u, msg, emailMeta{
-			BlobID: blobID, MailboxIds: mb, Keywords: kw,
-			Size: uint64(len(raw)), ReceivedAt: receivedAt,
-		})
-		id = created
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-	return string(id)
+	return testsupport.PutEmailAt(t, db, store, testAccount, "john@example.com", raw, mailboxIds, keywords, receivedAt)
 }
 
 func emailGet(t *testing.T, ts *httptest.Server, id, extra string) map[string]any {
@@ -347,7 +309,10 @@ func TestEmailSetKeywords(t *testing.T) {
 		t.Fatalf("$recent keywords: %v", kw)
 	}
 
-	// Exceeding the keyword limit is tooManyKeywords.
+	// Exceeding the keyword limit is tooManyKeywords. 100 duplicates
+	// internal/emailmethods's maxKeywordsPerEmail (surface test, cannot
+	// import the internal package's unexported constant).
+	const maxKeywordsPerEmail = 100
 	big := map[string]bool{}
 	for i := 0; i < maxKeywordsPerEmail+1; i++ {
 		big[fmt.Sprintf("k%d", i)] = true

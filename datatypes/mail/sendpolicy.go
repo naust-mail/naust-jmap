@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/addr"
 )
 
 // SendPolicy answers the two outbound authorization questions.
@@ -66,13 +67,13 @@ func (s *StaticSendPolicy) CanSend(_ context.Context, acct jmap.Id) (bool, strin
 // the local part is exact. A wildcard addr ("*@example.com") matches only
 // a wildcard grant - holding one address in a domain does not grant the
 // domain.
-func (s *StaticSendPolicy) CanSendAs(_ context.Context, acct jmap.Id, addr string) bool {
-	local, domain, ok := splitAddr(addr)
+func (s *StaticSendPolicy) CanSendAs(_ context.Context, acct jmap.Id, address string) bool {
+	local, domain, ok := addr.Split(address)
 	if !ok {
 		return false
 	}
 	for _, grant := range s.allow[acct] {
-		gLocal, gDomain, ok := splitAddr(grant)
+		gLocal, gDomain, ok := addr.Split(grant)
 		if !ok || !strings.EqualFold(domain, gDomain) {
 			continue
 		}
@@ -84,33 +85,4 @@ func (s *StaticSendPolicy) CanSendAs(_ context.Context, acct jmap.Id, addr strin
 		}
 	}
 	return false
-}
-
-// splitAddr splits an address at its last "@" into local part and domain,
-// both required to be non-empty. It also rejects any address that is not
-// wire-safe (see addrWireSafe): this is the single gate every envelope and
-// policy address passes through, so a control character can never reach
-// the SMTP command line as a smuggled CR/LF, and "<addr>" framing cannot
-// be broken.
-func splitAddr(addr string) (local, domain string, ok bool) {
-	if !addrWireSafe(addr) {
-		return "", "", false
-	}
-	i := strings.LastIndex(addr, "@")
-	if i <= 0 || i == len(addr)-1 {
-		return "", "", false
-	}
-	return addr[:i], addr[i+1:], true
-}
-
-// addrWireSafe reports whether addr is safe to place inside an SMTP
-// "<...>" command argument (RFC 5321): printable US-ASCII with no space,
-// no control character, and no angle bracket. CR and LF are the bytes that
-// would smuggle a second command onto the wire; angle brackets would break
-// the framing. This is deliberately stricter than a full addr-spec parse -
-// the goal is wire safety, and no legitimate envelope address needs those
-// bytes. (Internationalized addresses would arrive with SMTPUTF8, which
-// this relay does not yet speak.)
-func addrWireSafe(addr string) bool {
-	return isTokenSafe(addr) && !strings.ContainsAny(addr, "<>")
 }

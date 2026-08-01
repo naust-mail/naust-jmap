@@ -44,6 +44,9 @@ import (
 	"github.com/naust-mail/naust-jmap/core/providers/notify"
 	"github.com/naust-mail/naust-jmap/core/runtime"
 	"github.com/naust-mail/naust-jmap/datatypes/mail"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/deliver"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/search"
+	mailsubmit "github.com/naust-mail/naust-jmap/datatypes/mail/submit"
 	"github.com/naust-mail/naust-jmap/drivers/postgres"
 	"github.com/naust-mail/naust-jmap/examples/internal/tokenauth"
 )
@@ -116,7 +119,7 @@ type instanceConfig struct {
 	leasePoll   time.Duration
 	// submitter, when set, runs a submission worker with this Submitter and
 	// scanInterval as its reconciliation cadence.
-	submitter    mail.Submitter
+	submitter    mailsubmit.Submitter
 	scanInterval time.Duration
 }
 
@@ -130,7 +133,7 @@ type instance struct {
 	srv       *runtime.Server
 	ts        *httptest.Server
 	users     *tokenauth.Authenticator
-	deliverer *mail.Deliverer
+	deliverer *deliver.Deliverer
 	resolve   resolver
 }
 
@@ -189,14 +192,14 @@ func newInstance(t *testing.T, dsn string, accts []testAccount, cfg instanceConf
 	if err := mail.RegisterThread(proc, db, core); err != nil {
 		t.Fatal(err)
 	}
-	if err := mail.RegisterEmail(proc, db, blobs, core, acctCap, nil); err != nil {
+	if err := mail.RegisterEmail(proc, db, blobs, core, acctCap, search.New(blobs)); err != nil {
 		t.Fatal(err)
 	}
-	limits := mail.DefaultSubmissionLimits()
+	limits := mailsubmit.DefaultLimits()
 	if err := mail.RegisterIdentity(proc, db, policy, core); err != nil {
 		t.Fatal(err)
 	}
-	queue, err := mail.RegisterEmailSubmission(proc, db, blobs, core, policy, limits)
+	queue, err := mailsubmit.Register(proc, db, blobs, core, policy, limits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +211,7 @@ func newInstance(t *testing.T, dsn string, accts []testAccount, cfg instanceConf
 	if err := srv.Capability(mail.CapabilityURI).Advertise(struct{}{}, acctCap).Err(); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.Capability(mail.SubmissionCapabilityURI).Advertise(struct{}{}, mail.SubmissionAccountCapabilityFor(limits)).Err(); err != nil {
+	if err := srv.Capability(mailsubmit.CapabilityURI).Advertise(struct{}{}, mailsubmit.AccountCapabilityFor(limits)).Err(); err != nil {
 		t.Fatal(err)
 	}
 	srv.EnableBlobs(db, blobs)
@@ -216,11 +219,14 @@ func newInstance(t *testing.T, dsn string, accts []testAccount, cfg instanceConf
 		t.Fatal(err)
 	}
 
-	deliverer := mail.NewDeliverer(db, blobs, resolve)
+	deliverer, err := deliver.New(db, blobs, resolve)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if cfg.submitter != nil {
-		worker, err := mail.NewSubmissionWorker(queue, cfg.submitter,
-			mail.SubmissionWorkerConfig{QueueScanInterval: cfg.scanInterval})
+		worker, err := mailsubmit.NewWorker(queue, cfg.submitter,
+			mailsubmit.WorkerConfig{QueueScanInterval: cfg.scanInterval})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -297,7 +303,7 @@ func (in *instance) createInbox(t *testing.T, a testAccount) string {
 // normal Identity/set front door.
 func (in *instance) ensureIdentity(t *testing.T, a testAccount) string {
 	t.Helper()
-	using := []string{jmap.CoreCapability, mail.SubmissionCapabilityURI}
+	using := []string{jmap.CoreCapability, mailsubmit.CapabilityURI}
 	out := in.call(t, in.identity(a), using, "Identity/set",
 		fmt.Sprintf(`{"accountId":%q,"create":{"i":{"email":%q}}}`, a.id, a.sendAs))
 	created, ok := out["created"].(map[string]any)
@@ -309,9 +315,9 @@ func (in *instance) ensureIdentity(t *testing.T, a testAccount) string {
 
 // deliver runs one message through the delivery pipeline (the path LMTP and
 // HTTP ingest share) and returns the per-recipient events.
-func (in *instance) deliver(from, to, raw string) []mail.DeliveryEvent {
+func (in *instance) deliver(from, to, raw string) []deliver.Event {
 	return in.deliverer.Deliver(context.Background(),
-		mail.Envelope{MailFrom: from, Recipients: []string{to}}, strings.NewReader(raw))
+		deliver.Envelope{MailFrom: from, Recipients: []string{to}}, strings.NewReader(raw))
 }
 
 // emailIDs returns the account's Email ids via Email/query.
@@ -426,13 +432,13 @@ type countingSubmitter struct {
 	calls int
 }
 
-func (s *countingSubmitter) Submit(_ context.Context, env mail.SubmissionEnvelope, _ io.Reader) ([]mail.RecipientResult, error) {
+func (s *countingSubmitter) Submit(_ context.Context, env mailsubmit.Envelope, _ io.Reader) ([]mailsubmit.Result, error) {
 	s.mu.Lock()
 	s.calls++
 	s.mu.Unlock()
-	out := make([]mail.RecipientResult, len(env.Recipients))
+	out := make([]mailsubmit.Result, len(env.Recipients))
 	for i, r := range env.Recipients {
-		out[i] = mail.RecipientResult{Recipient: r.Email, Outcome: mail.Accepted, Reply: "250 2.0.0 accepted"}
+		out[i] = mailsubmit.Result{Recipient: r.Email, Outcome: mail.Accepted, Reply: "250 2.0.0 accepted"}
 	}
 	return out, nil
 }
@@ -717,7 +723,7 @@ func deliverSendable(t *testing.T, in *instance, a testAccount) string {
 // submit creates one EmailSubmission for the email through the front door.
 func submit(t *testing.T, in *instance, a testAccount, identityID, emailID string) {
 	t.Helper()
-	using := []string{jmap.CoreCapability, mail.SubmissionCapabilityURI}
+	using := []string{jmap.CoreCapability, mailsubmit.CapabilityURI}
 	args := fmt.Sprintf(`{"accountId":%q,"create":{"s":{"identityId":%q,"emailId":%q,`+
 		`"envelope":{"mailFrom":{"email":%q},"rcptTo":[{"email":"dest@remote.example"}]}}}}`,
 		a.id, identityID, emailID, a.sendAs)

@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/testsupport"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +26,9 @@ import (
 	"github.com/naust-mail/naust-jmap/core/providers/blob/kvstore"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/runtime"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/emailstore"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/parse"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/search"
 )
 
 // benchEmailServer is newEmailServer (email_test.go), typed for *testing.B,
@@ -34,7 +38,7 @@ import (
 // of this benchmark's profile far more than the query engine itself.
 func benchEmailServer(b *testing.B) (*httptest.Server, *objectdb.DB, blob.Store, *runtime.Processor, *auth.Identity) {
 	b.Helper()
-	a := newStaticAuth()
+	a := testsupport.NewStaticAuth()
 	a.AddUser("john@example.com", "secret", testAccount)
 	be := memory.New()
 	db := objectdb.New(be, lease.NewInProcess(be))
@@ -47,7 +51,7 @@ func benchEmailServer(b *testing.B) (*httptest.Server, *objectdb.DB, blob.Store,
 	if err := RegisterThread(p, db, core); err != nil {
 		b.Fatal(err)
 	}
-	if err := RegisterEmail(p, db, store, core, DefaultAccountCapability(), nil); err != nil {
+	if err := RegisterEmail(p, db, store, core, DefaultAccountCapability(), search.New(store)); err != nil {
 		b.Fatal(err)
 	}
 	srv, err := runtime.NewServer(a, p, "https://jmap.example.com", core)
@@ -148,15 +152,15 @@ func benchPutEmailAt(b *testing.B, db *objectdb.DB, store blob.Store, raw string
 	if keywords != nil {
 		kw, _ = json.Marshal(keywords)
 	}
-	c := newCapture()
-	c.preview = true
-	msg, err := parseMessage(strings.NewReader(raw), c)
+	c := parse.NewCapture()
+	c.Preview = true
+	msg, err := parse.ParseMessage(strings.NewReader(raw), c)
 	if err != nil {
 		b.Fatal(err)
 	}
 	var id jmap.Id
 	if _, err := db.Update(ctx, testAccount, func(u *objectdb.Update) error {
-		created, err := insertEmail(u, msg, emailMeta{
+		created, err := emailstore.InsertEmail(u, msg, emailstore.EmailMeta{
 			BlobID: blobID, MailboxIds: mb, Keywords: kw,
 			Size: uint64(len(raw)), ReceivedAt: receivedAt,
 		})

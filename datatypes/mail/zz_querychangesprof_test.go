@@ -11,6 +11,7 @@ package mail
 
 import (
 	"fmt"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/testsupport"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"github.com/naust-mail/naust-jmap/core/providers/blob/kvstore"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/runtime"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/search"
 )
 
 // profileServer is newEmailServer without Processor.
@@ -31,7 +33,7 @@ import (
 // numbers remain comparable across this test's history.
 func profileServer(t *testing.T) (*httptest.Server, *objectdb.DB, blob.Store) {
 	t.Helper()
-	a := newStaticAuth()
+	a := testsupport.NewStaticAuth()
 	a.AddUser("john@example.com", "secret", testAccount)
 	a.AddUser("jane@example.com", "secret", "Ajane")
 	a.AddAccess("jane@example.com", testAccount, auth.Access{Name: "shared"})
@@ -46,7 +48,7 @@ func profileServer(t *testing.T) (*httptest.Server, *objectdb.DB, blob.Store) {
 	if err := RegisterThread(p, db, core); err != nil {
 		t.Fatal(err)
 	}
-	if err := RegisterEmail(p, db, store, core, DefaultAccountCapability(), nil); err != nil {
+	if err := RegisterEmail(p, db, store, core, DefaultAccountCapability(), search.New(store)); err != nil {
 		t.Fatal(err)
 	}
 	srv, err := runtime.NewServer(a, p, "https://jmap.example.com", core)

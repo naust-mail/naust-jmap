@@ -22,19 +22,21 @@ import (
 	"github.com/naust-mail/naust-jmap/core/objectdb"
 	"github.com/naust-mail/naust-jmap/core/private/rawjson"
 	"github.com/naust-mail/naust-jmap/core/runtime"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/emailstore"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/record"
 )
 
 // TypeMailbox is the Mailbox type name.
-const TypeMailbox = "Mailbox"
+const TypeMailbox = record.TypeMailbox
 
 // mailboxCounters are the server-set count properties in the canonical
 // order used for Mailbox/changes updatedProperties.
 var mailboxCounters = [...]string{"totalEmails", "unreadEmails", "totalThreads", "unreadThreads"}
 
-// MailboxType returns the Mailbox descriptor. The count properties are
+// mailboxType returns the Mailbox descriptor. The count properties are
 // server-set and maintained by the Email side in the same commit that
 // changes them; until Email lands they stay 0.
-func MailboxType() *descriptor.Type {
+func mailboxType() *descriptor.Type {
 	null := json.RawMessage("null")
 	counter := descriptor.Property{Kind: descriptor.KindUnsignedInt, ServerSet: true, Default: json.RawMessage("0")}
 	return &descriptor.Type{
@@ -86,7 +88,7 @@ func RegisterMailbox(p *runtime.Processor, db *objectdb.DB, core jmap.CoreCapabi
 	if err := db.RegisterType(counterRulesType()); err != nil {
 		return err
 	}
-	return runtime.RegisterStandardTypeExt(p, db, MailboxType(), core, ext)
+	return runtime.RegisterStandardTypeExt(p, db, mailboxType(), core, ext)
 }
 
 // mailboxQueryHooks builds Mailbox's /query customization. Every
@@ -252,7 +254,7 @@ func mailboxValidate(u *objectdb.Update, old, new objectdb.Object, extra map[str
 	// counters get corrected (see threadmigrate.go). Every check above
 	// has passed, so this stages nothing for a rejected record.
 	if mailboxRole(old) != mailboxRole(new) && (mailboxRole(old) == "trash" || mailboxRole(new) == "trash") {
-		if err := noteTrashRulesChange(u); err != nil {
+		if err := emailstore.NoteTrashRulesChange(u); err != nil {
 			return nil, err
 		}
 	}
@@ -376,14 +378,14 @@ func mailboxDestroy(u *objectdb.Update, id jmap.Id, extra map[string]json.RawMes
 		if string(extra["onDestroyRemoveEmails"]) != "true" {
 			return &jmap.SetError{Type: "mailboxHasEmail", Description: "mailbox still contains emails"}, nil
 		}
-		if err := mailboxRemoveEmails(u, id); err != nil {
+		if err := emailstore.MailboxRemoveEmails(u, id); err != nil {
 			return nil, err
 		}
 	}
 	// Destroying the trash Mailbox changes the section 2.1 unreadThreads
 	// rules just as re-roling it does (see mailboxValidate).
 	if mailboxRole(obj) == "trash" {
-		if err := noteTrashRulesChange(u); err != nil {
+		if err := emailstore.NoteTrashRulesChange(u); err != nil {
 			return nil, err
 		}
 	}

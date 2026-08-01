@@ -12,15 +12,18 @@ package mail
 // with Update.BumpState; the Email/set metadata and destroy hooks never do,
 // which is exactly the 1.5 "on add, not on other change" contract.
 
-import "github.com/naust-mail/naust-jmap/core/descriptor"
+import (
+	"github.com/naust-mail/naust-jmap/core/descriptor"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/record"
+)
 
 // TypeEmailDelivery is the push-only EmailDelivery type name (section 1.5).
-const TypeEmailDelivery = "EmailDelivery"
+const TypeEmailDelivery = record.TypeEmailDelivery
 
-// EmailDeliveryType is the method-less descriptor for EmailDelivery.
+// emailDeliveryType is the method-less descriptor for EmailDelivery.
 // Registered in the object database (so TypeNames/TypeState know it, and an
 // EventSource or PushSubscription can request it) but never given a method
 // extension: "There are no methods to act on this type" (section 1.5).
-func EmailDeliveryType() *descriptor.Type {
+func emailDeliveryType() *descriptor.Type {
 	return &descriptor.Type{Name: TypeEmailDelivery, Capability: CapabilityURI}
 }

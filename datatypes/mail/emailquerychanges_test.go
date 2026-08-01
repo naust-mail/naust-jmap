@@ -17,6 +17,8 @@ import (
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/runtime"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/emailmethods"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/search"
 )
 
 // spliceIds applies the section 5.6 client algorithm to a fully cached
@@ -49,7 +51,7 @@ func spliceIds(cached []string, removed, added []any) []string {
 // a well-meaning future declaration of any of them would let
 // queryChanges corrupt client caches.
 func TestEmailQueryChangesDeclarations(t *testing.T) {
-	hooks := emailQueryHooks(nil, nil)
+	hooks := emailmethods.EmailQueryHooks(nil, nil)
 	for _, name := range []string{"allInThreadHaveKeyword", "someInThreadHaveKeyword", "noneInThreadHaveKeyword"} {
 		if _, declared := hooks.LocalConditions[name]; declared {
 			t.Errorf("thread condition %q declared record-local; it reads sibling records", name)
@@ -191,7 +193,7 @@ func TestEmailDeclarationsConformance(t *testing.T) {
 			map[string]bool{inbox: true}, map[string]bool{"$seen": i == 0}, base.Add(time.Duration(i)*time.Hour))
 		probes = append(probes, jmap.Id(id))
 	}
-	hooks := emailQueryHooks(db, naiveSearcher{store: store})
+	hooks := emailmethods.EmailQueryHooks(db, search.New(store))
 
 	// One or more sample values per declared condition and sort - the
 	// checker refuses unexercised declarations.

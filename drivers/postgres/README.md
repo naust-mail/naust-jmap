@@ -108,7 +108,7 @@ long transaction stops Postgres reclaiming its notification queue.
 
 ## Status and compatibility
 
-Pre-release, tagged v0.1.0. Requires `core` v0.1.0 or later.
+Pre-release, tagged v0.1.1. Requires `core` v0.3.0 or later.
 
 Tests in this module read `PG_TEST_DSN` and skip when it is unset.
 

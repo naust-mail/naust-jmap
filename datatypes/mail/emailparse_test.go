@@ -242,6 +242,15 @@ func TestEmailParseAKExample(t *testing.T) {
 	}
 }
 
+// emailParseDefaultProperties duplicates internal/emailmethods's list
+// (surface test, cannot import the internal package's unexported var): the
+// section 4.9 default property list used when properties is omitted.
+var emailParseDefaultProperties = []string{
+	"messageId", "inReplyTo", "references", "sender", "from", "to", "cc",
+	"bcc", "replyTo", "subject", "sentAt", "hasAttachment", "preview",
+	"bodyValues", "textBody", "htmlBody", "attachments",
+}
+
 // TestEmailParseDefaultPropertySet checks that an omitted properties argument
 // yields exactly the section 4.9 default list, no more and no less.
 func TestEmailParseDefaultPropertySet(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/testsupport"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -25,7 +26,7 @@ import (
 // account one plain address and one whole-domain wildcard.
 func identityServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	a := newStaticAuth()
+	a := testsupport.NewStaticAuth()
 	a.AddUser("john@example.com", "secret", testAccount)
 	be := memory.New()
 	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
@@ -40,7 +41,7 @@ func identityServer(t *testing.T) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.Capability(SubmissionCapabilityURI).Advertise(struct{}{}, struct{}{}).Err(); err != nil {
+	if err := srv.Capability(submissionCapabilityURI).Advertise(struct{}{}, struct{}{}).Err(); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv)
@@ -52,7 +53,7 @@ func identityServer(t *testing.T) *httptest.Server {
 func callSubmission(t *testing.T, ts *httptest.Server, calls ...jmap.Invocation) *jmap.Response {
 	t.Helper()
 	req := map[string]any{
-		"using":       []string{jmap.CoreCapability, SubmissionCapabilityURI},
+		"using":       []string{jmap.CoreCapability, submissionCapabilityURI},
 		"methodCalls": calls,
 	}
 	body, err := json.Marshal(req)

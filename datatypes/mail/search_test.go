@@ -136,12 +136,14 @@ func TestSearchSnippetPreviewCap(t *testing.T) {
 	body := strings.Repeat("word ", 100) + "needle " + strings.Repeat("word ", 100)
 	id := putEmail(t, db, store, bodyMsg("a@x", "b@x", "Long", body, map[string]string{"Message-ID": "<a@x>"}), mset(inbox), nil)
 
+	// 255 is the section 5 hard limit on a preview snippet (search.maxPreviewOctets).
+	const wantMaxPreviewOctets = 255
 	prev, _ := snippetByEmail(t, snippetGet(t, ts, `{"body":"needle"}`, id))[id]["preview"].(string)
 	if len(prev) == 0 {
 		t.Fatal("no preview for a body match")
 	}
-	if len(prev) > maxPreviewOctets {
-		t.Errorf("preview is %d octets, want <= %d", len(prev), maxPreviewOctets)
+	if len(prev) > wantMaxPreviewOctets {
+		t.Errorf("preview is %d octets, want <= %d", len(prev), wantMaxPreviewOctets)
 	}
 	if !strings.Contains(prev, "<mark>needle</mark>") {
 		t.Errorf("preview = %q, want <mark>needle</mark>", prev)

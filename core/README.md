@@ -318,6 +318,26 @@ recognized future extension of the query planner, not built.
 
 </details>
 
+<details>
+<summary>Design decision: why the runtime stays one package</summary>
+
+`core` is deliberately one Go package rather than several smaller ones
+split along its internal seams (session handling, dispatch, query
+evaluation, state tracking). Those seams exist and are real - the
+protocol machine has parts - but splitting them into separate importable
+packages would freeze each one's shape as a public API a consumer could
+depend on directly, when the only interface a consumer actually needs is
+the processor and server types this package already exports. One package
+keeps the protocol machine's internal cohesion visible in the code
+itself: session, dispatch, and state tracking cooperate on shared
+invariants (RFC 8620's request/response contract) that a package
+boundary would otherwise force into exported plumbing. Consumers - the
+runtime's datatypes, drivers, and capabilities - import one API and see
+one surface to keep stable; internal reshaping never touches them as
+long as that surface holds.
+
+</details>
+
 ## Examples
 
 - [`examples/quickstart`](../examples/quickstart) - the whole module in one
@@ -327,8 +347,8 @@ recognized future extension of the query planner, not built.
 
 ## Status and compatibility
 
-Pre-release, tagged v0.1.0. Breaking changes may land in minor bumps until 1.0.
-Every other module in this repository requires `core` at v0.1.0 or later; keep
+Pre-release, tagged v0.3.0. Breaking changes may land in minor bumps until 1.0.
+Every other module in this repository requires `core` at v0.3.0 or later; keep
 them on the same version.
 
 ## Related modules

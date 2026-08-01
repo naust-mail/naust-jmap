@@ -3,37 +3,28 @@ package mail
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
-	"strings"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
 	"github.com/naust-mail/naust-jmap/core/providers/blob"
 	"github.com/naust-mail/naust-jmap/core/runtime"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/emailmethods"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/emailstore"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/record"
 )
 
 // TypeEmail is the Email type name (RFC 8621 section 4).
-const TypeEmail = "Email"
+const TypeEmail = record.TypeEmail
 
-// maxKeywordsPerEmail bounds an Email's keyword set. RFC 8621 defines
-// tooManyKeywords but advertises no capability field for the limit: it is
-// server-defined. 100 is generous for real mail.
-const maxKeywordsPerEmail = 100
-
-// keywordForbidden is the set of characters a keyword MUST NOT contain
-// (RFC 8621 section 4.1.1): ( ) { ] % * " \. Note the spec lists the
-// closing bracket and opening brace only.
-const keywordForbidden = `(){]%*"\`
-
-// EmailType returns the Email descriptor. Storage split:
+// emailType returns the Email descriptor. Storage split:
 // the RFC 8621 section 4.2 "expected fast" properties are stored on the
 // record (extracted once at delivery); bodyStructure, bodyValues,
 // headers, and the header:{name} forms are computed on demand from the
 // blob (see the Email/get Computed resolver). Only mailboxIds and
 // keywords are client-mutable; every derived header property is immutable
 // and server-set (RFC 8621 section 4.1).
-func EmailType() *descriptor.Type {
+func emailType() *descriptor.Type {
 	// addr is a "EmailAddress[]|null" convenience header property; msgids
 	// is a "String[]|null" one. All are immutable and server-set: derived
 	// from the message, never set by a client.
@@ -107,7 +98,7 @@ var emailDefaultGetProperties = []string{
 }
 
 // EmailOption configures RegisterEmail.
-type EmailOption func(*genConfig)
+type EmailOption func(*emailmethods.GenConfig)
 
 // WithMessageIDDomain sets the domain synthesized Message-IDs are scoped
 // to when a creation omits one (RFC 5322 section 3.6.4) - conventionally
@@ -115,7 +106,7 @@ type EmailOption func(*genConfig)
 // Without it, the domain falls back to the creation's From address, then
 // "localhost".
 func WithMessageIDDomain(domain string) EmailOption {
-	return func(c *genConfig) { c.msgIDDomain = domain }
+	return func(c *emailmethods.GenConfig) { c.MsgIDDomain = domain }
 }
 
 // RegisterEmail registers the Email type, its method extensions, and
@@ -124,52 +115,58 @@ func WithMessageIDDomain(domain string) EmailOption {
 // enforced limits, which MUST match the AccountCapability advertised for the
 // account so the wire never promises what the server does not enforce.
 // searcher is the text-search socket (RFC 8621 section 4.4.1 text conditions
-// and section 5 snippets); a nil searcher installs the naive in-process
-// default.
+// and section 5 snippets); it is required, since the built-in substring
+// implementation (datatypes/mail/search) is a separate package a host
+// chooses to import rather than a default this package can fall back to.
+//
+// The Email method implementation (get/query/create/copy/import/parse/
+// generation) lives in internal/emailmethods; this function's job is
+// wiring those hooks onto the descriptor and the runtime, not implementing
+// them.
 func RegisterEmail(p *runtime.Processor, db *objectdb.DB, store blob.Store, core jmap.CoreCapabilities, acctCap AccountCapability, searcher Searcher, opts ...EmailOption) error {
 	if searcher == nil {
-		searcher = naiveSearcher{store: store}
+		return errors.New("mail: RegisterEmail: nil Searcher (pass search.New(blobs) for the built-in substring searcher)")
 	}
-	var cfg genConfig
+	var cfg emailmethods.GenConfig
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	mat := materializer{db: db, store: store, maxMailboxes: acctCap.MaxMailboxesPerEmail}
-	creator := emailCreate{mat: mat, cfg: cfg, maxAttachBytes: acctCap.MaxSizeAttachmentsPerEmail}
+	mat := emailmethods.Materializer{DB: db, Store: store, MaxMailboxes: acctCap.MaxMailboxesPerEmail}
+	creator := emailmethods.EmailCreate{Mat: mat, Cfg: cfg, MaxAttachBytes: acctCap.MaxSizeAttachmentsPerEmail}
 	ext := &runtime.Extensions{
 		// Email/copy is not derived: it is a cross-account ingest that must
 		// run threading, counters, and the mailboxIds invariant through the
 		// materialize seam, not the generic derived copy. It is registered
-		// as a custom method below (emailcopy.go).
+		// as a custom method below (internal/emailmethods/emailcopy.go).
 		Methods:              []string{"get", "changes", "set", "query", "queryChanges"},
 		DefaultGetProperties: emailDefaultGetProperties,
-		Computed:             &emailComputed{store: store},
+		Computed:             &emailmethods.EmailComputed{Store: store},
 		ExtraArgs: map[string]runtime.MethodArgs{
-			"get": {Names: emailGetArgNames, Check: checkEmailGetArgs},
+			"get": {Names: emailmethods.EmailGetArgNames, Check: emailmethods.CheckEmailGetArgs},
 		},
 		Set: &runtime.SetHooks{
 			Validate: emailValidate(acctCap.MaxMailboxesPerEmail),
-			Destroy:  emailDestroy,
+			Destroy:  emailstore.EmailDestroy,
 			// Creation is a message generation, not a property store: the
-			// create override runs it through emailgen + the materialize
-			// seam (RFC 8621 section 4.6), preparing outside the account
-			// lease like every other Email producer.
-			PrepareCreate: creator.prepare,
-			CommitCreate:  creator.commit,
+			// create override runs it through emailmethods' generator + the
+			// materialize seam (RFC 8621 section 4.6), preparing outside the
+			// account lease like every other Email producer.
+			PrepareCreate: creator.Prepare,
+			CommitCreate:  creator.Commit,
 		},
 		// Email/query (RFC 8621 section 4.4): the FilterCondition semantics
 		// (with index producers for inMailbox/hasKeyword and the
 		// before/after date window), the mail sort comparators, and
 		// collapseThreads keyed on threadId.
-		Query: emailQueryHooks(db, searcher),
+		Query: emailmethods.EmailQueryHooks(db, searcher),
 	}
-	if err := runtime.RegisterStandardTypeExt(p, db, EmailType(), core, ext); err != nil {
+	if err := runtime.RegisterStandardTypeExt(p, db, emailType(), core, ext); err != nil {
 		return err
 	}
 	// EmailDelivery (RFC 8621 section 1.5) is registered as a method-less
 	// push-only type so clients can subscribe to new-mail notifications;
 	// insertEmail advances its state via BumpState on each new Email.
-	if err := db.RegisterType(EmailDeliveryType()); err != nil {
+	if err := db.RegisterType(emailDeliveryType()); err != nil {
 		return err
 	}
 	// SearchSnippet/get (RFC 8621 section 5.1) is a custom method: SearchSnippet
@@ -179,116 +176,44 @@ func RegisterEmail(p *runtime.Processor, db *objectdb.DB, store blob.Store, core
 	// (section 4.9) are custom methods: import ingests an uploaded blob
 	// through the materialize seam, copy ingests another account's message
 	// through it, parse renders a blob as an Email without storing it.
-	p.Register("Email/import", CapabilityURI, emailImport{mat: mat, core: core}.handle)
-	p.Register("Email/copy", CapabilityURI, emailCopy{mat: mat, proc: p, core: core}.handle)
-	p.Register("Email/parse", CapabilityURI, emailParse{db: db, store: store, core: core}.handle)
+	p.Register("Email/import", CapabilityURI, emailmethods.EmailImport{Mat: mat, Core: core}.Handle)
+	p.Register("Email/copy", CapabilityURI, emailmethods.EmailCopy{Mat: mat, Proc: p, Core: core}.Handle)
+	p.Register("Email/parse", CapabilityURI, emailmethods.EmailParse{DB: db, Store: store, Core: core, EmailType: emailType()}.Handle)
 	return nil
 }
 
 // emailValidate enforces the Email/set update rules: only the mutable
 // mailboxIds/keywords change (the descriptor already restricts that);
 // this hook adds the value semantics the descriptor cannot express.
-// Creates never reach it - the create override (emailcreate.go) owns
-// creation entirely.
+// Creates never reach it - the create override (internal/emailmethods)
+// owns creation entirely.
 func emailValidate(maxMailboxes *int64) func(*objectdb.Update, objectdb.Object, objectdb.Object, map[string]json.RawMessage) (*jmap.SetError, error) {
 	return func(u *objectdb.Update, old, new objectdb.Object, _ map[string]json.RawMessage) (*jmap.SetError, error) {
-		if serr, err := validateMailboxIds(u, new, maxMailboxes); serr != nil || err != nil {
+		if serr, err := emailmethods.ValidateMailboxIds(u, new, maxMailboxes); serr != nil || err != nil {
 			return serr, err
 		}
-		if serr, err := validateKeywords(new); serr != nil || err != nil {
+		if serr, err := emailmethods.ValidateKeywords(new); serr != nil || err != nil {
 			return serr, err
 		}
 		// The mailboxIds/keywords change moves counters (moving between
 		// Mailboxes, marking read); apply the delta in the same commit,
 		// before the runtime stages the updated record.
-		if err := adjustCounters(u, old, new); err != nil {
+		if err := emailstore.AdjustCounters(u, old, new); err != nil {
 			return nil, err
 		}
 		return nil, nil
 	}
 }
 
-// validateMailboxIds enforces the "belongs to >= 1 Mailbox" invariant
-// (RFC 8621 section 4.1.1), that every value is true, that every key is an
-// existing Mailbox, and the tooManyMailboxes limit. It normalizes nothing.
-func validateMailboxIds(u *objectdb.Update, new objectdb.Object, maxMailboxes *int64) (*jmap.SetError, error) {
-	members, ok := decodeBoolMap(new["mailboxIds"])
-	if !ok {
-		return invalidProp("mailboxIds", "must be an object of Mailbox id to true"), nil
+// cloneObject is a shallow copy of an object's property map, safe to
+// mutate without disturbing the staged or committed original. Generic
+// object-map plumbing, not mutation-engine logic, so root keeps its own
+// copy alongside internal/emailstore's rather than exporting one across
+// the boundary for this alone.
+func cloneObject(obj objectdb.Object) objectdb.Object {
+	next := make(objectdb.Object, len(obj))
+	for k, v := range obj {
+		next[k] = v
 	}
-	if len(members) == 0 {
-		return invalidProp("mailboxIds", "an Email must be in at least one Mailbox"), nil
-	}
-	if maxMailboxes != nil && int64(len(members)) > *maxMailboxes {
-		return &jmap.SetError{Type: "tooManyMailboxes", Description: "too many Mailboxes for one Email"}, nil
-	}
-	for id, val := range members {
-		if !val {
-			return invalidProp("mailboxIds", "each value must be true"), nil
-		}
-		obj, err := u.Get(TypeMailbox, jmap.Id(id))
-		if errors.Is(err, objectdb.ErrNotFound) || (err == nil && obj == nil) {
-			return invalidProp("mailboxIds", fmt.Sprintf("Mailbox %q does not exist", id)), nil
-		}
-		if err != nil {
-			return nil, err
-		}
-	}
-	return nil, nil
-}
-
-// validateKeywords enforces keyword syntax (RFC 8621 section 4.1.1),
-// lowercases keys in place (servers MUST return keywords in lowercase),
-// requires every value be true, and enforces tooManyKeywords.
-func validateKeywords(new objectdb.Object) (*jmap.SetError, error) {
-	members, ok := decodeBoolMap(new["keywords"])
-	if !ok {
-		return invalidProp("keywords", "must be an object of keyword to true"), nil
-	}
-	if len(members) > maxKeywordsPerEmail {
-		return &jmap.SetError{Type: "tooManyKeywords", Description: "too many keywords on one Email"}, nil
-	}
-	lowered := make(map[string]bool, len(members))
-	for kw, val := range members {
-		if !val {
-			return invalidProp("keywords", "each value must be true"), nil
-		}
-		if !validKeyword(kw) {
-			return invalidProp("keywords", fmt.Sprintf("%q is not a valid keyword", kw)), nil
-		}
-		lowered[strings.ToLower(kw)] = true
-	}
-	raw, err := json.Marshal(lowered)
-	if err != nil {
-		return nil, err
-	}
-	new["keywords"] = raw
-	return nil, nil
-}
-
-// validKeyword reports whether s is a valid IMAP/JMAP keyword: 1-255
-// characters in ASCII %x21-%x7e with none of keywordForbidden.
-func validKeyword(s string) bool {
-	if len(s) < 1 || len(s) > 255 {
-		return false
-	}
-	for _, r := range s {
-		if r < 0x21 || r > 0x7e || strings.ContainsRune(keywordForbidden, r) {
-			return false
-		}
-	}
-	return true
-}
-
-// decodeBoolMap decodes a JSON object of string to bool. ok is false if
-// the value is absent, null, or not an object of booleans.
-func decodeBoolMap(raw json.RawMessage) (map[string]bool, bool) {
-	if isNullRaw(raw) {
-		return nil, false
-	}
-	var m map[string]bool
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return nil, false
-	}
-	return m, true
+	return next
 }

@@ -18,24 +18,36 @@ import (
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
 	"github.com/naust-mail/naust-jmap/core/runtime"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/addr"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/record"
 )
 
 // TypeIdentity is the Identity datatype name.
-const TypeIdentity = "Identity"
+const TypeIdentity = record.TypeIdentity
 
-// IdentityType returns the section 6 descriptor. email is immutable, and
+// TypeEmailSubmission is the EmailSubmission datatype name.
+const TypeEmailSubmission = record.TypeEmailSubmission
+
+// submissionCapabilityURI is the RFC 8621 submission capability
+// (urn:ietf:params:jmap:submission, section 1.3.2) that Identity lives
+// under. Duplicated from submit.CapabilityURI (same RFC-fixed string):
+// root cannot import submit (submit imports root for SendPolicy/Outcome),
+// so this is a cycle break, not a drift risk.
+const submissionCapabilityURI = "urn:ietf:params:jmap:submission"
+
+// identityType returns the section 6 descriptor. email is immutable, and
 // the whole-domain wildcard form "*@example.com" is legal (the client may
 // then use any address in the domain). mayDelete is server-set and always
 // true here: which identities are protected from deletion is host policy
 // the spec leaves open ("servers may wish to..."), and destroying an
 // identity loses only its settings - the grant lives in the SendPolicy,
 // so a recreate restores it.
-func IdentityType() *descriptor.Type {
+func identityType() *descriptor.Type {
 	null := json.RawMessage("null")
 	emptyString := json.RawMessage(`""`)
 	return &descriptor.Type{
 		Name:       TypeIdentity,
-		Capability: SubmissionCapabilityURI,
+		Capability: submissionCapabilityURI,
 		Properties: map[string]descriptor.Property{
 			"name":          {Kind: descriptor.KindString, Default: emptyString},
 			"email":         {Kind: descriptor.KindString, Immutable: true},
@@ -61,7 +73,7 @@ func RegisterIdentity(p *runtime.Processor, db *objectdb.DB, policy SendPolicy, 
 		Methods: []string{"get", "changes", "set"},
 		Set:     &runtime.SetHooks{Validate: identityValidate(policy)},
 	}
-	return runtime.RegisterStandardTypeExt(p, db, IdentityType(), core, ext)
+	return runtime.RegisterStandardTypeExt(p, db, identityType(), core, ext)
 }
 
 // identityValidate enforces the section 6 semantics the descriptor cannot
@@ -79,7 +91,7 @@ func identityValidate(policy SendPolicy) func(*objectdb.Update, objectdb.Object,
 			if raw, has := new["email"]; !has || json.Unmarshal(raw, &email) != nil || email == "" {
 				return invalidProp("email", "email is required"), nil
 			}
-			if _, _, ok := splitAddr(email); !ok {
+			if _, _, ok := addr.Split(email); !ok {
 				return invalidProp("email", "not an email address"), nil
 			}
 		}

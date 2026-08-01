@@ -7,6 +7,7 @@ package mail
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/testsupport"
 	"net/http/httptest"
 	"testing"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/naust-mail/naust-jmap/core/providers/blob/kvstore"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/runtime"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/search"
 )
 
 const copyTarget = "Atarget"
@@ -27,7 +29,7 @@ const copyTarget = "Atarget"
 // shared harness stays single-account.
 func copyEmailServer(t *testing.T) (*httptest.Server, *objectdb.DB, blob.Store) {
 	t.Helper()
-	a := newStaticAuth()
+	a := testsupport.NewStaticAuth()
 	a.AddUser("john@example.com", "secret", testAccount)
 	a.AddAccess("john@example.com", copyTarget, auth.Access{Name: "target"})
 	be := memory.New()
@@ -41,7 +43,7 @@ func copyEmailServer(t *testing.T) (*httptest.Server, *objectdb.DB, blob.Store) 
 	if err := RegisterThread(p, db, core); err != nil {
 		t.Fatal(err)
 	}
-	if err := RegisterEmail(p, db, store, core, DefaultAccountCapability(), nil); err != nil {
+	if err := RegisterEmail(p, db, store, core, DefaultAccountCapability(), search.New(store)); err != nil {
 		t.Fatal(err)
 	}
 	srv, err := runtime.NewServer(a, p, "https://jmap.example.com", core)

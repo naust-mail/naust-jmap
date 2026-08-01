@@ -171,15 +171,20 @@ Full file: [`examples/quickstart`](examples/quickstart).
 
 ### Serve mail
 
-The RFC 8621 types register the same way, into the same processor:
+The RFC 8621 types register the same way, into the same processor. Delivery
+and submission are their own packages, `datatypes/mail/deliver` and
+`datatypes/mail/submit`, imported only when you need them:
 
 ```go
-// Register the five RFC 8621 (mail) types, plus the submission queue
+// Register the five RFC 8621 (mail) types. RegisterEmail takes its search
+// implementation explicitly - here the built-in substring search.
 mail.RegisterMailbox(proc, db, core)
 mail.RegisterThread(proc, db, core)
-mail.RegisterEmail(proc, db, blobs, core, mail.DefaultAccountCapability(), nil)
+mail.RegisterEmail(proc, db, blobs, core, mail.DefaultAccountCapability(), search.New(blobs))
 mail.RegisterIdentity(proc, db, policy, core)
-queue, _ := mail.RegisterEmailSubmission(proc, db, blobs, core, policy, limits)
+
+// submit.Register returns the submission queue a sending worker reads.
+queue, _ := submit.Register(proc, db, blobs, core, policy, submit.DefaultLimits())
 ```
 
 Full file: [`examples/mailserver`](examples/mailserver), which also wires LMTP
@@ -272,8 +277,8 @@ go run ./examples/mailserver
 
 ## Roadmap
 
-naust-jmap is pre-release: tagged at v0.1.0 (pre-1.0, breaking changes may
-still land in minor bumps). The mail module (see Mail
+naust-jmap is pre-release (pre-1.0): modules version independently and
+breaking changes may still land in minor bumps. The mail module (see Mail
 above) reads, composes and sends, over either the sqlite or postgres driver
 (the latter including a multi-node cluster hint layer). Coming next, in
 order:

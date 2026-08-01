@@ -56,9 +56,21 @@ next:
 // maintains is reachable from a running server.
 const oraclePkg = module + "/internal/oracle"
 
-// TestOracleIsTestOnly fails if any package in the module imports the oracle in
-// its non-test build. Deps is the transitive import set of the package proper,
-// so only a real import shows up here - a _test.go import does not.
+// testsupportPkg holds fixtures shared by more than one of the module's test
+// packages (e.g. the heap-watching helpers root's delivery tests and search's
+// matcher tests both use). It is test-only for a narrower reason than the
+// oracle - it is meant for _test.go files, not a production concern
+// masquerading as one - but the same leak would mean production code paying
+// for test scaffolding, so it gets the same guard.
+const testsupportPkg = module + "/internal/testsupport"
+
+// testOnlyPkgs is every package this guard confines to _test.go files.
+var testOnlyPkgs = [...]string{oraclePkg, testsupportPkg}
+
+// TestOracleIsTestOnly fails if any package in the module imports the oracle or
+// testsupport in its non-test build. Deps is the transitive import set of the
+// package proper, so only a real import shows up here - a _test.go import
+// does not.
 func TestOracleIsTestOnly(t *testing.T) {
 	out, err := exec.Command("go", "list", "-f", "{{.ImportPath}} {{join .Deps \" \"}}", module+"/...").CombinedOutput()
 	if err != nil {
@@ -67,8 +79,10 @@ func TestOracleIsTestOnly(t *testing.T) {
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		fields := strings.Fields(line)
 		for _, dep := range fields[1:] {
-			if dep == oraclePkg {
-				t.Errorf("%s imports %s in its non-test build; the oracle exists only for tests", fields[0], oraclePkg)
+			for _, testOnly := range testOnlyPkgs {
+				if dep == testOnly {
+					t.Errorf("%s imports %s in its non-test build; it exists only for tests", fields[0], testOnly)
+				}
 			}
 		}
 	}

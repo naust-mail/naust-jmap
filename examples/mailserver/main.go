@@ -103,6 +103,9 @@ import (
 	"github.com/naust-mail/naust-jmap/core/runtime"
 	"github.com/naust-mail/naust-jmap/core/webpush"
 	"github.com/naust-mail/naust-jmap/datatypes/mail"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/deliver"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/search"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/submit"
 	"github.com/naust-mail/naust-jmap/drivers/postgres"
 	"github.com/naust-mail/naust-jmap/drivers/sqlite"
 	"github.com/naust-mail/naust-jmap/examples/internal/tokenauth"
@@ -137,16 +140,16 @@ func (m staticResolver) Resolve(_ context.Context, recipient string) (jmap.Id, b
 // is honest about scope: a recipient this server does not host is
 // rejected per recipient, as a relay would report an unknown mailbox.
 type loopbackSubmitter struct {
-	d *mail.Deliverer
+	d *deliver.Deliverer
 }
 
-func (l loopbackSubmitter) Submit(ctx context.Context, env mail.SubmissionEnvelope, msg io.Reader) ([]mail.RecipientResult, error) {
+func (l loopbackSubmitter) Submit(ctx context.Context, env submit.Envelope, msg io.Reader) ([]submit.Result, error) {
 	rcpts := make([]string, len(env.Recipients))
 	for i, r := range env.Recipients {
 		rcpts[i] = r.Email
 	}
-	events := l.d.Deliver(ctx, mail.Envelope{MailFrom: env.MailFrom, Recipients: rcpts}, msg)
-	results := make([]mail.RecipientResult, 0, len(events))
+	events := l.d.Deliver(ctx, deliver.Envelope{MailFrom: env.MailFrom, Recipients: rcpts}, msg)
+	results := make([]submit.Result, 0, len(events))
 	for _, ev := range events {
 		var reply string
 		switch ev.Outcome {
@@ -157,7 +160,7 @@ func (l loopbackSubmitter) Submit(ctx context.Context, env mail.SubmissionEnvelo
 		default:
 			reply = "451 4.3.0 local delivery failed: " + ev.Reason
 		}
-		results = append(results, mail.RecipientResult{Recipient: ev.Recipient, Outcome: ev.Outcome, Reply: reply})
+		results = append(results, submit.Result{Recipient: ev.Recipient, Outcome: ev.Outcome, Reply: reply})
 	}
 	return results, nil
 }
@@ -171,7 +174,7 @@ func ensureIdentity(proc *runtime.Processor, acct jmap.Id, email string) error {
 		Username: email,
 		Accounts: map[jmap.Id]auth.Access{acct: {Name: email, Personal: true}},
 	}
-	using := []string{jmap.CoreCapability, mail.SubmissionCapabilityURI}
+	using := []string{jmap.CoreCapability, submit.CapabilityURI}
 	call := func(name, args string) (json.RawMessage, error) {
 		resp := proc.Process(context.Background(), &jmap.Request{
 			Using:       using,
@@ -320,7 +323,7 @@ func main() {
 	if err := mail.RegisterThread(proc, db, core); err != nil {
 		log.Fatal(err)
 	}
-	if err := mail.RegisterEmail(proc, db, blobs, core, acctCap, nil); err != nil {
+	if err := mail.RegisterEmail(proc, db, blobs, core, acctCap, search.New(blobs)); err != nil {
 		log.Fatal(err)
 	}
 
@@ -330,11 +333,11 @@ func main() {
 	// and only as itself.
 	policy := mail.NewStaticSendPolicy()
 	policy.Allow("Ademo", "demo@example.com")
-	limits := mail.DefaultSubmissionLimits()
+	limits := submit.DefaultLimits()
 	if err := mail.RegisterIdentity(proc, db, policy, core); err != nil {
 		log.Fatal(err)
 	}
-	queue, err := mail.RegisterEmailSubmission(proc, db, blobs, core, policy, limits)
+	queue, err := submit.Register(proc, db, blobs, core, policy, limits)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -349,7 +352,7 @@ func main() {
 	if err := srv.Capability(mail.CapabilityURI).Advertise(struct{}{}, acctCap).Err(); err != nil {
 		log.Fatal(err)
 	}
-	if err := srv.Capability(mail.SubmissionCapabilityURI).Advertise(struct{}{}, mail.SubmissionAccountCapabilityFor(limits)).Err(); err != nil {
+	if err := srv.Capability(submit.CapabilityURI).Advertise(struct{}{}, submit.AccountCapabilityFor(limits)).Err(); err != nil {
 		log.Fatal(err)
 	}
 	if err := srv.Capability(mail.VacationCapabilityURI).Advertise(struct{}{}, struct{}{}).Err(); err != nil {
@@ -442,33 +445,36 @@ func main() {
 	// Report ingestion correlates inbound DSNs/MDNs with the submissions
 	// they report on, and the vacation responder answers per RFC 3834
 	// through the same submission queue everything else sends through.
-	deliverer := mail.NewDeliverer(db, blobs, resolve,
-		mail.WithReportIngestion(),
-		mail.WithVacationResponder(queue))
+	deliverer, err := deliver.New(db, blobs, resolve,
+		deliver.WithReportIngestion(),
+		deliver.WithVacationResponder(queue))
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// The sending worker: real relay when -relay is set, loopback through
 	// the local Deliverer otherwise. Either way it is the same Submitter
 	// socket and the same queue engine.
-	var submitter mail.Submitter
+	var submitter submit.Submitter
 	if *relay != "" {
-		cfg := mail.SMTPRelayConfig{Addr: *relay}
+		cfg := submit.SMTPRelayConfig{Addr: *relay}
 		switch *relayTLS {
 		case "starttls":
-			cfg.Mode = mail.RequireSTARTTLS
+			cfg.Mode = submit.RequireSTARTTLS
 		case "implicit":
-			cfg.Mode = mail.ImplicitTLS
+			cfg.Mode = submit.ImplicitTLS
 		case "plain":
 			// The operator chose plaintext explicitly, so credentials may
 			// ride on it too (a localhost relay hop, typically).
-			cfg.Mode = mail.Plaintext
+			cfg.Mode = submit.Plaintext
 			cfg.AllowPlaintextAuth = true
 		default:
 			log.Fatalf("-relay-tls must be starttls, implicit or plain, got %q", *relayTLS)
 		}
 		if *relayUser != "" {
-			cfg.Auth = &mail.PlainAuth{Username: *relayUser, Password: *relayPass}
+			cfg.Auth = &submit.PlainAuth{Username: *relayUser, Password: *relayPass}
 		}
-		submitter, err = mail.NewSMTPRelay(cfg)
+		submitter, err = submit.NewSMTPRelay(cfg)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -477,7 +483,7 @@ func main() {
 		submitter = loopbackSubmitter{d: deliverer}
 		log.Printf("loopback sending: no -relay set, submissions deliver to local accounts only")
 	}
-	worker, err := mail.NewSubmissionWorker(queue, submitter, mail.SubmissionWorkerConfig{})
+	worker, err := submit.NewWorker(queue, submitter, submit.WorkerConfig{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -495,7 +501,7 @@ func main() {
 		log.Fatal(err)
 	}
 	go func() {
-		if err := mail.ServeLMTP(ln, deliverer, "mailserver.example"); err != nil {
+		if err := deliver.ServeLMTP(ln, deliverer, "mailserver.example"); err != nil {
 			log.Fatal(err)
 		}
 	}()
@@ -504,7 +510,7 @@ func main() {
 	// adapter, everything else is the JMAP server (/api, /.well-known/jmap,
 	// /eventsource, the blob endpoints).
 	root := http.NewServeMux()
-	root.Handle("/ingest", mail.NewHTTPIngest(deliverer, mail.WithIngestHostname("mailserver.example")))
+	root.Handle("/ingest", deliver.NewHTTPIngest(deliverer, deliver.WithIngestHostname("mailserver.example")))
 	root.Handle("/login", users.LoginHandler())
 	root.Handle("/", srv)
 

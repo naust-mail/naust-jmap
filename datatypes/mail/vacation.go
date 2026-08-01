@@ -17,12 +17,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
 	"github.com/naust-mail/naust-jmap/core/runtime"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/record"
 )
 
 // VacationCapabilityURI is the RFC 8621 vacation response capability
@@ -31,7 +31,7 @@ import (
 const VacationCapabilityURI = "urn:ietf:params:jmap:vacationresponse"
 
 // TypeVacationResponse is the VacationResponse datatype name.
-const TypeVacationResponse = "VacationResponse"
+const TypeVacationResponse = record.TypeVacationResponse
 
 // vacationSingletonId is the fixed wire id of the one VacationResponse
 // object (RFC 8621 section 8: "THE VacationResponse object", id
@@ -63,13 +63,10 @@ var vacationWireProps = []string{"isEnabled", "fromDate", "toDate", "subject", "
 // RegisterVacationResponse registers the VacationResponse type and its two
 // methods (RFC 8621 sections 8.1-8.2) on the processor. The embedder
 // advertises VacationCapabilityURI on its server for the type to be
-// callable; the delivery-side responder is enabled separately
-// (WithVacationResponder).
+// callable; the delivery-side responder, and the suppression ledger it
+// owns, are registered separately (deliver.New with WithVacationResponder).
 func RegisterVacationResponse(p *runtime.Processor, db *objectdb.DB) error {
 	if err := db.RegisterType(vacationResponseType()); err != nil {
-		return err
-	}
-	if err := db.RegisterType(vacationNotifiedType()); err != nil {
 		return err
 	}
 	h := vacationMethods{db: db}
@@ -84,7 +81,7 @@ type vacationMethods struct{ db *objectdb.DB }
 // 8: isEnabled false, everything else null).
 func vacationDefaults() map[string]json.RawMessage {
 	obj := map[string]json.RawMessage{
-		"id":        mustJSON(vacationSingletonId),
+		"id":        record.MustJSON(vacationSingletonId),
 		"isEnabled": json.RawMessage(`false`),
 	}
 	for _, p := range vacationWireProps[1:] {
@@ -337,33 +334,11 @@ func (h vacationMethods) applyVacationUpdate(ctx context.Context, acct jmap.Id, 
 			_, err := u.Create(TypeVacationResponse, obj)
 			return err
 		}
-		obj["id"] = mustJSON(storedId)
+		obj["id"] = record.MustJSON(storedId)
 		return u.Put(TypeVacationResponse, storedId, obj)
 	})
 	if err != nil {
 		return &jmap.SetError{Type: "serverFail", Description: err.Error()}
 	}
 	return nil
-}
-
-// vacationEnabledNow reports whether the account's vacation response is
-// active at now: enabled, and now within [fromDate, toDate) - a null
-// bound is open (RFC 8621 section 8).
-func vacationEnabledNow(full map[string]json.RawMessage, now time.Time) bool {
-	var enabled bool
-	json.Unmarshal(full["isEnabled"], &enabled)
-	if !enabled {
-		return false
-	}
-	if s, ok := decodeString(full["fromDate"]); ok {
-		if t, err := time.Parse(time.RFC3339, s); err != nil || now.Before(t) {
-			return false
-		}
-	}
-	if s, ok := decodeString(full["toDate"]); ok {
-		if t, err := time.Parse(time.RFC3339, s); err != nil || !now.Before(t) {
-			return false
-		}
-	}
-	return true
 }
