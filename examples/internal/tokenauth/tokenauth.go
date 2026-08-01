@@ -40,6 +40,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/providers/auth"
@@ -82,7 +83,7 @@ type Authenticator struct {
 
 	// revSubs holds the auth.Revoker subscribers RevokeUser emits to.
 	rvMu    sync.Mutex
-	revSubs map[chan string]struct{}
+	revSubs map[chan auth.Revocation]struct{}
 }
 
 // New returns an empty Authenticator.
@@ -90,7 +91,7 @@ func New() *Authenticator {
 	return &Authenticator{
 		users:   make(map[string]credential),
 		tokens:  make(map[string]auth.Identity),
-		revSubs: make(map[chan string]struct{}),
+		revSubs: make(map[chan auth.Revocation]struct{}),
 	}
 }
 
@@ -175,7 +176,12 @@ func (a *Authenticator) mint(id auth.Identity) string {
 // the runtime closes the user's live long-lived connections - a token
 // check on the next request never reaches a connection that does not
 // make one.
-func (a *Authenticator) RevokeUser(username string) {
+//
+// at is the instant the revocation took effect. A direct caller passes
+// time.Now(); a caller relaying an event from another auth.Revoker
+// stream MUST pass the event's own At through unchanged, so redelivered
+// events stay idempotent (see the auth.Revoker contract).
+func (a *Authenticator) RevokeUser(username string, at time.Time) {
 	a.mu.Lock()
 	for sum, id := range a.tokens {
 		if id.Username == username {
@@ -188,7 +194,7 @@ func (a *Authenticator) RevokeUser(username string) {
 	defer a.rvMu.Unlock()
 	for ch := range a.revSubs {
 		select {
-		case ch <- username:
+		case ch <- auth.Revocation{Username: username, At: at}:
 		default:
 			// The runtime consumer drains promptly; a full buffer means it
 			// is gone or wedged. Dropping beats blocking the revoker, and
@@ -200,8 +206,8 @@ func (a *Authenticator) RevokeUser(username string) {
 
 // Revocations implements auth.Revoker. The channel is buffered and is
 // closed, after unregistering, when ctx ends.
-func (a *Authenticator) Revocations(ctx context.Context) <-chan string {
-	ch := make(chan string, 64)
+func (a *Authenticator) Revocations(ctx context.Context) <-chan auth.Revocation {
+	ch := make(chan auth.Revocation, 64)
 	a.rvMu.Lock()
 	a.revSubs[ch] = struct{}{}
 	a.rvMu.Unlock()

@@ -3,11 +3,11 @@ module github.com/naust-mail/naust-jmap/examples
 go 1.25.0
 
 require (
-	github.com/naust-mail/naust-jmap/capabilities/websocket v0.1.0
-	github.com/naust-mail/naust-jmap/core v0.1.0
-	github.com/naust-mail/naust-jmap/datatypes/mail v0.1.0
-	github.com/naust-mail/naust-jmap/drivers/postgres v0.1.0
-	github.com/naust-mail/naust-jmap/drivers/sqlite v0.1.0
+	github.com/naust-mail/naust-jmap/capabilities/websocket v0.1.1
+	github.com/naust-mail/naust-jmap/core v0.2.0
+	github.com/naust-mail/naust-jmap/datatypes/mail v0.1.1
+	github.com/naust-mail/naust-jmap/drivers/postgres v0.1.1
+	github.com/naust-mail/naust-jmap/drivers/sqlite v0.1.1
 	golang.org/x/crypto v0.54.0
 )
 

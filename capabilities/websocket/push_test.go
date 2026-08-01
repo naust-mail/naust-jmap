@@ -1,6 +1,7 @@
 package websocket
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/naust-mail/naust-jmap/capabilities/websocket/internal/frame"
 	"github.com/naust-mail/naust-jmap/core/descriptor"
+	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
 	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/providers/backend/memory"
@@ -33,7 +35,13 @@ func pushTestServer(t *testing.T) *testServer {
 // verbatim data type names.
 func pushServerWithTypes(t *testing.T, types map[string]string) *testServer {
 	t.Helper()
-	core := runtime.DefaultCoreCapabilities()
+	return pushServerCore(t, types, runtime.DefaultCoreCapabilities())
+}
+
+// pushServerCore is the same server with caller-chosen core limits, so
+// pool-accounting tests can shrink the shared request pool.
+func pushServerCore(t *testing.T, types map[string]string, core jmap.CoreCapabilities) *testServer {
+	t.Helper()
 	proc := runtime.NewProcessor()
 	be := memory.New()
 	db := objectdb.New(be, lease.NewInProcess(be))
@@ -304,6 +312,73 @@ func TestReauthBackstopClosesOnExpiredCredentials(t *testing.T) {
 	}
 }
 
+// expiringRevokerAuth is expiringAuth plus an auth.Revoker stream that
+// never fires: the case where credentials die behind the Revoker's back.
+type expiringRevokerAuth struct {
+	expiringAuth
+	events chan auth.Revocation
+}
+
+func (a *expiringRevokerAuth) Revocations(_ context.Context) <-chan auth.Revocation {
+	return a.events
+}
+
+// With a Revoker present the backstop is normally off, but the
+// ReauthWithRevoker knob turns it on as an independent floor: expired
+// credentials close the connection even though the revocation stream
+// never says a word.
+func TestReauthWithRevokerKnob(t *testing.T) {
+	// Restore via t.Cleanup, not defer, for the same reason as the
+	// backstop test above: the restore must not race a reauth loop
+	// still reading the knobs.
+	oldInterval, oldKnob := ReauthInterval, ReauthWithRevoker
+	t.Cleanup(func() { ReauthInterval, ReauthWithRevoker = oldInterval, oldKnob })
+	ReauthInterval = 30 * time.Millisecond
+	ReauthWithRevoker = true
+
+	a := &expiringRevokerAuth{events: make(chan auth.Revocation)}
+	proc := runtime.NewProcessor()
+	srv, err := runtime.NewServer(a, proc, "https://jmap.example.com", runtime.DefaultCoreCapabilities())
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := &testServer{srv: srv, gate: make(chan struct{})}
+	env.handler = NewHandler(srv, a)
+	if env.handler.reauthEvery == 0 {
+		t.Fatal("knob set but the reauth loop is not armed")
+	}
+	if err := srv.Capability(CapabilityURI).Handle("/ws", env.handler).Err(); err != nil {
+		t.Fatal(err)
+	}
+	env.ts = httptest.NewServer(srv)
+	t.Cleanup(env.ts.Close)
+	t.Cleanup(func() {
+		for i := 0; i < 500; i++ {
+			env.handler.mu.Lock()
+			n := len(env.handler.conns)
+			env.handler.mu.Unlock()
+			if n == 0 {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Error("connections never untracked")
+	})
+
+	c := dialWS(t, env)
+	c.send(frame.OpText, request("R1", "Core/echo", "c0"))
+	c.recvText(5 * time.Second)
+
+	a.expired.Store(true)
+	op, payload, err := c.recv(5 * time.Second)
+	if err != nil || op != frame.OpClose {
+		t.Fatalf("op %d err %v, want a close frame", op, err)
+	}
+	if code := binary.BigEndian.Uint16(payload[:2]); code != 1008 {
+		t.Fatalf("close code %d, want 1008", code)
+	}
+}
+
 // The advertised capability object carries the wss URL and the real
 // supportsPush value (RFC 8887 section 3).
 func TestSessionCapabilityAdvertised(t *testing.T) {
@@ -327,5 +402,26 @@ func TestSessionCapabilityAdvertised(t *testing.T) {
 	}
 	if cap.URL != "wss://jmap.example.com/ws" || !cap.SupportsPush {
 		t.Fatalf("capability: %+v", cap)
+	}
+}
+
+// Enabling push holds the request slot through its per-account state
+// reads; with a pool of exactly one slot the enable and a follow-up
+// request must both still complete (the accounting must never nest a
+// second acquire under the held slot).
+func TestPushEnableSingleSlotPool(t *testing.T) {
+	core := runtime.DefaultCoreCapabilities()
+	core.MaxConcurrentRequests = 1
+	env := pushServerCore(t, map[string]string{"TestNote": "subject"}, core)
+	c := dialWS(t, env)
+
+	c.send(frame.OpText, []byte(`{"@type":"WebSocketPushEnable","dataTypes":null}`))
+	changed := recvStateChange(c)
+	if changed["Atest1"] == nil {
+		t.Fatalf("no snapshot for the account: %v", changed)
+	}
+	c.send(frame.OpText, []byte(`{"@type":"Request","id":"R1","using":["urn:ietf:params:jmap:core"],"methodCalls":[["Core/echo",{},"c0"]]}`))
+	if m := c.recvType("Response", 5*time.Second); m["requestId"] != "R1" {
+		t.Fatalf("response did not follow the enable: %v", m)
 	}
 }

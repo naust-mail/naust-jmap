@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
 )
@@ -74,12 +75,32 @@ type Authenticator interface {
 // In a multi-process deployment every process's subscription must see
 // every revocation, wherever it originated - fan-out across the fleet
 // is the implementation's responsibility, not the runtime's.
+//
+// Delivery is at-least-once: an implementation may deliver the same
+// revocation more than once (for example, a durable transport that
+// re-asserts recent revocations after an outage). Consumers make the
+// stream safe to replay by applying events idempotently - comparing
+// the event's At against when each connection was established and
+// closing only connections that predate the revocation. To keep that
+// comparison meaningful, an implementation that relays or re-emits an
+// event MUST preserve its original At, never re-stamp it.
 type Revoker interface {
-	// Revocations returns a stream of usernames (Identity.Username)
-	// whose credentials have been revoked. The implementation closes
-	// the channel when ctx is done. The runtime consumes promptly and
-	// ignores usernames with no live connection in this process.
-	Revocations(ctx context.Context) <-chan string
+	// Revocations returns a stream of revocation events. The
+	// implementation closes the channel when ctx is done. The runtime
+	// consumes promptly and ignores events for usernames with no live
+	// connection in this process.
+	Revocations(ctx context.Context) <-chan Revocation
+}
+
+// Revocation is one credential-revocation event on a Revoker stream.
+type Revocation struct {
+	// Username is the Identity.Username whose credentials were revoked.
+	Username string
+	// At is the instant the revocation took effect. Connections
+	// established after it were authenticated against the post-revocation
+	// credential state and survive redelivery of this event; anything
+	// relaying the event must carry At through unchanged.
+	At time.Time
 }
 
 // Challenger is an optional Authenticator extension that names the scheme

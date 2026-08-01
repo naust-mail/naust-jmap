@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
+	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/providers/notify"
 	"github.com/naust-mail/naust-jmap/core/providers/notify/notifytest"
 )
@@ -452,11 +453,15 @@ func TestHintsRevokerFleet(t *testing.T) {
 	if err := PublishRevocation(context.Background(), hA.store.pool, "john@example.com"); err != nil {
 		t.Fatal(err)
 	}
-	for name, sub := range map[string]<-chan string{"publisher": subA, "peer": subB} {
+	for name, sub := range map[string]<-chan auth.Revocation{"publisher": subA, "peer": subB} {
 		select {
 		case got := <-sub:
-			if got != "john@example.com" {
-				t.Errorf("%s received %q", name, got)
+			if got.Username != "john@example.com" {
+				t.Errorf("%s received %q", name, got.Username)
+			}
+			// Live delivery stamps the arrival instant; it must be recent.
+			if age := time.Since(got.At); age < 0 || age > time.Minute {
+				t.Errorf("%s event At is %v old", name, age)
 			}
 		case <-time.After(5 * time.Second):
 			t.Fatalf("%s never received the revocation", name)
@@ -472,5 +477,164 @@ func TestHintsRevokerFleet(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("stream not closed after context end")
+	}
+}
+
+// TestRevocationPollFloor proves the delivery floor works with no NOTIFY
+// involved at all: a row written directly to the revocations table is
+// delivered to a subscriber by a poll pass, carrying the row's at. This
+// is the path that re-asserts a revocation whose NOTIFY was lost, and it
+// also exercises the timestamptz round trip into time.Time.
+func TestRevocationPollFloor(t *testing.T) {
+	h := openHints(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sub := h.Revoker().Revocations(ctx)
+
+	if _, err := h.store.pool.Exec(context.Background(),
+		"INSERT INTO revocations (username, at) VALUES ($1, now() - interval '1 hour')", "kim@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	h.pollRevocationsOnce(context.Background())
+
+	select {
+	case got := <-sub:
+		if got.Username != "kim@example.com" {
+			t.Errorf("received %q", got.Username)
+		}
+		if got.At.IsZero() {
+			t.Error("event At is zero, want the row's timestamp")
+		}
+		if age := time.Since(got.At.UTC()); age < 50*time.Minute || age > 70*time.Minute {
+			t.Errorf("event At is %v old, want about an hour", age)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("poll never delivered the table row")
+	}
+}
+
+// TestPublishRevocationUpsert proves re-revoking a username keeps one row
+// and advances its at rather than accumulating rows.
+func TestPublishRevocationUpsert(t *testing.T) {
+	h := openHints(t)
+	pool := h.store.pool
+
+	if err := PublishRevocation(context.Background(), pool, "kim@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	var first time.Time
+	if err := pool.QueryRow(context.Background(),
+		"SELECT at FROM revocations WHERE username = $1", "kim@example.com").Scan(&first); err != nil {
+		t.Fatal(err)
+	}
+	// Backdate so the second publish provably advances at even within
+	// one clock tick.
+	if _, err := pool.Exec(context.Background(),
+		"UPDATE revocations SET at = at - interval '1 minute' WHERE username = $1", "kim@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := PublishRevocation(context.Background(), pool, "kim@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	var second time.Time
+	if err := pool.QueryRow(context.Background(),
+		"SELECT count(*), max(at) FROM revocations WHERE username = $1", "kim@example.com").Scan(&n, &second); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("rows for one username = %d, want 1", n)
+	}
+	if !second.After(first.Add(-30 * time.Second)) {
+		t.Errorf("second publish did not advance at: first %v, second %v", first, second)
+	}
+}
+
+// TestRevocationPollPrunes proves a row older than the retention window
+// is neither delivered nor kept, while a fresh row still flows.
+func TestRevocationPollPrunes(t *testing.T) {
+	h := openHints(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sub := h.Revoker().Revocations(ctx)
+
+	if _, err := h.store.pool.Exec(context.Background(),
+		"INSERT INTO revocations (username, at) VALUES ($1, now() - interval '25 hours'), ($2, now())",
+		"stale@example.com", "fresh@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	h.pollRevocationsOnce(context.Background())
+
+	select {
+	case got := <-sub:
+		if got.Username != "fresh@example.com" {
+			t.Errorf("delivered %q, want only the fresh row", got.Username)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fresh row never delivered")
+	}
+	select {
+	case got := <-sub:
+		t.Errorf("unexpected extra delivery %q", got.Username)
+	case <-time.After(100 * time.Millisecond):
+	}
+	var n int
+	if err := h.store.pool.QueryRow(context.Background(),
+		"SELECT count(*) FROM revocations WHERE username = $1", "stale@example.com").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Error("stale row survived the prune")
+	}
+}
+
+// TestPublishRevocationRollback proves the durable half is transactional:
+// a publish inside a rolled-back transaction leaves no row (and NOTIFY
+// never fires on rollback), so an aborted credential change never
+// revokes anything.
+func TestPublishRevocationRollback(t *testing.T) {
+	h := openHints(t)
+	pool := h.store.pool
+
+	tx, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := PublishRevocation(context.Background(), tx, "kim@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		"SELECT count(*) FROM revocations").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("rolled-back publish left %d rows", n)
+	}
+}
+
+func TestDeliverRevocationCountsDrops(t *testing.T) {
+	full := make(chan auth.Revocation, 1)
+	full <- auth.Revocation{Username: "held@example.com", At: time.Now()}
+	open := make(chan auth.Revocation, 1)
+	h := &Hints{revSubs: map[chan auth.Revocation]struct{}{
+		full: {},
+		open: {},
+	}}
+
+	ev := auth.Revocation{Username: "kim@example.com", At: time.Now()}
+	if got := h.deliverRevocation(ev); got != 1 {
+		t.Errorf("deliverRevocation dropped %d sends, want 1", got)
+	}
+	select {
+	case got := <-open:
+		if got.Username != ev.Username {
+			t.Errorf("open subscriber got %q, want %q", got.Username, ev.Username)
+		}
+	default:
+		t.Error("open subscriber received nothing")
 	}
 }

@@ -335,6 +335,18 @@ func TestEmailSetKeywords(t *testing.T) {
 		t.Fatalf("false value: %v", se)
 	}
 
+	// "$recent" is registered with scope "reserved" (section 10.4.5):
+	// the name is held against future registration and no server
+	// behaviour attaches to it. Section 4.1.1 lets users set arbitrary
+	// keywords, so it stores like any other rather than being rejected.
+	if _, ok := update(`{"keywords/$recent":true}`)["updated"].(map[string]any)[id]; !ok {
+		t.Fatal("$recent rejected")
+	}
+	kw = emailGet(t, ts, id, `,"properties":["keywords"]`)["keywords"].(map[string]any)
+	if kw["$recent"] != true || len(kw) != 3 {
+		t.Fatalf("$recent keywords: %v", kw)
+	}
+
 	// Exceeding the keyword limit is tooManyKeywords.
 	big := map[string]bool{}
 	for i := 0; i < maxKeywordsPerEmail+1; i++ {

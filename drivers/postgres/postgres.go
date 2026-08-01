@@ -75,6 +75,20 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
+	// The revocations table is a keyed set - one row per username with a
+	// currently-relevant revocation, upserted by PublishRevocation and
+	// re-read by every process's poll (see hints.go). It is deliberately
+	// not an event log: only the latest revocation per username matters,
+	// and a set stays bounded by distinct revoked users, not event volume.
+	// The at index serves the poll's retention window scan and prune.
+	if _, err := pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS revocations (username TEXT PRIMARY KEY, at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS revocations_at ON revocations (at)`); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	return &Store{pool: pool}, nil
 }
 

@@ -90,6 +90,15 @@ func (s *Server) AcquireSlot(ctx context.Context, ident *auth.Identity) (*Reques
 		s.userDone(ident.Username)
 		return nil, ctx.Err()
 	}
+	// Both a free slot and a done context can be ready at once and the
+	// selects pick randomly; a caller with a dead context must not walk
+	// away holding a slot.
+	if err := ctx.Err(); err != nil {
+		<-s.apiSlots
+		<-sem
+		s.userDone(ident.Username)
+		return nil, err
+	}
 	return &RequestSlot{s: s, ident: ident, userSem: sem}, nil
 }
 

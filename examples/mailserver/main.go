@@ -296,10 +296,14 @@ func main() {
 	// local authenticator, which deletes the user's tokens and emits on
 	// its own auth.Revoker stream so the runtime closes the user's live
 	// EventSource streams and WebSocket connections.
+	// The relay preserves each event's At: fleet delivery is
+	// at-least-once (the poll re-asserts recent revocations), and only
+	// the original timestamp keeps redelivery idempotent - re-stamping
+	// would bounce sessions re-authenticated after the revocation.
 	if hints != nil {
 		go func() {
-			for username := range hints.Revoker().Revocations(context.Background()) {
-				users.RevokeUser(username)
+			for ev := range hints.Revoker().Revocations(context.Background()) {
+				users.RevokeUser(ev.Username, ev.At)
 			}
 		}()
 	}

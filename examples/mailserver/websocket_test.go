@@ -188,7 +188,7 @@ func TestWebSocketEndToEnd(t *testing.T) {
 	}
 
 	// Revocation reaches the live socket: 1008, then EOF.
-	users.RevokeUser("demo@example.com")
+	users.RevokeUser("demo@example.com", time.Now())
 	op, payload := recv()
 	if op != 0x8 {
 		t.Fatalf("opcode %d, want close", op)

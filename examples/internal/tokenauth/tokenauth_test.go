@@ -58,7 +58,8 @@ func TestRevokeUser(t *testing.T) {
 	defer cancel()
 	events := a.Revocations(ctx)
 
-	a.RevokeUser("john@example.com")
+	at := time.Now().Add(-time.Minute) // a relayed instant, not now
+	a.RevokeUser("john@example.com", at)
 
 	for _, tok := range []string{johnTok1, johnTok2} {
 		if _, err := a.Authenticate(bearer(tok)); err == nil {
@@ -70,8 +71,13 @@ func TestRevokeUser(t *testing.T) {
 	}
 	select {
 	case got := <-events:
-		if got != "john@example.com" {
-			t.Fatalf("revocation for %q", got)
+		if got.Username != "john@example.com" {
+			t.Fatalf("revocation for %q", got.Username)
+		}
+		// The emitted event carries the caller's at unchanged: relayed
+		// timestamps must never be re-stamped (auth.Revoker contract).
+		if !got.At.Equal(at) {
+			t.Fatalf("emitted At %v, want the given %v", got.At, at)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("revocation never emitted")
@@ -94,6 +100,6 @@ func TestRevokeUser(t *testing.T) {
 func TestRevokeUserNoSubscribers(t *testing.T) {
 	a := New()
 	a.AddUser("john@example.com", "secret", "A1")
-	a.RevokeUser("john@example.com")
-	a.RevokeUser("ghost@example.com")
+	a.RevokeUser("john@example.com", time.Now())
+	a.RevokeUser("ghost@example.com", time.Now())
 }

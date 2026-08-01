@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mrand "math/rand/v2"
 	"net/http"
 	"sort"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
+	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/providers/notify"
 	"github.com/naust-mail/naust-jmap/core/tuning"
 )
@@ -69,9 +71,21 @@ func (s *Server) handleEventSource(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The stream authenticates once and then holds open, so it must die
-	// with its credentials: registering the cancel lets a revocation of
-	// this username (auth.Revoker) end the stream immediately.
-	ctx, cancel := context.WithCancel(r.Context())
+	// with its credentials. With an auth.Revoker, a revocation of this
+	// username ends the stream immediately (the registered cancel);
+	// without one, nothing would ever re-check, so the stream instead
+	// carries a jittered lifetime cap. EventSource clients reconnect on
+	// stream end as a matter of protocol, the reconnect re-authenticates
+	// with current credentials, and the connect-time state push below
+	// means a reconnecting client misses nothing - so the cap costs a
+	// brief delivery blip, never data.
+	base := r.Context()
+	if _, ok := s.authn.(auth.Revoker); !ok && tuning.EventSourceMaxLifetime > 0 {
+		var expire context.CancelFunc
+		base, expire = context.WithTimeout(base, jittered(tuning.EventSourceMaxLifetime))
+		defer expire()
+	}
+	ctx, cancel := context.WithCancel(base)
 	defer cancel()
 	unregister := s.RegisterConnection(ident.Username, cancel)
 	defer unregister()
@@ -167,6 +181,12 @@ func (s *Server) handleEventSource(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// jittered spreads d over [0.75d, 1.25d) so many streams opened
+// together do not expire and reconnect in lockstep.
+func jittered(d time.Duration) time.Duration {
+	return d*3/4 + mrand.N(d/2)
 }
 
 // parseEventTypes resolves the "types" variable (section 7.3): the

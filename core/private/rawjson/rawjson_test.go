@@ -35,4 +35,14 @@ func TestForwarding(t *testing.T) {
 	if err := EachKey([]byte(`[]`), func(string) {}); err == nil {
 		t.Error("EachKey(array) must error")
 	}
+	m, err := Members([]byte(`{"@type":"A","junk":[1,{}],"@type":"B","id":"x"}`), map[string]bool{"@type": true, "id": true})
+	if err != nil || len(m) != 2 || string(m["@type"]) != `"B"` || string(m["id"]) != `"x"` {
+		t.Errorf("Members = %v, %v", m, err)
+	}
+	if m, err := Members([]byte(`null`), map[string]bool{"a": true}); m != nil || err != nil {
+		t.Errorf("Members(null) = %v, %v, want nil map, nil error", m, err)
+	}
+	if _, err := Members([]byte(`{"a":1} trailing`), nil); err == nil {
+		t.Error("Members with trailing bytes must error")
+	}
 }

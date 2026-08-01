@@ -95,6 +95,11 @@ clients that cannot hold a connection open.
 > RFC 8620 conformant** - section 7.2 has no opt-out - and is intended for
 > development. A production server supplies both.
 
+Event-source streams authenticate once and then hold open, so implement
+`auth.Revoker` on your authenticator to close a revoked identity's streams
+promptly; without one, streams are capped at `tuning.EventSourceMaxLifetime`
+and re-authenticate on reconnect.
+
 ## Public API
 
 godoc is the reference. This table is the map: the entry points a consumer
@@ -111,6 +116,7 @@ actually calls.
 | `Server.EnableBlobs`                                               | method       | Turns on upload/download and `Blob/copy` against a `blob.Store`                                              |
 | `Server.EnablePush`                                                | method       | Turns on the event-source endpoint, and webhooks when given a subscription store and sender                  |
 | `Server.ServeHTTP`                                                 | method       | Standard `http.Handler`; mount it where you like                                                             |
+| `Server.Close`                                                     | method       | Ends the server's lifetime: stops and joins its background goroutines. Shut transports down first            |
 | `Server.AcquireSlot` / `TryAcquireSlot`                            | method       | The concurrency gate, shared with out-of-band transports such as WebSocket                                   |
 | `descriptor.Type`, `descriptor.Property`, `descriptor.Kind`        | type         | A datatype described as data: properties, kinds, which are indexed, defaults                                 |
 | `objectdb.New`                                                     | func         | The object database over a backend and a lease manager                                                       |

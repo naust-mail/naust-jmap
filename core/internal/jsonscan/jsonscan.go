@@ -12,8 +12,11 @@
 package jsonscan
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/maphash"
 	"sort"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -147,16 +150,9 @@ func DecodeObjectSubset(raw []byte, names map[string]string, wanted map[string]b
 			return nil, err
 		}
 		span := s.buf[start+1 : s.pos-1]
-		clean := true
-		for _, c := range span {
-			if c == '\\' || c >= utf8.RuneSelf {
-				clean = false
-				break
-			}
-		}
 		var key string
 		var keep bool
-		if clean {
+		if cleanASCII(span) {
 			// The map lookups on string(span) do not copy; an unwanted
 			// clean name allocates nothing.
 			if wanted[string(span)] {
@@ -546,10 +542,222 @@ func EachString(raw []byte, fn func(elem string)) error {
 	}
 }
 
+// CheckIJSON validates raw as exactly one JSON text whose objects all
+// have distinct member names - the RFC 7493 section 2.3 constraint
+// that encoding/json does not enforce (it silently keeps the last
+// duplicate) - with nesting bounded at maxDepth enclosing containers.
+// Names are compared decoded, so an escaped spelling of a name
+// collides with its literal spelling. Like the rest of the scanner,
+// raw invalid UTF-8 inside strings is not rejected here; a caller
+// wanting full I-JSON must check UTF-8 validity itself.
+func CheckIJSON(raw []byte, maxDepth int) error {
+	s := &scanner{buf: raw}
+	s.skipSpace()
+	if err := s.checkValue(0, maxDepth); err != nil {
+		return err
+	}
+	return s.end()
+}
+
+// dupSpillAt is the object width where duplicate detection switches
+// from a linear scan of the names seen so far to a hashed set. Below
+// it the scan is allocation free and faster than hashing; above it
+// the set keeps a wide object - a bulk /set's update map, or a
+// hostile filler object - linear instead of quadratic.
+const dupSpillAt = 32
+
+// dupHashSeed keys the spilled set's hashing. A fixed hash function
+// over attacker-chosen names would invite engineered collisions that
+// degrade probing to quadratic, so the seed is random per process and
+// maphash is the stdlib's flooding-resistant hash.
+var dupHashSeed = maphash.MakeSeed()
+
+// checkValue is skipValue with the CheckIJSON obligations added: open
+// counts the containers enclosing the value, and any value nested
+// deeper than maxDepth is refused before recursing, so the walk's
+// stack stays bounded on hostile input.
+func (s *scanner) checkValue(open, maxDepth int) error {
+	if open > maxDepth {
+		return s.errAt("exceeded max nesting depth")
+	}
+	if s.pos >= len(s.buf) {
+		return s.errAt("missing value")
+	}
+	switch c := s.buf[s.pos]; {
+	case c == '{':
+		s.pos++
+		s.skipSpace()
+		if s.pos < len(s.buf) && s.buf[s.pos] == '}' {
+			s.pos++
+			return nil
+		}
+		base := len(s.names)
+		err := s.checkMembers(open, maxDepth)
+		s.names = s.names[:base]
+		return err
+	case c == '[':
+		s.pos++
+		s.skipSpace()
+		if s.pos < len(s.buf) && s.buf[s.pos] == ']' {
+			s.pos++
+			return nil
+		}
+		for {
+			s.skipSpace()
+			if err := s.checkValue(open+1, maxDepth); err != nil {
+				return err
+			}
+			s.skipSpace()
+			if s.pos >= len(s.buf) {
+				return s.errAt("unterminated array")
+			}
+			switch s.buf[s.pos] {
+			case ',':
+				s.pos++
+			case ']':
+				s.pos++
+				return nil
+			default:
+				return s.errAt("expected ',' or ']' in array")
+			}
+		}
+	case c == '"':
+		return s.skipString()
+	case c == 't':
+		return s.literal("true")
+	case c == 'f':
+		return s.literal("false")
+	case c == 'n':
+		return s.literal("null")
+	case c == '-' || ('0' <= c && c <= '9'):
+		return s.skipNumber()
+	default:
+		return s.errAt("invalid value")
+	}
+}
+
+// checkMembers walks the members of an already-opened, non-empty
+// object for checkValue. Each decoded name is held on s.names for the
+// object's duration and compared against the ones before it; a clean
+// name stays a zero-copy sub-slice of the buffer, and only a name
+// containing escapes or non-ASCII is unquoted so that different
+// spellings of one name still collide. Past dupSpillAt members the
+// names index into an open-addressed table keyed by seeded hash, so a
+// wide object - thousands of members in one bulk update - stays
+// linear without allocating per name.
+func (s *scanner) checkMembers(open, maxDepth int) error {
+	base := len(s.names)
+	var table []int32
+	var hashes []uint64
+	for {
+		s.skipSpace()
+		start := s.pos
+		if err := s.skipString(); err != nil {
+			return err
+		}
+		span := s.buf[start+1 : s.pos-1]
+		name := span
+		if !cleanASCII(span) {
+			name = unquoteBytes(span)
+		}
+		if table == nil {
+			for _, prev := range s.names[base:] {
+				if bytes.Equal(prev, name) {
+					return s.errAt("duplicate object member name")
+				}
+			}
+			s.names = append(s.names, name)
+			if len(s.names)-base > dupSpillAt {
+				for _, prev := range s.names[base:] {
+					hashes = append(hashes, maphash.Bytes(dupHashSeed, prev))
+				}
+				table = rehashInto(hashes, 4*dupSpillAt)
+			}
+		} else {
+			h := maphash.Bytes(dupHashSeed, name)
+			if (len(hashes)+1)*4 > len(table)*3 {
+				table = rehashInto(hashes, len(table)*2)
+			}
+			if s.probeInsert(table, base, name, h) {
+				return s.errAt("duplicate object member name")
+			}
+			s.names = append(s.names, name)
+			hashes = append(hashes, h)
+		}
+		s.skipSpace()
+		if s.pos >= len(s.buf) || s.buf[s.pos] != ':' {
+			return s.errAt("expected ':' after member name")
+		}
+		s.pos++
+		s.skipSpace()
+		if err := s.checkValue(open+1, maxDepth); err != nil {
+			return err
+		}
+		s.skipSpace()
+		if s.pos >= len(s.buf) {
+			return s.errAt("unterminated object")
+		}
+		switch s.buf[s.pos] {
+		case ',':
+			s.pos++
+		case '}':
+			s.pos++
+			return nil
+		default:
+			return s.errAt("expected ',' or '}' in object")
+		}
+	}
+}
+
+// probeInsert looks name up in the object's open-addressed table by
+// linear probing, reporting true on a duplicate and otherwise claiming
+// the first free slot for the index the name is about to take on
+// s.names. Entries are one-based indices - zero means empty, so a
+// freshly allocated table needs no fill pass - and hold indices rather
+// than the names themselves, so a collision compares the real spans
+// and a hash collision can only cost probe steps, never a wrong
+// verdict.
+func (s *scanner) probeInsert(table []int32, base int, name []byte, h uint64) bool {
+	mask := uint64(len(table) - 1)
+	i := h & mask
+	for {
+		e := table[i]
+		if e == 0 {
+			table[i] = int32(len(s.names) - base + 1)
+			return false
+		}
+		if bytes.Equal(s.names[base+int(e)-1], name) {
+			return true
+		}
+		i = (i + 1) & mask
+	}
+}
+
+// rehashInto builds a size-n probe table over the object's already
+// stored name hashes, so growing the table never touches the name
+// bytes again. The names are already distinct, so entries are placed
+// without duplicate checks.
+func rehashInto(hashes []uint64, n int) []int32 {
+	table := make([]int32, n)
+	mask := uint64(n - 1)
+	for j, h := range hashes {
+		i := h & mask
+		for table[i] != 0 {
+			i = (i + 1) & mask
+		}
+		table[i] = int32(j + 1)
+	}
+	return table
+}
+
 // scanner walks one buffer left to right; pos never moves backwards.
 type scanner struct {
 	buf []byte
 	pos int
+	// names is CheckIJSON's shared name stack: each open object claims
+	// the tail from its own base, so one growing slice serves the whole
+	// walk instead of one allocation per object.
+	names [][]byte
 }
 
 func (s *scanner) errAt(msg string) error {
@@ -679,13 +887,26 @@ func (s *scanner) skipValue(open int) error {
 // skipString validates a string without decoding it: escapes must be
 // well formed and unescaped control characters are an error (RFC 8259
 // section 7). Bytes >= 0x20 pass through unexamined - like the stdlib
-// scanner, raw invalid UTF-8 is not rejected here.
+// scanner, raw invalid UTF-8 is not rejected here. Only three byte
+// values can end, escape, or invalidate a string, so the body is
+// skipped word-at-a-time: one 64-bit load per eight clean bytes, with
+// the byte loop taking over around any byte the word test flags.
 func (s *scanner) skipString() error {
 	if s.pos >= len(s.buf) || s.buf[s.pos] != '"' {
 		return s.errAt("expected string")
 	}
 	s.pos++
-	for s.pos < len(s.buf) {
+	for {
+		for s.pos+8 <= len(s.buf) {
+			x := binary.LittleEndian.Uint64(s.buf[s.pos:])
+			if hasByte(x, '"') || hasByte(x, '\\') || hasBelow(x, 0x20) {
+				break
+			}
+			s.pos += 8
+		}
+		if s.pos >= len(s.buf) {
+			return s.errAt("unterminated string")
+		}
 		switch c := s.buf[s.pos]; {
 		case c == '"':
 			s.pos++
@@ -700,7 +921,19 @@ func (s *scanner) skipString() error {
 			s.pos++
 		}
 	}
-	return s.errAt("unterminated string")
+}
+
+// hasByte reports whether any byte of x equals b, and hasBelow whether
+// any byte of x is less than n (valid for n <= 0x80): the standard
+// word-at-a-time byte tests (Hacker's Delight section 6-1). No false
+// positives or negatives; each is a handful of ALU ops.
+func hasByte(x uint64, b byte) bool {
+	y := x ^ (0x0101010101010101 * uint64(b))
+	return (y-0x0101010101010101)&^y&0x8080808080808080 != 0
+}
+
+func hasBelow(x uint64, n byte) bool {
+	return (x-0x0101010101010101*uint64(n))&^x&0x8080808080808080 != 0
 }
 
 func (s *scanner) skipEscape() error {
@@ -727,6 +960,25 @@ func (s *scanner) skipEscape() error {
 	}
 }
 
+// cleanASCII reports whether span holds neither a backslash nor any
+// byte >= 0x80 - a string body that decodes as itself, needing no
+// unquote. Checked word-at-a-time like skipString's fast path.
+func cleanASCII(span []byte) bool {
+	for len(span) >= 8 {
+		x := binary.LittleEndian.Uint64(span)
+		if hasByte(x, '\\') || x&0x8080808080808080 != 0 {
+			return false
+		}
+		span = span[8:]
+	}
+	for _, c := range span {
+		if c == '\\' || c >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
 // parseString validates a string and returns its decoded value. The
 // decoding matches encoding/json's unquote exactly: surrogate pairs
 // combine, a lone surrogate becomes U+FFFD, and each invalid UTF-8 byte
@@ -737,14 +989,7 @@ func (s *scanner) parseString() (string, error) {
 		return "", err
 	}
 	span := s.buf[start+1 : s.pos-1]
-	clean := true
-	for _, c := range span {
-		if c == '\\' || c >= utf8.RuneSelf {
-			clean = false
-			break
-		}
-	}
-	if clean {
+	if cleanASCII(span) {
 		return string(span), nil
 	}
 	return unquote(span), nil
@@ -781,6 +1026,13 @@ func (s *scanner) parseName(names map[string]string) (string, error) {
 
 // unquote decodes an escape-validated string body.
 func unquote(span []byte) string {
+	return string(unquoteBytes(span))
+}
+
+// unquoteBytes is unquote returning the freshly built byte slice
+// directly, for callers that want bytes: the result never aliases span,
+// so it may be retained across further scanning of the input.
+func unquoteBytes(span []byte) []byte {
 	out := make([]byte, 0, len(span))
 	for i := 0; i < len(span); {
 		switch c := span[i]; {
@@ -841,7 +1093,7 @@ func unquote(span []byte) string {
 			}
 		}
 	}
-	return string(out)
+	return out
 }
 
 // skipNumber validates the RFC 8259 section 6 number grammar. The first

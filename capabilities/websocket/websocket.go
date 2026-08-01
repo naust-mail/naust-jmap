@@ -29,15 +29,16 @@ type Handler struct {
 	srv   *runtime.Server
 	authn auth.Authenticator
 
-	// db and n are set by EnablePush (see push.go); nil means push is
-	// not supported on this endpoint.
+	// db and n are set by EnablePush (see push.go) and guarded by mu;
+	// a nil notifier means push is not supported on this endpoint.
 	db *objectdb.DB
 	n  notify.Notifier
 
 	// reauthEvery is non-zero when the authenticator implements no
-	// auth.Revoker: the periodic re-authentication loop is then the only
-	// way revoked credentials can reach an open connection (see
-	// reauth.go). The interval is captured from the ReauthInterval knob
+	// auth.Revoker (the periodic re-authentication loop is then the only
+	// way revoked credentials can reach an open connection, see
+	// reauth.go), or when ReauthWithRevoker turns the loop on alongside
+	// a Revoker. The interval is captured from the ReauthInterval knob
 	// at construction.
 	reauthEvery time.Duration
 
@@ -63,6 +64,8 @@ func NewHandler(srv *runtime.Server, authn auth.Authenticator) *Handler {
 		h.reauthEvery = ReauthInterval
 		slog.Warn("websocket: authenticator implements no auth.Revoker; " +
 			"falling back to periodic re-authentication of open connections")
+	} else if ReauthWithRevoker {
+		h.reauthEvery = ReauthInterval
 	}
 	return h
 }
@@ -94,11 +97,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// A revoked identity kills the connection with 1008 (RFC 8887
 	// section 4.2's credential-expiry policy) and cancels its in-flight
-	// work through the connection context.
-	unregister := h.srv.RegisterConnection(ident.Username, func() {
-		c.writeClose(frame.ClosePolicyViolation, "credentials revoked")
-		c.abort()
-	})
+	// work through the connection context; the closing write runs off
+	// the revocation dispatcher's goroutine (see conn.revoked).
+	unregister := h.srv.RegisterConnection(ident.Username, c.revoked)
 	defer unregister()
 
 	if h.reauthEvery > 0 {
@@ -124,6 +125,11 @@ func (h *Handler) challenge() string {
 	return `Basic realm="jmap"`
 }
 
+// track admits a connection into h.conns. Membership is a lifetime
+// claim, not just a close list: a connection is in the set exactly
+// while its serving goroutine is alive (untrack is the goroutine's
+// final action), which is what lets Shutdown wait tracked connections
+// all the way out rather than merely closing their sockets.
 func (h *Handler) track(c *conn) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -134,15 +140,22 @@ func (h *Handler) track(c *conn) bool {
 	return true
 }
 
+// untrack ends a tracked connection's membership and marks its
+// goroutine finished. It must be the last thing the serving goroutine
+// does - the deferred calls that drain request workers and unregister
+// from the runtime all run before it.
 func (h *Handler) untrack(c *conn) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	delete(h.conns, c)
+	h.mu.Unlock()
+	close(c.done)
 }
 
 // Shutdown closes every live connection gracefully: 1001 Going Away
 // after in-flight requests drain under DrainDeadline (RFC 6455
-// section 7.1.1). New connections are refused once it begins.
+// section 7.1.1). New connections are refused once it begins, and it
+// returns only after every tracked connection's serving goroutine has
+// exited - afterwards no goroutine of the handler's remains.
 func (h *Handler) Shutdown() {
 	h.mu.Lock()
 	h.closed = true
@@ -161,4 +174,12 @@ func (h *Handler) Shutdown() {
 		}(c)
 	}
 	wg.Wait()
+	// The close handshakes above are bounded by DrainDeadline and
+	// CloseReplyDeadline; once each socket is down, its goroutine's
+	// remaining teardown is quick, so this wait is short and unbounded
+	// on purpose - a deadline here would just turn a teardown bug into
+	// a silent leak.
+	for _, c := range conns {
+		<-c.done
+	}
 }

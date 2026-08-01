@@ -44,6 +44,7 @@ type testServer struct {
 	srv     *runtime.Server
 	handler *Handler
 	gate    chan struct{} // closing it releases every Test/slow call
+	started chan struct{} // Test/hang signals here when it begins
 }
 
 func newTestServer(t *testing.T) *testServer {
@@ -53,7 +54,7 @@ func newTestServer(t *testing.T) *testServer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	env := &testServer{srv: srv, gate: make(chan struct{})}
+	env := &testServer{srv: srv, gate: make(chan struct{}), started: make(chan struct{}, 8)}
 	env.handler = NewHandler(srv, staticAuth{})
 	err = srv.Capability(CapabilityURI).
 		Advertise(SessionCapability(srv.BaseURL(), "/ws", false), struct{}{}).
@@ -71,12 +72,27 @@ func newTestServer(t *testing.T) *testServer {
 			}
 			return []jmap.Invocation{{Name: "Test/slow", Args: json.RawMessage(`{"done":true}`), CallID: call.CallID}}
 		}).
+		Method("Test/hang", func(ctx context.Context, call *runtime.Call) []jmap.Invocation {
+			// Deliberately ignores ctx: models a method that keeps
+			// working after cancellation, for teardown-ordering tests.
+			select {
+			case env.started <- struct{}{}:
+			default:
+			}
+			<-env.gate
+			return []jmap.Invocation{{Name: "Test/hang", Args: json.RawMessage(`{}`), CallID: call.CallID}}
+		}).
 		Err()
 	if err != nil {
 		t.Fatal(err)
 	}
 	env.ts = httptest.NewServer(srv)
 	t.Cleanup(env.ts.Close)
+	// Shutdown synchronizes with every tracked connection's goroutine;
+	// without it a cleanup restoring a package tuning var races the
+	// hijacked connection's setup-time read of that var (the httptest
+	// server does not wait for hijacked connections).
+	t.Cleanup(env.handler.Shutdown)
 	return env
 }
 
@@ -94,7 +110,15 @@ type wsClient struct {
 
 func dialWS(t *testing.T, env *testServer) *wsClient {
 	t.Helper()
-	nc, err := net.Dial("tcp", strings.TrimPrefix(env.ts.URL, "http://"))
+	return dialURL(t, env.ts.URL)
+}
+
+// dialURL performs the handshake against any test server URL, so tests
+// can wrap the handler in their own http server when they need to
+// observe ServeHTTP itself.
+func dialURL(t *testing.T, url string) *wsClient {
+	t.Helper()
+	nc, err := net.Dial("tcp", strings.TrimPrefix(url, "http://"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,16 +568,16 @@ func TestRequestLevelErrors(t *testing.T) {
 
 type revokingWSAuth struct {
 	staticAuth
-	events chan string
+	events chan auth.Revocation
 }
 
-func (a *revokingWSAuth) Revocations(_ context.Context) <-chan string { return a.events }
+func (a *revokingWSAuth) Revocations(_ context.Context) <-chan auth.Revocation { return a.events }
 
 // Revoking the identity closes the socket with 1008 (RFC 8887 section
 // 4.2) and cancels its in-flight work.
 func TestRevocationClosesSocket(t *testing.T) {
 	proc := runtime.NewProcessor()
-	a := &revokingWSAuth{events: make(chan string)}
+	a := &revokingWSAuth{events: make(chan auth.Revocation)}
 	srv, err := runtime.NewServer(a, proc, "https://jmap.example.com", runtime.DefaultCoreCapabilities())
 	if err != nil {
 		t.Fatal(err)
@@ -571,7 +595,7 @@ func TestRevocationClosesSocket(t *testing.T) {
 	c.send(frame.OpText, request("R1", "Core/echo", "c0"))
 	c.recvText(5 * time.Second)
 
-	a.events <- "john@example.com"
+	a.events <- auth.Revocation{Username: "john@example.com", At: time.Now()}
 	op, payload, err := c.recv(5 * time.Second)
 	if err != nil || op != frame.OpClose {
 		t.Fatalf("op %d err %v, want a close frame", op, err)
@@ -630,6 +654,7 @@ func TestNonObjectAndWrongTypedMessages(t *testing.T) {
 		{`{"@type":["Request"]}`, jmap.ProblemNotRequest},
 		{`{"@type":"Request","id":7}`, jmap.ProblemNotRequest},
 		{`{"@type":null}`, jmap.ProblemNotRequest},
+		{`{"@type":"Request","@type":5}`, jmap.ProblemNotRequest},
 		{`{{not json`, jmap.ProblemNotJSON},
 		{`{"@type":"Request"} trailing`, jmap.ProblemNotJSON},
 		{``, jmap.ProblemNotJSON},
@@ -643,6 +668,36 @@ func TestNonObjectAndWrongTypedMessages(t *testing.T) {
 	c.send(frame.OpText, request("alive", "Core/echo", "c9"))
 	if m := c.recvText(5 * time.Second); m["requestId"] != "alive" {
 		t.Fatal("connection did not survive the garbage parade")
+	}
+}
+
+// Envelope member decoding follows JSON member semantics, not byte
+// matching: an escaped name is the same member, a duplicated member
+// keeps its last occurrence like a map decode, and an explicit null id
+// is an absent id (a response to an id-less request carries no
+// requestId, RFC 8887 section 4.3.2).
+func TestEnvelopeMemberShapes(t *testing.T) {
+	env := newTestServer(t)
+	c := dialWS(t, env)
+
+	// \u0040 is '@': the escaped name is the @type member.
+	c.send(frame.OpText, []byte(`{"\u0040type":"Request","using":["urn:ietf:params:jmap:core","urn:example:test"],"methodCalls":[["Core/echo",{},"c1"]]}`))
+	if m := c.recvText(5 * time.Second); m["@type"] != "Response" || m["requestId"] != nil {
+		t.Fatalf("escaped @type: %v", m)
+	}
+
+	// The duplicated id's last occurrence is the one echoed back; the
+	// duplicate itself is refused downstream as I-JSON (RFC 7493
+	// section 2.3), proving the envelope kept the last value.
+	c.send(frame.OpText, []byte(`{"@type":"Request","id":"first","id":"last","using":[],"methodCalls":[]}`))
+	if m := c.recvText(5 * time.Second); m["@type"] != "RequestError" || m["requestId"] != "last" {
+		t.Fatalf("duplicate id: %v", m)
+	}
+
+	// An explicit null id is an absent id.
+	c.send(frame.OpText, []byte(`{"@type":"Request","id":null,"using":["urn:ietf:params:jmap:core","urn:example:test"],"methodCalls":[["Core/echo",{},"c3"]]}`))
+	if m := c.recvText(5 * time.Second); m["@type"] != "Response" || m["requestId"] != nil {
+		t.Fatalf("null id: %v", m)
 	}
 }
 
@@ -805,5 +860,169 @@ func TestEmptyUsingEmptyCalls(t *testing.T) {
 	m := c.recvText(5 * time.Second)
 	if m["@type"] != "Response" || len(m["methodResponses"].([]any)) != 0 {
 		t.Fatalf("empty request: %v", m)
+	}
+}
+
+// A message, once started, must finish within MessageDeadline: a peer
+// dripping an unfinished fragment holds the reassembly buffer and a
+// pool slot, and only the deadline bounds that hold (RFC 6455 section
+// 10.4). Quiet time between complete messages never counts.
+func TestMessageDeadlineKillsSlowMessage(t *testing.T) {
+	old := MessageDeadline
+	MessageDeadline = 150 * time.Millisecond
+	t.Cleanup(func() { MessageDeadline = old })
+	env := newTestServer(t)
+	c := dialWS(t, env)
+
+	// Quiet gaps well past the deadline are fine: the clock only
+	// starts when bytes arrive.
+	for i := 0; i < 2; i++ {
+		c.send(frame.OpText, []byte(`{"@type":"Request","id":"D1","using":["urn:ietf:params:jmap:core"],"methodCalls":[["Core/echo",{},"c0"]]}`))
+		c.recvType("Response", 2*time.Second)
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// An unfinished fragment starts the clock; the connection is
+	// failed with 1008 when the message does not complete.
+	c.sendFrame(false, frame.OpText, []byte(`{"@type":`))
+	op, payload, err := c.recv(2 * time.Second)
+	if err != nil || op != frame.OpClose {
+		t.Fatalf("op %d, err %v, want close", op, err)
+	}
+	if code := binary.BigEndian.Uint16(payload[:2]); code != 1008 {
+		t.Fatalf("close code %d, want 1008", code)
+	}
+}
+
+// A failed connection sends its close code and drops TCP without
+// waiting for the peer's Close reply (RFC 6455 section 7.1.7); the
+// peer must see EOF well before CloseReplyDeadline.
+func TestProtocolErrorClosesWithoutReplyWait(t *testing.T) {
+	env := newTestServer(t)
+	c := dialWS(t, env)
+
+	// An unmasked client frame is a protocol violation (5.1).
+	c.nc.Write([]byte{0x81, 0x01, 'x'})
+	op, payload, err := c.recv(2 * time.Second)
+	if err != nil || op != frame.OpClose {
+		t.Fatalf("op %d, err %v, want close", op, err)
+	}
+	if code := binary.BigEndian.Uint16(payload[:2]); code != 1002 {
+		t.Fatalf("close code %d, want 1002", code)
+	}
+	start := time.Now()
+	c.nc.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := c.br.ReadByte(); err == nil {
+		t.Fatal("read a byte after the close frame")
+	}
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("connection lingered %v after failing", waited)
+	}
+}
+
+// The revocation callback runs on the server's single revocation
+// dispatcher, which must never block (see runtime.RegisterConnection):
+// it must return promptly even while another writer holds the write
+// mutex against a stalled peer, and still close the connection with
+// 1008 once the mutex frees.
+func TestRevokedCloseDoesNotBlockCaller(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	rd := frame.NewReader(bufio.NewReader(server), 1<<20, 32)
+	c := newConn(&Handler{}, &auth.Identity{Username: "john@example.com"}, server, rd)
+
+	c.wmu.Lock()
+	done := make(chan struct{})
+	go func() {
+		c.revoked()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		c.wmu.Unlock()
+		t.Fatal("revocation callback blocked behind the write mutex")
+	}
+	c.wmu.Unlock()
+
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var hdr [2]byte
+	if _, err := io.ReadFull(client, hdr[:]); err != nil {
+		t.Fatal(err)
+	}
+	if hdr[0] != 0x88 {
+		t.Fatalf("opcode %#x, want a Close frame", hdr[0])
+	}
+	payload := make([]byte, hdr[1]&0x7f)
+	if _, err := io.ReadFull(client, payload); err != nil {
+		t.Fatal(err)
+	}
+	if code := binary.BigEndian.Uint16(payload[:2]); code != 1008 {
+		t.Fatalf("close code %d, want 1008", code)
+	}
+	if _, err := client.Read(hdr[:1]); err == nil {
+		t.Fatal("connection still open after revocation")
+	}
+}
+
+// A graceful shutdown that lands mid-frame cannot recognize the peer's
+// Close reply (the parse position is unknown), so it must skip the
+// reply wait instead of burning CloseReplyDeadline parsing garbage.
+func TestShutdownMidFrameSkipsCloseReplyWait(t *testing.T) {
+	env := newTestServer(t)
+	c := dialWS(t, env)
+
+	// A masked text frame announcing 64 payload bytes, of which only
+	// three ever arrive.
+	c.nc.Write([]byte{0x81, 0x80 | 64, 1, 2, 3, 4, 'a', 'b', 'c'})
+	time.Sleep(150 * time.Millisecond)
+
+	start := time.Now()
+	env.handler.Shutdown()
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("shutdown took %v; the close-reply wait must be skipped mid-frame", elapsed)
+	}
+	op, payload, err := c.recv(2 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op != frame.OpClose || binary.BigEndian.Uint16(payload[:2]) != 1001 {
+		t.Fatalf("opcode %#x payload %v, want Close 1001", op, payload)
+	}
+}
+
+// After a failed connection the handler returns only once every
+// request goroutine has finished, so no request work outlives it -
+// even for a method that ignores its context.
+func TestTeardownWaitsForInFlightRequests(t *testing.T) {
+	env := newTestServer(t)
+	served := make(chan struct{})
+	ws := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		env.handler.ServeHTTP(w, r)
+		close(served)
+	}))
+	defer ws.Close()
+
+	c := dialURL(t, ws.URL)
+	c.send(frame.OpText, []byte(`{"@type":"Request","id":"R1","using":["urn:ietf:params:jmap:core","urn:example:test"],"methodCalls":[["Test/hang",{},"c0"]]}`))
+	select {
+	case <-env.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Test/hang never started")
+	}
+
+	// An unmasked frame fails the connection while the request runs.
+	c.nc.Write([]byte{0x81, 0x01, 'x'})
+	select {
+	case <-served:
+		t.Fatal("handler returned while a request goroutine was still running")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	close(env.gate)
+	select {
+	case <-served:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after the in-flight request finished")
 	}
 }

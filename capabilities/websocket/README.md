@@ -56,13 +56,14 @@ what tells a client where to connect.
 | `Handler.EnablePush(db, notifier)`                                      | method | Turn on StateChange push over the socket. Without it `SupportsPush` is false |
 | `Handler.SupportsPush()`                                                | method | Whether push is available, for the advertised capability object              |
 | `Handler.ServeHTTP`                                                     | method | It is an `http.Handler`; mount it at the path you advertise                  |
-| `Handler.Shutdown()`                                                    | method | Drain and close live sockets, bounded by `DrainDeadline`                     |
+| `Handler.Shutdown()`                                                    | method | Drain and close live sockets, bounded by `DrainDeadline`; returns with no connection goroutine left running |
 | `SessionCapability(baseURL, path string, supportsPush bool) Capability` | func   | The capability object to advertise in the session resource                   |
 | `Capability`                                                            | type   | The advertised object: URL and push support                                  |
 | `CapabilityURI`                                                         | const  | `urn:ietf:params:jmap:websocket`                                             |
 | `IdleTimeout`, `WriteDeadline`, `DrainDeadline`, `CloseReplyDeadline`   | var    | Connection timing                                                            |
 | `MaxMessageSize`, `MaxFragments`, `MaxRequestIDLength`, `LaneCap`       | var    | Per-connection limits                                                        |
 | `ReauthInterval`                                                        | var    | How often a live socket re-checks its credential                             |
+| `ReauthWithRevoker`                                                     | var    | Run the re-auth backstop even when the authenticator has a revocation stream |
 
 The package-level vars are the tuning surface; set them before serving.
 
@@ -81,7 +82,10 @@ state strings it holds, which the snapshot covers.
 
 **Long-lived connections re-check authentication.** A credential revoked
 mid-session does not stay valid until the socket closes; `ReauthInterval` bounds
-the window, and the runtime's revocation path closes affected connections.
+the window, and the runtime's revocation path closes affected connections. With
+an `auth.Revoker` present the periodic re-check is normally off (the stream
+carries revocations); `ReauthWithRevoker` opts it back on as an independent
+floor, at the cost of one `Authenticate` per connection per interval.
 
 ## Examples
 

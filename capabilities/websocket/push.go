@@ -32,15 +32,26 @@ import (
 // supportsPush must be advertised false.
 func (h *Handler) EnablePush(db *objectdb.DB, n notify.Notifier) {
 	db.SetNotifier(n)
+	h.mu.Lock()
 	h.db, h.n = db, n
+	h.mu.Unlock()
+}
+
+// pushDeps returns the push wiring under the handler lock; a nil
+// notifier means push is not supported on this endpoint.
+func (h *Handler) pushDeps() (*objectdb.DB, notify.Notifier) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.db, h.n
 }
 
 // SupportsPush reports whether EnablePush has been called; it is the
 // value to advertise in the section 3 capability object.
-func (h *Handler) SupportsPush() bool { return h.n != nil }
+func (h *Handler) SupportsPush() bool { _, n := h.pushDeps(); return n != nil }
 
 func (c *conn) handlePushEnable(id *string, payload []byte) {
-	if c.h.n == nil {
+	db, n := c.h.pushDeps()
+	if n == nil {
 		c.writeRequestError(id, jmap.RequestError{Type: jmap.ProblemNotRequest, Status: 400,
 			Detail: "push is not supported on this connection"})
 		return
@@ -55,7 +66,7 @@ func (c *conn) handlePushEnable(id *string, payload []byte) {
 			Detail: "malformed WebSocketPushEnable object"})
 		return
 	}
-	types, ok := c.resolveTypes(pe.DataTypes)
+	types, ok := c.resolveTypes(db, pe.DataTypes)
 	if !ok {
 		// Unknown names would silently never fire, which always means a
 		// client bug; reject them (the event source does the same).
@@ -73,6 +84,17 @@ func (c *conn) handlePushEnable(id *string, payload []byte) {
 	c.pushCancel = cancel
 	c.pushMu.Unlock()
 
+	// A failed enable leaves push OFF, whatever it was before: the old
+	// subscription is already canceled, so claiming push is on would
+	// leave a subscriber-shaped connection nobody streams to.
+	failed := func() {
+		c.pushMu.Lock()
+		cancel()
+		c.pushCancel = nil
+		c.pushMu.Unlock()
+		c.pushOn.Store(false)
+	}
+
 	// Changes are pushed for every account the user has access to
 	// (RFC 8620 section 7.1). Subscribe BEFORE reading current state so
 	// no commit can fall between the two: a change landing during the
@@ -82,8 +104,9 @@ func (c *conn) handlePushEnable(id *string, payload []byte) {
 	for id := range c.ident.Accounts {
 		accounts = append(accounts, id)
 	}
-	sub, err := c.h.n.Subscribe(pushCtx, accounts)
+	sub, err := n.Subscribe(pushCtx, accounts)
 	if err != nil {
+		failed()
 		c.writeRequestError(id, jmap.RequestError{Type: jmap.ProblemNotRequest, Status: 500,
 			Detail: "subscribe failed"})
 		return
@@ -93,9 +116,10 @@ func (c *conn) handlePushEnable(id *string, payload []byte) {
 	for _, acct := range accounts {
 		ts := make(jmap.TypeState, len(types))
 		for _, name := range types {
-			state, err := c.h.db.TypeState(pushCtx, acct, name)
+			state, err := db.TypeState(pushCtx, acct, name)
 			if err != nil {
 				sub.Close()
+				failed()
 				c.writeRequestError(id, jmap.RequestError{Type: jmap.ProblemNotRequest, Status: 500,
 					Detail: "state read failed"})
 				return
@@ -108,6 +132,7 @@ func (c *conn) handlePushEnable(id *string, payload []byte) {
 	c.pushOn.Store(true)
 	if !c.writeStateChange(snapshot) {
 		sub.Close()
+		failed()
 		return
 	}
 	wantType := make(map[string]bool, len(types))
@@ -135,8 +160,8 @@ func (c *conn) handlePushDisable() {
 
 // resolveTypes maps the dataTypes property to concrete type names:
 // null means every supported type; unknown names are rejected.
-func (c *conn) resolveTypes(dataTypes *[]string) ([]string, bool) {
-	all := c.h.db.TypeNames()
+func (c *conn) resolveTypes(db *objectdb.DB, dataTypes *[]string) ([]string, bool) {
+	all := db.TypeNames()
 	if dataTypes == nil {
 		return all, true
 	}

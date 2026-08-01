@@ -14,6 +14,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net"
+	"slices"
 	"unicode/utf8"
 )
 
@@ -63,6 +65,12 @@ type Message struct {
 type Reader struct {
 	r io.Reader
 
+	// OnFrameHeader, when set, is called on the reading goroutine each
+	// time a frame header has arrived, before the frame is processed.
+	// The connection layer uses it to bound how long a peer that has
+	// started sending may take to finish (section 10.4).
+	OnFrameHeader func()
+
 	// maxMessage caps a message's total reassembled payload; a message
 	// that would exceed it fails with 1009 before the excess is read.
 	maxMessage int64
@@ -71,20 +79,60 @@ type Reader struct {
 	maxFragments int
 
 	// Reassembly state for the message in progress (section 5.4).
+	// utfOK is how much of partial has already passed text validation,
+	// so invalid UTF-8 fails as it arrives, not at message end.
 	partial   []byte
 	partialOp byte
 	frags     int
+	utfOK     int
+
+	// dirty is set when a read error cut the stream inside a frame:
+	// some of its bytes were consumed and some were not, so the next
+	// byte's meaning is unknown and no further parse can be trusted.
+	dirty bool
 }
+
+// MessageInProgress reports whether a fragmented message is mid
+// assembly (section 5.4), so the connection layer can keep a deadline
+// armed across the control frames Next returns in between.
+func (rd *Reader) MessageInProgress() bool {
+	return rd.partial != nil
+}
+
+// Dirty reports whether an earlier read error (typically a forced
+// deadline) cut the stream inside a frame, leaving the parse position
+// unknown. A dirty reader must not be resumed; one whose reads only
+// ever failed on frame boundaries can keep parsing.
+func (rd *Reader) Dirty() bool { return rd.dirty }
 
 // NewReader wraps a stream (typically the buffered reader left over
 // from the HTTP hijack). maxMessage and maxFragments must be positive.
 func NewReader(r io.Reader, maxMessage int64, maxFragments int) *Reader {
+	if maxMessage <= 0 || maxFragments <= 0 {
+		// Programmer error, not peer input: a non-positive cap would
+		// refuse every data frame or every fragment.
+		panic("websocket: NewReader requires positive maxMessage and maxFragments")
+	}
 	return &Reader{r: r, maxMessage: maxMessage, maxFragments: maxFragments}
 }
 
 func (rd *Reader) full(buf []byte) error {
-	_, err := io.ReadFull(rd.r, buf)
+	n, err := io.ReadFull(rd.r, buf)
+	if err != nil && n > 0 {
+		rd.dirty = true
+	}
 	return err
+}
+
+// midFull reads bytes that belong to a frame whose header has already
+// been consumed: any failure here, even before a byte arrives, strands
+// the parse position inside that frame.
+func (rd *Reader) midFull(buf []byte) error {
+	if err := rd.full(buf); err != nil {
+		rd.dirty = true
+		return err
+	}
+	return nil
 }
 
 // Next returns the next complete message. Control frames interleaved
@@ -97,6 +145,9 @@ func (rd *Reader) Next() (Message, error) {
 		var hdr [2]byte
 		if err := rd.full(hdr[:]); err != nil {
 			return Message{}, err
+		}
+		if rd.OnFrameHeader != nil {
+			rd.OnFrameHeader()
 		}
 		fin := hdr[0]&0x80 != 0
 		if hdr[0]&0x70 != 0 {
@@ -115,7 +166,7 @@ func (rd *Reader) Next() (Message, error) {
 		switch length {
 		case 126:
 			var ext [2]byte
-			if err := rd.full(ext[:]); err != nil {
+			if err := rd.midFull(ext[:]); err != nil {
 				return Message{}, err
 			}
 			length = int64(binary.BigEndian.Uint16(ext[:]))
@@ -125,7 +176,7 @@ func (rd *Reader) Next() (Message, error) {
 			}
 		case 127:
 			var ext [8]byte
-			if err := rd.full(ext[:]); err != nil {
+			if err := rd.midFull(ext[:]); err != nil {
 				return Message{}, err
 			}
 			v := binary.BigEndian.Uint64(ext[:])
@@ -184,16 +235,18 @@ func (rd *Reader) Next() (Message, error) {
 		}
 
 		var key [4]byte
-		if err := rd.full(key[:]); err != nil {
+		if err := rd.midFull(key[:]); err != nil {
 			return Message{}, err
 		}
-		payload := make([]byte, length)
-		if err := rd.full(payload); err != nil {
-			return Message{}, err
-		}
-		mask(payload, key)
 
 		if control {
+			// Control payloads are at most 125 bytes (checked above), so
+			// an exact allocation is already bounded.
+			payload := make([]byte, length)
+			if err := rd.midFull(payload); err != nil {
+				return Message{}, err
+			}
+			mask(payload, key, 0)
 			if op == OpClose {
 				if err := validateClose(payload); err != nil {
 					return Message{}, err
@@ -204,28 +257,101 @@ func (rd *Reader) Next() (Message, error) {
 
 		if op != OpContinuation {
 			rd.partialOp = op
-			rd.partial = payload
-		} else {
-			rd.partial = append(rd.partial, payload...)
+			// Non-nil marks a message in progress even when this first
+			// fragment carries no payload (section 5.4).
+			rd.partial = []byte{}
+			rd.utfOK = 0
+		}
+		if err := rd.appendPayload(length, key); err != nil {
+			return Message{}, err
 		}
 		if !fin {
 			continue
 		}
 		msg := Message{Opcode: rd.partialOp, Payload: rd.partial}
-		rd.partial, rd.partialOp, rd.frags = nil, 0, 0
-		if msg.Opcode == OpText && !utf8.Valid(msg.Payload) {
-			// The whole message MUST be valid UTF-8 (5.6, 8.1).
+		tail := rd.utfOK
+		rd.partial, rd.partialOp, rd.frags, rd.utfOK = nil, 0, 0, 0
+		if msg.Opcode == OpText && !utf8.Valid(msg.Payload[tail:]) {
+			// Everything before tail was validated as it arrived; the
+			// message may not end mid code point (5.6, 8.1).
 			return Message{}, &ProtocolError{CloseInvalidPayload, "text message is not valid UTF-8"}
 		}
 		return msg, nil
 	}
 }
 
+// allocChunk bounds how far payload allocation may run ahead of the
+// bytes actually received. A frame header alone commits at most this
+// much memory; claiming a huge length costs the sender the bandwidth
+// to fill it (section 10.4 resource limits).
+const allocChunk = 32 << 10
+
+// appendPayload reads a data frame's payload directly onto the
+// reassembly buffer in allocChunk-bounded steps, unmasking each chunk
+// as it arrives. The buffer grows with received bytes, never with a
+// merely claimed length, and a fragment is never buffered separately
+// from the message it extends.
+func (rd *Reader) appendPayload(length int64, key [4]byte) error {
+	for done := int64(0); done < length; {
+		n := int(min(length-done, allocChunk))
+		off := len(rd.partial)
+		rd.partial = slices.Grow(rd.partial, n)[:off+n]
+		if err := rd.midFull(rd.partial[off:]); err != nil {
+			return err
+		}
+		// The mask key index continues across chunk boundaries: byte i
+		// of the frame's payload is masked with key[i%4] (section 5.3).
+		mask(rd.partial[off:], key, done)
+		done += int64(n)
+		if rd.partialOp == OpText {
+			if err := rd.validateChunk(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// validateChunk checks the not-yet-validated span of a text message,
+// leaving at most utf8.UTFMax-1 trailing bytes of a possibly still
+// incomplete code point for the next chunk. Invalid text MUST fail
+// the connection (5.6, 8.1); checking as bytes arrive means it does
+// so before a full message's worth of buffering, not after.
+func (rd *Reader) validateChunk() error {
+	p, cut := rd.partial, len(rd.partial)
+	for i := 1; i < utf8.UTFMax && cut-i >= rd.utfOK; i++ {
+		if utf8.RuneStart(p[cut-i]) {
+			if !utf8.FullRune(p[cut-i:]) {
+				cut -= i
+			}
+			break
+		}
+	}
+	if !utf8.Valid(p[rd.utfOK:cut]) {
+		return &ProtocolError{CloseInvalidPayload, "text message is not valid UTF-8"}
+	}
+	rd.utfOK = cut
+	return nil
+}
+
 // mask applies the section 5.3 transform in place (it is its own
-// inverse).
-func mask(p []byte, key [4]byte) {
-	for i := range p {
-		p[i] ^= key[i%4]
+// inverse), starting at the given byte offset of the frame's payload
+// so a payload can be unmasked in chunks. The 4-byte key rotated to
+// the offset's phase and repeated fills a 64-bit word, so eight bytes
+// transform per XOR; a byte loop finishes the sub-word tail.
+func mask(p []byte, key [4]byte, offset int64) {
+	var k [4]byte
+	for i := range k {
+		k[i] = key[(offset+int64(i))%4]
+	}
+	k32 := binary.LittleEndian.Uint32(k[:])
+	k64 := uint64(k32) | uint64(k32)<<32
+	for len(p) >= 8 {
+		binary.LittleEndian.PutUint64(p, binary.LittleEndian.Uint64(p)^k64)
+		p = p[8:]
+	}
+	for i, b := range p {
+		p[i] = b ^ k[i%4]
 	}
 }
 
@@ -271,6 +397,15 @@ func validReceivedCloseCode(code uint16) bool {
 // the server never masks (5.1) and never needs to fragment. The caller
 // serializes writers and sets any write deadline on w's connection.
 func WriteMessage(w io.Writer, op byte, payload []byte) error {
+	// The writer enforces what the wire format cannot express: opcodes
+	// are 4 bits (5.2) and a control payload is at most 125 bytes and
+	// unfragmented (5.5) - FIN is always set here.
+	if op > 0x0f {
+		return fmt.Errorf("websocket: invalid opcode %#x", op)
+	}
+	if op&0x8 != 0 && len(payload) > 125 {
+		return fmt.Errorf("websocket: control frame payload of %d bytes exceeds 125", len(payload))
+	}
 	var hdr [10]byte
 	hdr[0] = 0x80 | op
 	n := 2
@@ -286,10 +421,12 @@ func WriteMessage(w io.Writer, op byte, payload []byte) error {
 		binary.BigEndian.PutUint64(hdr[2:10], uint64(len(payload)))
 		n = 10
 	}
-	if _, err := w.Write(hdr[:n]); err != nil {
-		return err
-	}
-	_, err := w.Write(payload)
+	// Header and payload go out as one gathered write: on a TCP
+	// connection net.Buffers is a single writev, so a frame never costs
+	// two syscalls, and on any other writer it degrades to the same
+	// sequential writes. The bytes on the wire are identical either way.
+	bufs := net.Buffers{hdr[:n], payload}
+	_, err := bufs.WriteTo(w)
 	return err
 }
 

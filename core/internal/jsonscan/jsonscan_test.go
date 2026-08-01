@@ -3,6 +3,7 @@ package jsonscan
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -240,4 +241,46 @@ func FuzzHelpersVsStdlib(f *testing.F) {
 		checkInterning(t, raw)
 		checkSubset(t, raw)
 	})
+}
+
+// TestCheckIJSONWideObjects exercises the spilled duplicate table at
+// volume: every table size the growth path produces, the duplicate in
+// the worst position (last, after the whole table is built), escaped
+// spellings colliding across the spill boundary, and a distinct-names
+// control at each width. At these widths and load factors hash
+// collisions and probe clusters are statistically guaranteed, so the
+// probe and resize paths all execute.
+func TestCheckIJSONWideObjects(t *testing.T) {
+	build := func(n int, dupAt int, esc bool) []byte {
+		var b []byte
+		b = append(b, '{')
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				b = append(b, ',')
+			}
+			if i == dupAt {
+				if esc {
+					// An escaped respelling of member k0.
+					b = append(b, `"\u006b0":9`...)
+				} else {
+					b = append(b, `"k0":9`...)
+				}
+				continue
+			}
+			b = append(b, fmt.Sprintf(`"k%d":%d`, i, i)...)
+		}
+		b = append(b, '}')
+		return b
+	}
+	for _, n := range []int{33, 95, 96, 97, 200, 1000, 5000} {
+		if err := CheckIJSON(build(n, -1, false), 1024); err != nil {
+			t.Errorf("distinct %d members rejected: %v", n, err)
+		}
+		if err := CheckIJSON(build(n, n-1, false), 1024); err == nil {
+			t.Errorf("duplicate at end of %d members accepted", n)
+		}
+		if err := CheckIJSON(build(n, n-1, true), 1024); err == nil {
+			t.Errorf("escaped duplicate at end of %d members accepted", n)
+		}
+	}
 }

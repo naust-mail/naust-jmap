@@ -23,7 +23,11 @@
 // the internal scanner surfaces here if and when a consumer appears.
 package rawjson
 
-import "github.com/naust-mail/naust-jmap/core/internal/jsonscan"
+import (
+	"encoding/json"
+
+	"github.com/naust-mail/naust-jmap/core/internal/jsonscan"
+)
 
 // String decodes one complete JSON string value, allowing surrounding
 // whitespace. It reports false for anything else - including null,
@@ -48,3 +52,15 @@ func EachKey(raw []byte, fn func(key string)) error { return jsonscan.EachKey(ra
 // without materializing the member set; acceptance matches EachKey,
 // including validation of the whole value and null-as-empty.
 func HasKey(raw []byte, key string) (bool, error) { return jsonscan.HasKey(raw, key) }
+
+// Members decodes the wanted members of a JSON object value in one
+// pass, mirroring json.Unmarshal into a map restricted to those names:
+// the whole value is validated, a duplicated wanted name keeps the
+// last occurrence, and a literal null yields a nil map with no error.
+// Unwanted members cost only the validation scan - their names are
+// never decoded and their values never stored - so a message padded
+// with junk cannot inflate the result. Returned values are sub-slices
+// of raw; the caller must own raw and not modify it while they live.
+func Members(raw []byte, wanted map[string]bool) (map[string]json.RawMessage, error) {
+	return jsonscan.DecodeObjectSubset(raw, nil, wanted)
+}

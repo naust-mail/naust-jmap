@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
+	"runtime"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -41,7 +43,7 @@ func clientFrame(fin bool, op byte, payload []byte, key [4]byte) []byte {
 	b = append(b, key[:]...)
 	masked := make([]byte, len(payload))
 	copy(masked, payload)
-	mask(masked, key)
+	mask(masked, key, 0)
 	return append(b, masked...)
 }
 
@@ -517,5 +519,165 @@ func TestWriteCloseExactCap(t *testing.T) {
 	}
 	if got := buf.Bytes()[1]; got != 125 {
 		t.Fatalf("close payload %d bytes, want exactly 125", got)
+	}
+}
+
+// Payload memory must follow the bytes actually received, not the
+// length a header claims (10.4): a hostile header announcing half a
+// gigabyte, followed by silence, must not commit that allocation.
+func TestClaimedLengthNotPreallocated(t *testing.T) {
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	pr, pw := io.Pipe()
+	rd := NewReader(pr, 1<<30, 64)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rd.Next()
+	}()
+
+	// FIN text frame, masked, 64-bit length claiming 512 MiB. The
+	// unbuffered pipe returns from Write only once the reader has
+	// consumed the whole header, so it is past the length check and
+	// blocked waiting for payload when Write returns.
+	hdr := []byte{0x81, 0x80 | 127, 0, 0, 0, 0, 0x20, 0, 0, 0, 1, 2, 3, 4}
+	if _, err := pw.Write(hdr); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	if grew := int64(after.HeapAlloc) - int64(before.HeapAlloc); grew > 32<<20 {
+		t.Fatalf("heap grew %d bytes on an unfilled 512 MiB claim", grew)
+	}
+
+	pw.Close()
+	<-done
+}
+
+// Reassembly around the internal allocation-chunk boundaries: sizes
+// straddling the chunk must survive intact, including the mask key
+// rotation continuing across chunks within a frame (5.3) and
+// restarting with each new frame's own key.
+func TestChunkBoundaryReassembly(t *testing.T) {
+	key := [4]byte{0xa1, 0x5c, 0x03, 0xff}
+	pattern := func(n int) []byte {
+		p := make([]byte, n)
+		for i := range p {
+			p[i] = byte(i*7 + 3)
+		}
+		return p
+	}
+	for _, n := range []int{allocChunk - 1, allocChunk, allocChunk + 1, 3*allocChunk + 5} {
+		payload := pattern(n)
+		msg, err := newTestReader(clientFrame(true, OpBinary, payload, key)).Next()
+		if err != nil || !bytes.Equal(msg.Payload, payload) {
+			t.Fatalf("single frame of %d bytes: %v", n, err)
+		}
+	}
+
+	// Fragmented at an off-chunk offset: two frames, two keys.
+	payload := pattern(2*allocChunk + 777)
+	cut := allocChunk + 1
+	stream := clientFrame(false, OpBinary, payload[:cut], key)
+	stream = append(stream, clientFrame(true, OpContinuation, payload[cut:], [4]byte{1, 2, 3, 4})...)
+	msg, err := newTestReader(stream).Next()
+	if err != nil || !bytes.Equal(msg.Payload, payload) {
+		t.Fatalf("fragmented reassembly: %v", err)
+	}
+}
+
+// Invalid text fails the connection when it arrives (5.6, 8.1), not
+// after the attacker has bought a full message of buffering: a bad
+// byte in a fragment errors before any continuation is read.
+func TestUTF8FailFast(t *testing.T) {
+	key := [4]byte{5, 6, 7, 8}
+
+	// The stream ends after the unfinished fragment; only fail-fast
+	// validation can produce a ProtocolError here.
+	wantProtocolError(t, clientFrame(false, OpText, []byte{0xff, 0xfe}, key), CloseInvalidPayload)
+
+	// A rune split across the internal chunk boundary inside one frame
+	// is fine; an invalid byte right after it is not.
+	good := append(bytes.Repeat([]byte{'a'}, allocChunk-1), []byte("éxyz")...)
+	msg, err := newTestReader(clientFrame(true, OpText, good, key)).Next()
+	if err != nil || !bytes.Equal(msg.Payload, good) {
+		t.Fatalf("rune across chunk boundary: %v", err)
+	}
+	bad := append(bytes.Repeat([]byte{'a'}, allocChunk-1), 0xc3, 0xc3)
+	wantProtocolError(t, clientFrame(true, OpText, bad, key), CloseInvalidPayload)
+}
+
+// A first fragment with an empty payload still opens a message: the
+// continuation that follows must be accepted, not rejected as a lone
+// continuation (5.4).
+func TestEmptyFirstFragment(t *testing.T) {
+	key := [4]byte{3, 1, 4, 1}
+	stream := append(
+		clientFrame(false, OpText, nil, key),
+		clientFrame(true, OpContinuation, []byte("Hello"), key)...)
+	msg, err := newTestReader(stream).Next()
+	if err != nil || msg.Opcode != OpText || string(msg.Payload) != "Hello" {
+		t.Fatalf("empty first fragment: %+v, %v", msg, err)
+	}
+}
+
+// The writer refuses what the wire format cannot express.
+func TestWriteMessageRejectsInvalid(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteMessage(&buf, 0x10, nil); err == nil {
+		t.Fatal("opcode 0x10 accepted")
+	}
+	if err := WriteMessage(&buf, OpPing, bytes.Repeat([]byte{'p'}, 126)); err == nil {
+		t.Fatal("126-byte control payload accepted")
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("rejected frames wrote %d bytes", buf.Len())
+	}
+}
+
+// Dirty must distinguish a stream cut on a frame boundary (resumable)
+// from one cut inside a frame (parse position unknown).
+func TestDirtyTracksMidFrameCuts(t *testing.T) {
+	key := [4]byte{0x37, 0xfa, 0x21, 0x3d}
+	whole := clientFrame(true, OpText, []byte("abc"), key)
+
+	clean := [][]byte{
+		{},    // nothing arrived at all
+		whole, // ends exactly after a complete frame
+	}
+	for i, stream := range clean {
+		rd := newTestReader(stream)
+		for {
+			if _, err := rd.Next(); err != nil {
+				break
+			}
+		}
+		if rd.Dirty() {
+			t.Errorf("clean case %d: reader dirty after a frame-boundary cut", i)
+		}
+	}
+
+	dirty := [][]byte{
+		whole[:1],                // half a header
+		whole[:2],                // header consumed, mask key missing
+		whole[:6],                // header and key consumed, no payload byte
+		whole[:8],                // cut inside the payload
+		{0x81, 0x80 | 126},       // 16-bit length announced, never sent
+		{0x81, 0x80 | 127, 0x00}, // cut inside a 64-bit length
+	}
+	for i, stream := range dirty {
+		rd := newTestReader(stream)
+		for {
+			if _, err := rd.Next(); err != nil {
+				break
+			}
+		}
+		if !rd.Dirty() {
+			t.Errorf("dirty case %d: reader clean after a mid-frame cut", i)
+		}
 	}
 }

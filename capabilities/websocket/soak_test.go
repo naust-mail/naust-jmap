@@ -47,7 +47,7 @@ func TestConnectionChurnSoak(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	baseline := goruntime.NumGoroutine()
 
-	a := &revokingWSAuth{events: make(chan string)}
+	a := &revokingWSAuth{events: make(chan auth.Revocation)}
 	proc := runtime.NewProcessor()
 	be := memory.New()
 	db := objectdb.New(be, lease.NewInProcess(be))
@@ -90,7 +90,7 @@ func TestConnectionChurnSoak(t *testing.T) {
 				return
 			case <-time.After(40 * time.Millisecond):
 				select {
-				case a.events <- "john@example.com":
+				case a.events <- auth.Revocation{Username: "john@example.com", At: time.Now()}:
 				case <-revokerStop:
 					return
 				}

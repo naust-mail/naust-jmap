@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/url"
 	"sort"
 	"strings"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
+	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/providers/notify"
 	"github.com/naust-mail/naust-jmap/core/pushsub"
 	"github.com/naust-mail/naust-jmap/core/tuning"
@@ -68,6 +70,11 @@ type subWatcher struct{ cancel context.CancelFunc }
 // RFC 8620 conformant (section 7.2 has no opt-out) and is meant for
 // development.
 func (s *Server) EnablePush(db *objectdb.DB, n notify.Notifier, subs *pushsub.Store, sender *webpush.Sender) error {
+	if _, ok := s.authn.(auth.Revoker); !ok {
+		slog.Warn("naust-jmap: authenticator implements no auth.Revoker; " +
+			"event-source streams are capped at tuning.EventSourceMaxLifetime " +
+			"and re-authenticate on reconnect")
+	}
 	db.SetNotifier(n)
 	ctx, stop := context.WithCancel(context.Background())
 	p := &pushSupport{
@@ -89,15 +96,6 @@ func (s *Server) EnablePush(db *objectdb.DB, n notify.Notifier, subs *pushsub.St
 	// unexpired subscription.
 	p.active = true
 	return p.relistOnce(ctx)
-}
-
-// Close stops push delivery goroutines and waits for them. The HTTP
-// handler itself needs no shutdown.
-func (s *Server) Close() {
-	if s.push != nil {
-		s.push.stop()
-		s.push.wg.Wait()
-	}
 }
 
 // SetWebpushActive starts (true) or stops (false) webpush StateChange delivery

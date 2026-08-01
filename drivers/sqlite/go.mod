@@ -3,7 +3,7 @@ module github.com/naust-mail/naust-jmap/drivers/sqlite
 go 1.25.0
 
 require (
-	github.com/naust-mail/naust-jmap/core v0.1.0
+	github.com/naust-mail/naust-jmap/core v0.2.0
 	modernc.org/sqlite v1.53.0
 )
 

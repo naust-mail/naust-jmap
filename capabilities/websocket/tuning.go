@@ -27,6 +27,14 @@ var WriteDeadline = 30 * time.Second
 // for a request slot or executing requests never counts. 0 disables.
 var IdleTimeout = 10 * time.Minute
 
+// MessageDeadline bounds one message from its first frame header to
+// its last byte: a peer that starts sending must finish the message
+// within this window or the connection is failed with 1008 (RFC 6455
+// section 10.4 resource limits). The clock starts only when a header
+// arrives, so a quiet connection - a push subscriber sitting and
+// listening - is never touched by it. 0 disables.
+var MessageDeadline = 2 * time.Minute
+
 // MaxMessageSize caps one coalesced text message (RFC 8887 section 4.3
 // requires fragments be coalesced before parsing; this bounds what
 // that coalescing will buffer). It mirrors the default JMAP
@@ -50,9 +58,20 @@ var MaxRequestIDLength = 256
 // Authenticate on a connection's stored handshake request (jittered;
 // see reauth.go). The backstop only runs when the authenticator
 // implements no auth.Revoker - a revocation stream makes polling
-// pointless. 0 disables it entirely, which with no Revoker means open
-// connections outlive their credentials until they close themselves.
+// pointless - unless ReauthWithRevoker turns it on regardless. 0
+// disables it entirely, which with no Revoker means open connections
+// outlive their credentials until they close themselves.
 var ReauthInterval = 10 * time.Minute
+
+// ReauthWithRevoker runs the re-authentication backstop even when the
+// authenticator implements auth.Revoker. A revocation stream normally
+// makes polling pointless, but a deployment can opt in as a floor that
+// holds even if its Revoker never learns of a credential change (for
+// example, credentials mutated behind the Revoker's back). It re-runs
+// Authenticate per connection per interval - for a KDF-backed
+// authenticator that is a real per-connection burn, so weigh the cost
+// before enabling.
+var ReauthWithRevoker = false
 
 // DrainDeadline bounds how long a graceful shutdown waits for in-
 // flight requests to finish and flush before the connection is torn

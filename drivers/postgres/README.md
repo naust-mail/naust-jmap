@@ -38,8 +38,8 @@ Import cost: pgx, quarantined to this module.
 | `Store`                                    | type      | The `backend.Backend` implementation. Pass it to `objectdb.New`                                                                 |
 | `OpenHints(ctx, store) (*Hints, error)`    | func      | Starts the cluster hint transport over LISTEN/NOTIFY                                                                            |
 | `Hints`                                    | type      | A `notify.Notifier` and lease `Waker` that crosses process boundaries                                                           |
-| `PublishRevocation(ctx, db, username)`     | func      | Broadcasts a credential revocation to every process in the fleet                                                                |
-| `RevocationExecer`                         | interface | What `PublishRevocation` needs; satisfied by the pool                                                                           |
+| `PublishRevocation(ctx, db, username)`     | func      | Durably records a credential revocation and broadcasts it to every process in the fleet                                         |
+| `RevocationExecer`                         | interface | What `PublishRevocation` needs; satisfied by the pool, a conn, or a tx                                                          |
 | `Hints.Notifier()`, `Waker()`, `Revoker()` | method    | The three provider interfaces the hint transport satisfies. Hand them to `EnablePush`, the lease manager, and auth respectively |
 | `Store.Close()`, `Hints.Close()`           | method    | Shut down the pool and the listener connection                                                                                  |
 
@@ -67,11 +67,23 @@ because the runtime serializes writes per account through leases. Unlike SQLite
 there is no dedicated write connection: Postgres MVCC handles concurrent writers,
 and the account lease already means at most one writer per account is active.
 
-**Hints are an accelerator, never a correctness dependency.** A dropped or
-duplicated hint costs latency and nothing else. Change delivery is reconciled by
-clients on state strings (RFC 8620 section 7), and lease safety is the store's
-generation fence, not a hint. Without hints, a fleet still converges on the
-periodic scan.
+**Change and lease hints are an accelerator, never a correctness dependency.**
+A dropped or duplicated hint costs latency and nothing else. Change delivery is
+reconciled by clients on state strings (RFC 8620 section 7), and lease safety
+is the store's generation fence, not a hint. Without hints, a fleet still
+converges on the periodic scan.
+
+**Revocations are held to a stronger contract: at-least-once.** Each
+`PublishRevocation` upserts a durable `revocations` row in the publisher's
+transaction and fires a NOTIFY; the NOTIFY is only the fast path. Every
+process also re-reads the table's retention window (24h) on a slow poll, so a
+NOTIFY lost while a listener was reconnecting is re-delivered by the next
+poll, about a minute later at worst. Events carry the revocation time and the
+runtime applies them idempotently - redelivery closes nothing that
+authenticated after the revocation. The residual risks are narrow: the
+database being unreachable for longer than the retention window while revoked
+connections stay open, or clock skew between the database and a host beyond
+the runtime's slack.
 
 **Hint payloads are untrusted input.** Any database role that can NOTIFY on
 these channels can forge one, so the listener decodes strictly into a typed

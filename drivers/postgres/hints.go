@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	mrand "math/rand/v2"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -21,10 +23,19 @@ import (
 
 // This file adds the cluster hint transport: a best-effort accelerator that
 // lets change notifications and lease-wake hints cross process boundaries over
-// Postgres LISTEN/NOTIFY. It is strictly optional. Correctness never depends on
-// a hint arriving: change delivery is reconciled by clients on state strings
-// (RFC 8620 section 7), and lease safety is the store's generation fence, not a
-// hint. A dropped or duplicated hint costs only latency.
+// Postgres LISTEN/NOTIFY. It is strictly optional. For change and lease hints,
+// correctness never depends on a hint arriving: change delivery is reconciled
+// by clients on state strings (RFC 8620 section 7), and lease safety is the
+// store's generation fence, not a hint. A dropped or duplicated hint costs only
+// latency. Revocations are held to a stronger contract: the durable
+// revocations table is the truth and NOTIFY is only the fast path. Each
+// publish upserts the table in the publisher's transaction, and every
+// process re-reads the table's retention window on a slow poll, so a
+// NOTIFY lost while this process's listener is reconnecting is
+// re-delivered by the next poll - at-least-once delivery, applied
+// idempotently by the consumer (see auth.Revoker). The residuals: the
+// database being unreachable for longer than the retention window while
+// connections stay up, and clock skew beyond the consumer's slack.
 //
 // One dedicated listener connection per process carries every hint. That
 // connection is the only part of the system that needs a real session (LISTEN
@@ -77,6 +88,32 @@ const (
 	// LISTEN - an aggressive pooler, a terminate loop, a flaky path - cannot
 	// become an unthrottled reconnect storm.
 	stableConnThreshold = 10 * time.Second
+
+	// revocationRetention is how long a revocation row stays in the table
+	// and how far back each poll re-asserts. It must exceed any realistic
+	// listener outage: a revocation is only lost if this process cannot
+	// reach the database for longer than this while the revoked user's
+	// connections stay open. Rows older than the window are pruned. The
+	// two roles deliberately share one value: consumers apply events
+	// against the event's own timestamp, so re-asserting an old row
+	// still closes a connection that predates it. The re-assert depth is
+	// therefore the horizon of that safety net - shortening it would
+	// narrow the net, not just save work - and pruning deeper than the
+	// scan would keep rows nothing reads.
+	revocationRetention = 24 * time.Hour
+
+	// revocationPollInterval is the base period of the per-process poll
+	// that re-reads the revocations table. Each tick is jittered so a
+	// fleet restarted together does not thundering-herd the table. The
+	// poll is the delivery floor - NOTIFY latency when the listener is
+	// healthy, at most about one interval when it is not.
+	revocationPollInterval = time.Minute
+
+	// revocationWarnRows is the poll result size above which a warning is
+	// logged. The poll deliberately has no row cap - capping would let an
+	// attacker flood dummy revocations to push a real one past the cap -
+	// so an oversized table is reported loudly instead of trimmed.
+	revocationWarnRows = 10_000
 )
 
 // changePayload is the wire form of a change hint.
@@ -157,7 +194,7 @@ type Hints struct {
 	waiters map[jmap.Id][]chan struct{}
 
 	rmu     sync.Mutex
-	revSubs map[chan string]struct{}
+	revSubs map[chan auth.Revocation]struct{}
 
 	notifier *hintsNotifier
 	waker    *hintsWaker
@@ -173,6 +210,7 @@ type Hints struct {
 	cancel      context.CancelFunc
 	listenDone  chan struct{}
 	publishDone chan struct{}
+	pollDone    chan struct{}
 }
 
 // OpenHints starts the shared hint transport for this process: one dedicated
@@ -195,10 +233,11 @@ func OpenHints(ctx context.Context, store *Store) (*Hints, error) {
 		local:       notify.NewInProcess(),
 		pub:         make(chan publishReq, publishQueueDepth),
 		waiters:     make(map[jmap.Id][]chan struct{}),
-		revSubs:     make(map[chan string]struct{}),
+		revSubs:     make(map[chan auth.Revocation]struct{}),
 		shedNow:     time.Now,
 		listenDone:  make(chan struct{}),
 		publishDone: make(chan struct{}),
+		pollDone:    make(chan struct{}),
 	}
 	h.notifier = &hintsNotifier{h: h}
 	h.waker = &hintsWaker{h: h}
@@ -221,6 +260,7 @@ func OpenHints(ctx context.Context, store *Store) (*Hints, error) {
 
 	go h.listen(loopCtx, conn)
 	go h.publish(loopCtx)
+	go h.pollRevocations(loopCtx)
 	return h, nil
 }
 
@@ -236,13 +276,14 @@ func (h *Hints) Waker() lease.Waker { return h.waker }
 // including the one that published it.
 func (h *Hints) Revoker() auth.Revoker { return h.revoker }
 
-// Close stops the listener and publisher loops and closes the listener
-// connection. Local subscriptions are owned by their callers and are not force
-// closed here.
+// Close stops the listener, publisher, and revocation poll loops and
+// closes the listener connection. Local subscriptions are owned by their
+// callers and are not force closed here.
 func (h *Hints) Close() error {
 	h.cancel()
 	<-h.listenDone
 	<-h.publishDone
+	<-h.pollDone
 	return nil
 }
 
@@ -363,7 +404,11 @@ func (h *Hints) consume(ctx context.Context, conn *pgx.Conn) {
 // malformed, self-originated, or over the per-second dispatchBudget. It runs
 // only on the listener goroutine, so the shed state needs no lock.
 func (h *Hints) dispatch(channel, payload string) {
-	if h.shed() {
+	// Revocations are security events and are exempt from load
+	// shedding: dropping one leaves revoked credentials live. The
+	// budget exists to protect cache-refresh traffic, not access
+	// control.
+	if channel != chanRevoke && h.shed() {
 		return
 	}
 	switch channel {
@@ -396,24 +441,107 @@ func (h *Hints) dispatch(channel, payload string) {
 		// No self-origin filter, deliberately: the publishing process
 		// must close its own live connections too, and its runtime's
 		// connection index is only reached through this delivery.
-		h.deliverRevocation(p.Username)
+		// A live NOTIFY is stamped with the delivery instant rather than
+		// carrying a time on the wire: it arrives within moments of the
+		// publishing commit, so now() is the honest bound, and the exact
+		// at is only needed by the poll, which reads it from the table.
+		if n := h.deliverRevocation(auth.Revocation{Username: p.Username, At: time.Now()}); n > 0 {
+			slog.Warn("postgres: revocation subscriber queue full, delivery deferred to the poll", "dropped", n)
+		}
 	}
 }
 
-// deliverRevocation fans one revocation out to every subscriber. Sends
-// are non-blocking under the lock: a subscriber whose buffer is full is
-// skipped with a loud log rather than allowed to stall the listener
-// goroutine (see revokeSubQueueDepth).
-func (h *Hints) deliverRevocation(username string) {
+// deliverRevocation fans one revocation out to every subscriber and
+// reports how many sends were dropped. Sends are non-blocking under the
+// lock: a subscriber whose buffer is full is skipped rather than allowed
+// to stall the caller (see revokeSubQueueDepth). A dropped send is not a
+// lost revocation - the poll re-asserts every row in the retention
+// window, so delivery is retried within about one interval; each caller
+// logs drops at a volume fitting its path.
+func (h *Hints) deliverRevocation(ev auth.Revocation) int {
 	h.rmu.Lock()
 	defer h.rmu.Unlock()
+	dropped := 0
 	for ch := range h.revSubs {
 		select {
-		case ch <- username:
+		case ch <- ev:
 		default:
-			slog.Error("postgres: revocation subscriber queue full, dropping a revocation")
+			dropped++
 		}
 	}
+	return dropped
+}
+
+// pollRevocations is the revocation delivery floor: on a jittered
+// interval it prunes rows older than the retention window and
+// re-delivers every row inside it through the normal fan-out. It runs
+// on the pool, independent of the listener connection, so a NOTIFY
+// missed during a listener outage is re-asserted here at most about one
+// interval late. Redelivery of already-applied revocations is by
+// design - consumers apply events idempotently (see auth.Revoker), so
+// the loop needs no memory of what it has delivered before. No
+// watermark, deliberately: row visibility order is not commit order, so
+// an incremental scan could skip a row committed late, and the full
+// window is small (distinct revoked users in the window, warned above
+// revocationWarnRows).
+func (h *Hints) pollRevocations(ctx context.Context) {
+	defer close(h.pollDone)
+	for {
+		if sleepCtx(ctx, jitteredInterval(revocationPollInterval)) {
+			return
+		}
+		h.pollRevocationsOnce(ctx)
+	}
+}
+
+// pollRevocationsOnce runs one prune-and-redeliver pass. Query errors are
+// logged and left for the next tick - the transport runs degraded, same
+// philosophy as the listener.
+func (h *Hints) pollRevocationsOnce(ctx context.Context) {
+	if _, err := h.store.pool.Exec(ctx, "DELETE FROM revocations WHERE at < now() - $1::interval", revocationRetention.String()); err != nil && ctx.Err() == nil {
+		// Prune failure never blocks the read: a fat table costs scan
+		// time, not correctness.
+		slog.Warn("postgres: revocation prune failed", "err", err)
+	}
+	rows, err := h.store.pool.Query(ctx, "SELECT username, at FROM revocations WHERE at >= now() - $1::interval", revocationRetention.String())
+	if err != nil {
+		if ctx.Err() == nil {
+			slog.Warn("postgres: revocation poll failed", "err", err)
+		}
+		return
+	}
+	var evs []auth.Revocation
+	for rows.Next() {
+		var ev auth.Revocation
+		if err := rows.Scan(&ev.Username, &ev.At); err != nil {
+			slog.Warn("postgres: revocation poll scan failed", "err", err)
+			break
+		}
+		evs = append(evs, ev)
+	}
+	if err := rows.Err(); err != nil && ctx.Err() == nil {
+		slog.Warn("postgres: revocation poll failed", "err", err)
+	}
+	rows.Close()
+	if len(evs) > revocationWarnRows {
+		slog.Warn("postgres: revocations table unusually large", "rows", len(evs))
+	}
+	// One summary per pass, not one log per drop: a full window fanning
+	// into slow subscribers could otherwise emit thousands of lines per
+	// poll, and a dropped redelivery is retried on the next pass anyway.
+	dropped := 0
+	for _, ev := range evs {
+		dropped += h.deliverRevocation(ev)
+	}
+	if dropped > 0 {
+		slog.Warn("postgres: revocation redeliveries dropped on full subscriber queues", "dropped", dropped)
+	}
+}
+
+// jitteredInterval spreads d over [0.75d, 1.25d) so a fleet of processes
+// started together does not poll in lockstep.
+func jitteredInterval(d time.Duration) time.Duration {
+	return d*3/4 + mrand.N(d/2)
 }
 
 // shed reports whether this notification is over the listener's per-second
@@ -571,8 +699,8 @@ type hintsRevoker struct{ h *Hints }
 // Revocations subscribes to the fleet's revocation stream. The channel
 // is buffered (revokeSubQueueDepth) and is closed, after unregistering,
 // when ctx ends.
-func (r *hintsRevoker) Revocations(ctx context.Context) <-chan string {
-	ch := make(chan string, revokeSubQueueDepth)
+func (r *hintsRevoker) Revocations(ctx context.Context) <-chan auth.Revocation {
+	ch := make(chan auth.Revocation, revokeSubQueueDepth)
 	r.h.rmu.Lock()
 	r.h.revSubs[ch] = struct{}{}
 	r.h.rmu.Unlock()
@@ -601,12 +729,27 @@ type RevocationExecer interface {
 // transaction commits, so the revocation and the credential change
 // become one atomic event - no window where one is visible without the
 // other, and a rolled-back change never kills connections.
+//
+// The upsert into the revocations table is the durable half of the
+// contract: NOTIFY reaches only sessions listening at commit time, and
+// the row is what every process's poll re-asserts from afterwards
+// (at-least-once delivery; see the file header). Re-revoking a username
+// advances its row's at rather than adding a row.
 func PublishRevocation(ctx context.Context, db RevocationExecer, username string) error {
 	if username == "" {
 		return errors.New("postgres: cannot publish a revocation for an empty username")
 	}
+	if !utf8.ValidString(username) {
+		return errors.New("postgres: cannot publish a revocation for a non-UTF-8 username")
+	}
 	b, err := json.Marshal(revokePayload{Username: username})
 	if err != nil {
+		return err
+	}
+	if len(b) > notifyPayloadBudget {
+		return errors.New("postgres: revocation username too long for a NOTIFY payload")
+	}
+	if _, err := db.Exec(ctx, "INSERT INTO revocations (username) VALUES ($1) ON CONFLICT (username) DO UPDATE SET at = now()", username); err != nil {
 		return err
 	}
 	_, err = db.Exec(ctx, "SELECT pg_notify($1, $2)", chanRevoke, string(b))

@@ -11,6 +11,7 @@ import (
 
 	"github.com/naust-mail/naust-jmap/capabilities/websocket/internal/frame"
 	"github.com/naust-mail/naust-jmap/core/jmap"
+	"github.com/naust-mail/naust-jmap/core/private/rawjson"
 	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/runtime"
 )
@@ -59,6 +60,19 @@ type conn struct {
 
 	teardown sync.Once
 
+	// done closes when the connection's serving goroutine has finished
+	// all of its work; the handler closes it as it removes the
+	// connection from its tracking set, which is the goroutine's final
+	// action (see Handler.untrack and Handler.Shutdown).
+	done chan struct{}
+
+	// msgTimeout is MessageDeadline captured at construction;
+	// msgDeadline is the absolute cutoff for the message currently
+	// arriving, zero when none is. Both are touched only on the
+	// reading goroutine (the frame reader's header hook runs there).
+	msgTimeout  time.Duration
+	msgDeadline time.Time
+
 	// pushMu/push* live in push.go (WebSocketPushEnable state).
 	pushMu     sync.Mutex
 	pushCancel context.CancelFunc
@@ -71,7 +85,7 @@ func newConn(h *Handler, ident *auth.Identity, nc net.Conn, rd *frame.Reader) *c
 	if lanes < 1 {
 		lanes = 1
 	}
-	return &conn{
+	c := &conn{
 		h:          h,
 		ident:      ident,
 		nc:         nc,
@@ -81,7 +95,37 @@ func newConn(h *Handler, ident *auth.Identity, nc net.Conn, rd *frame.Reader) *c
 		lanes:      make(chan struct{}, lanes),
 		serial:     make(chan struct{}, 1),
 		readerDone: make(chan struct{}),
+		done:       make(chan struct{}),
+		msgTimeout: MessageDeadline,
 	}
+	rd.OnFrameHeader = c.onFrameHeader
+	return c
+}
+
+// onFrameHeader runs on the reading goroutine whenever a frame header
+// arrives. The first header of a message arms an absolute deadline:
+// once a peer starts sending, the whole message - fragments and all -
+// must land within msgTimeout, so a slow drip cannot hold the
+// reassembly buffer and a pool slot forever (RFC 6455 section 10.4).
+func (c *conn) onFrameHeader() {
+	if c.msgTimeout > 0 && c.msgDeadline.IsZero() {
+		c.msgDeadline = time.Now().Add(c.msgTimeout)
+		c.nc.SetReadDeadline(c.msgDeadline)
+	}
+}
+
+// revoked closes a connection whose credentials have been revoked:
+// close 1008 per RFC 8887 section 4.2's credential-expiry policy. The
+// write happens on its own goroutine because the caller is the
+// server's revocation dispatcher, which must never block (see
+// runtime.RegisterConnection): a peer that has stopped reading can
+// hold the write mutex for a full WriteDeadline, and revocations for
+// other connections must not queue behind that.
+func (c *conn) revoked() {
+	go func() {
+		c.writeClose(frame.ClosePolicyViolation, "credentials revoked")
+		c.abort()
+	}()
 }
 
 // abort tears the connection down without a closing handshake: for
@@ -139,9 +183,28 @@ func (c *conn) closeWith(code uint16, reason string) {
 	c.teardown.Do(func() { c.nc.Close() })
 }
 
+// failWith fails the WebSocket connection (RFC 6455 section 7.1.7):
+// send the close code, cancel in-flight work, and drop the TCP
+// connection without processing any further peer data - a failed
+// connection gets no close-reply wait.
+func (c *conn) failWith(code uint16, reason string) {
+	c.writeClose(code, reason)
+	c.cancel()
+	c.teardown.Do(func() { c.nc.Close() })
+}
+
 // awaitCloseReply consumes frames until the peer's Close or an error,
 // bounded by CloseReplyDeadline.
 func (c *conn) awaitCloseReply() {
+	// The message-deadline hook must not re-arm the read deadline while
+	// draining the reply; the caller owns the reader by now.
+	c.rd.OnFrameHeader = nil
+	if c.rd.Dirty() {
+		// An interrupted read stranded the parse position inside a
+		// frame, so the peer's Close can no longer be recognized;
+		// waiting for it (RFC 6455 section 5.5.1) is pointless.
+		return
+	}
 	c.nc.SetReadDeadline(time.Now().Add(CloseReplyDeadline))
 	for {
 		msg, err := c.rd.Next()
@@ -159,6 +222,11 @@ func (c *conn) run() {
 		if !c.draining.Load() {
 			c.abort()
 		}
+		// No request goroutine outlives the connection handler: the
+		// connection context is canceled (by the abort above, or by the
+		// shutdown that kicked the loop after its drain window), so
+		// in-flight work unblocks and this wait ends with it.
+		c.wg.Wait()
 	}()
 	defer close(c.readerDone)
 	for {
@@ -181,10 +249,15 @@ func (c *conn) run() {
 		// The idle timeout counts only truly-idle time: it is armed
 		// after the gate, only when nothing is in flight, and never on a
 		// connection that has push enabled - a push subscriber is doing
-		// its job by sitting quiet and listening.
-		if IdleTimeout > 0 && c.inflight.Load() == 0 && !c.pushOn.Load() {
+		// its job by sitting quiet and listening. A message deadline
+		// armed mid-assembly outranks it: interleaved control frames
+		// (RFC 6455 section 5.4) must not reset the clock.
+		switch {
+		case !c.msgDeadline.IsZero():
+			c.nc.SetReadDeadline(c.msgDeadline)
+		case IdleTimeout > 0 && c.inflight.Load() == 0 && !c.pushOn.Load():
 			c.nc.SetReadDeadline(time.Now().Add(IdleTimeout))
-		} else {
+		default:
 			c.nc.SetReadDeadline(time.Time{})
 		}
 
@@ -198,11 +271,18 @@ func (c *conn) run() {
 			var ne net.Error
 			switch {
 			case errors.As(err, &pe):
-				c.closeWith(pe.Code, pe.Reason)
+				c.failWith(pe.Code, pe.Reason)
 			case errors.As(err, &ne) && ne.Timeout():
-				c.closeWith(frame.CloseNormal, "idle timeout")
+				if !c.msgDeadline.IsZero() {
+					c.failWith(frame.ClosePolicyViolation, "message not completed in time")
+				} else {
+					c.closeWith(frame.CloseNormal, "idle timeout")
+				}
 			}
 			return
+		}
+		if !c.rd.MessageInProgress() {
+			c.msgDeadline = time.Time{}
 		}
 
 		switch msg.Opcode {
@@ -254,12 +334,35 @@ const notJSONDetail = "The request did not parse as I-JSON."
 // anything else is answered with a RequestError object as section
 // 4.3.1 requires - request-level errors never kill the connection.
 // dispatch owns slot: it hands it to a request goroutine or releases it.
+// envelopeMembers is the wrapper property set dispatch extracts; the
+// rest of the message is validated and skipped without being decoded,
+// since ParseRequest makes its own full pass later.
+var envelopeMembers = map[string]bool{"@type": true, "id": true}
+
 func (c *conn) dispatch(slot *runtime.RequestSlot, payload []byte) {
-	var env struct {
-		Type *string `json:"@type"`
-		ID   *string `json:"id"`
+	members, err := rawjson.Members(payload, envelopeMembers)
+	var typ string
+	typOK := false
+	if err == nil {
+		// A missing @type, a null one, and a non-string one all fail
+		// here, exactly the shapes json.Unmarshal into *string would
+		// leave nil or refuse.
+		typ, typOK = rawjson.String(members["@type"])
 	}
-	if err := json.Unmarshal(payload, &env); err != nil || env.Type == nil {
+	var id *string
+	if typOK {
+		// id is optional and may be an explicit null (decoding into
+		// *string treats null as absent); any other non-string value
+		// makes the message malformed.
+		if raw, ok := members["id"]; ok && string(raw) != "null" {
+			if v, sok := rawjson.String(raw); sok {
+				id = &v
+			} else {
+				typOK = false
+			}
+		}
+	}
+	if !typOK {
 		slot.Release()
 		// Two distinct request-level problems (RFC 8620 section 3.6.1):
 		// bytes that do not parse as JSON at all are notJSON; valid JSON
@@ -273,7 +376,7 @@ func (c *conn) dispatch(slot *runtime.RequestSlot, payload []byte) {
 		c.writeRequestError(nil, reqErr)
 		return
 	}
-	if env.ID != nil && len(*env.ID) > MaxRequestIDLength {
+	if id != nil && len(*id) > MaxRequestIDLength {
 		// The id is echoed back verbatim; an oversized one is refused
 		// without echoing it.
 		slot.Release()
@@ -282,13 +385,13 @@ func (c *conn) dispatch(slot *runtime.RequestSlot, payload []byte) {
 		return
 	}
 
-	switch *env.Type {
+	switch typ {
 	case "Request":
 		// Labeled requests may run concurrently up to the lane cap;
 		// id-less requests take the serial lane so responses arrive in
 		// request order (section 4.3.2 correlates only by id).
 		lane := c.serial
-		if env.ID != nil {
+		if id != nil {
 			lane = c.lanes
 		}
 		select {
@@ -312,16 +415,19 @@ func (c *conn) dispatch(slot *runtime.RequestSlot, payload []byte) {
 		c.inflight.Add(1)
 		c.wg.Add(1)
 		c.drainMu.Unlock()
-		go c.process(slot, lane, env.ID, payload)
+		go c.process(slot, lane, id, payload)
 	case "WebSocketPushEnable":
+		// Enabling push reads current state for every account (see
+		// handlePushEnable); the slot is held for the duration so the
+		// shared pool accounts for that work like any request's.
+		c.handlePushEnable(id, payload)
 		slot.Release()
-		c.handlePushEnable(env.ID, payload)
 	case "WebSocketPushDisable":
 		slot.Release()
 		c.handlePushDisable()
 	default:
 		slot.Release()
-		c.writeRequestError(env.ID, jmap.RequestError{Type: jmap.ProblemNotRequest, Status: 400,
+		c.writeRequestError(id, jmap.RequestError{Type: jmap.ProblemNotRequest, Status: 400,
 			Detail: "unknown @type"})
 	}
 }

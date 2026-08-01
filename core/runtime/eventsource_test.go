@@ -15,9 +15,11 @@ import (
 	"github.com/naust-mail/naust-jmap/core/descriptor"
 	"github.com/naust-mail/naust-jmap/core/internal/authtest"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
+	"github.com/naust-mail/naust-jmap/core/providers/auth"
 	"github.com/naust-mail/naust-jmap/core/providers/backend/memory"
 	"github.com/naust-mail/naust-jmap/core/providers/lease"
 	"github.com/naust-mail/naust-jmap/core/providers/notify"
+	"github.com/naust-mail/naust-jmap/core/tuning"
 )
 
 // pushServer is noteServer plus a second type (so the types filter is
@@ -250,5 +252,81 @@ func TestEventSourceErrors(t *testing.T) {
 	postResp.Body.Close()
 	if postResp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("POST: %d", postResp.StatusCode)
+	}
+}
+
+// A stream under an authenticator with no auth.Revoker must not outlive
+// the lifetime cap: it ends on its own, and the client's reconnect
+// re-authenticates with current credentials. Section 7.3 clients
+// reconnect on stream end as a matter of protocol, and the connect-time
+// state push means the reconnect loses nothing.
+func TestEventSourceLifetimeCapEndsStream(t *testing.T) {
+	old := tuning.EventSourceMaxLifetime
+	tuning.EventSourceMaxLifetime = 200 * time.Millisecond
+	t.Cleanup(func() { tuning.EventSourceMaxLifetime = old })
+
+	ts := pushServer(t)
+	c := openEventSource(t, ts, "types=*&closeafter=no&ping=0")
+	c.mustStateEvent(t)
+
+	// The jittered cap is at most 250ms here; the stream must end well
+	// within a couple of seconds.
+	end := make(chan error, 1)
+	go func() { _, _, err := c.readEvent(); end <- err }()
+	select {
+	case err := <-end:
+		if err == nil {
+			t.Fatal("expected end of stream, got an event")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream outlived the lifetime cap")
+	}
+
+	// The stream is renewable: a reconnect authenticates and gets the
+	// full current state again.
+	c2 := openEventSource(t, ts, "types=*&closeafter=no&ping=0")
+	c2.mustStateEvent(t)
+}
+
+// An authenticator with a Revoker is exempt from the lifetime cap: the
+// revocation stream owns credential expiry, so capping would only cost
+// reconnect churn.
+func TestEventSourceNoLifetimeCapWithRevoker(t *testing.T) {
+	old := tuning.EventSourceMaxLifetime
+	tuning.EventSourceMaxLifetime = 100 * time.Millisecond
+	t.Cleanup(func() { tuning.EventSourceMaxLifetime = old })
+
+	core := DefaultCoreCapabilities()
+	a := &revokingAuth{Static: authtest.NewStatic(), events: make(chan auth.Revocation)}
+	a.AddUser("john@example.com", "secret", "Atest1")
+	be := memory.New()
+	db := objectdb.New(be, lease.NewInProcess(be))
+	p := NewProcessor()
+	if err := RegisterStandardType(p, db, testNoteType(), core); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewServer(a, p, "https://jmap.example.com", core)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	if err := srv.Capability("urn:example:testnote").Advertise(struct{}{}, struct{}{}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.EnablePush(db, notify.NewInProcess(), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	c := openEventSource(t, ts, "types=*&closeafter=no&ping=1")
+	c.mustStateEvent(t)
+	// Keep reading well past several cap lengths; pings must keep
+	// arriving and the stream must not end.
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, _, err := c.readEvent(); err != nil {
+			t.Fatalf("stream ended despite the Revoker exemption: %v", err)
+		}
 	}
 }

@@ -1,6 +1,7 @@
 package jmap
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -29,6 +30,41 @@ func TestCheckIJSON(t *testing.T) {
 	for _, s := range invalid {
 		if err := CheckIJSON([]byte(s)); err == nil {
 			t.Errorf("CheckIJSON(%q) = nil, want error", s)
+		}
+	}
+}
+
+// TestCheckIJSONAllocBounds pins the allocation profile of the accept
+// path so it cannot silently regress: a body with no objects completes
+// with zero allocations, and an object's cost is the growth of one
+// shared name stack (doubling appends), never an allocation per member.
+// A per-member regression on the 32-member case would read as 32+.
+func TestCheckIJSONAllocBounds(t *testing.T) {
+	var b strings.Builder
+	b.WriteByte('{')
+	for i := 0; i < 32; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `"k%d":%d`, i, i)
+	}
+	b.WriteByte('}')
+	cases := []struct {
+		name string
+		body []byte
+		max  float64
+	}{
+		{"noObjects", []byte(`[1,-2.5e3,"x",true,null,["y"]]`), 0},
+		{"members32", []byte(b.String()), 8},
+	}
+	for _, c := range cases {
+		got := testing.AllocsPerRun(200, func() {
+			if err := CheckIJSON(c.body); err != nil {
+				t.Fatal(err)
+			}
+		})
+		if got > c.max {
+			t.Errorf("%s: %v allocs per run, want <= %v", c.name, got, c.max)
 		}
 	}
 }

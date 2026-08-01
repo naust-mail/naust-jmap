@@ -177,6 +177,17 @@ var MaxRequestedProperties = 512
 // imposes no minimum at all.
 var EventSourceMaxPingInterval uint64 = 3600
 
+// EventSourceMaxLifetime caps how long one event-source stream stays open
+// (jittered) when the authenticator implements no auth.Revoker. The cap is
+// the credential-expiry fallback: EventSource clients reconnect on stream
+// end as a matter of protocol, and the reconnect re-authenticates with the
+// client's current credentials, so a revoked credential stops receiving
+// changes within about one lifetime. Implementing auth.Revoker is the
+// better path - revocation then closes the stream in seconds and this cap
+// never applies. 0 disables it, which with no Revoker means open streams
+// outlive their credentials until they close themselves.
+var EventSourceMaxLifetime = 10 * time.Minute
+
 // PushSubscriptionMaxLifetime caps a push subscription's expiry: the server
 // sets it when the client gives none and clamps larger client values to it.
 // RFC 8620 section 7.2 floors it at 48 hours (spec.go; Validate warns below
@@ -239,6 +250,12 @@ func Validate() []string {
 			"PushSubscriptionMaxLifetime (%s) is below the RFC 8620 section 7.2 floor of %s: "+
 				"push subscriptions would expire sooner than the spec permits",
 			PushSubscriptionMaxLifetime, specMinPushSubscriptionMaxLifetime))
+	}
+	if MaxConcurrentRequestsPerUser < 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"MaxConcurrentRequestsPerUser (%d) is negative: treated as unset, "+
+				"half the shared pool applies",
+			MaxConcurrentRequestsPerUser))
 	}
 	if UploadReclaimWindow <= UploadRefreshInterval {
 		warnings = append(warnings, fmt.Sprintf(

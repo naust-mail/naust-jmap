@@ -74,6 +74,15 @@ type Server struct {
 	// registration, read without locking by ServeHTTP: all registration
 	// must complete before the server starts serving.
 	routes map[string]http.Handler
+
+	// cancel/watchDone/closeOnce are the server's lifetime. Every
+	// background goroutine the server owns is bounded by the context
+	// cancel ends and joined by Close before it returns; today that is
+	// only the revocation watcher, whose exit closes watchDone (closed
+	// eagerly when there is no watcher).
+	cancel    context.CancelFunc
+	watchDone chan struct{}
+	closeOnce sync.Once
 }
 
 // NewServer wires an authenticator and processor into an http.Handler.
@@ -94,6 +103,13 @@ func NewServer(a auth.Authenticator, p *Processor, baseURL string, core jmap.Cor
 	if perUser <= 0 {
 		perUser = max(1, int(core.MaxConcurrentRequests)/2)
 	}
+	if pool := int(core.MaxConcurrentRequests); pool > 1 && perUser >= pool {
+		slog.Warn("naust-jmap: tuning", "warning", fmt.Sprintf(
+			"MaxConcurrentRequestsPerUser (%d) is not below the shared pool (%d): "+
+				"clamped to %d so one user cannot hold every slot",
+			perUser, pool, pool-1))
+		perUser = pool - 1
+	}
 	s := &Server{
 		authn:        a,
 		proc:         p,
@@ -106,13 +122,39 @@ func NewServer(a auth.Authenticator, p *Processor, baseURL string, core jmap.Cor
 		perUserSlots: perUser,
 		routes:       map[string]http.Handler{},
 	}
-	// A revocation-capable authenticator gets one subscriber for the
-	// server's life: revoked identities' live connections are closed the
-	// moment the event arrives (see revoke.go and auth.Revoker).
+	// A revocation-capable authenticator gets one subscriber, held for
+	// the server's lifetime: revoked identities' live connections are
+	// closed the moment the event arrives (see revoke.go and
+	// auth.Revoker). Close cancels the subscription and waits the
+	// watcher out.
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+	s.watchDone = make(chan struct{})
 	if rv, ok := a.(auth.Revoker); ok {
-		go s.watchRevocations(rv.Revocations(context.Background()))
+		go s.watchRevocations(ctx, rv.Revocations(ctx))
+	} else {
+		close(s.watchDone)
 	}
 	return s, nil
+}
+
+// Close ends the server's lifetime: it stops every background
+// goroutine the server owns - the authenticator revocation
+// subscription and, when EnablePush was called, the push delivery
+// watchers - and returns once they have exited. It does not touch live
+// connections or requests: transports own their sockets and drain them
+// through their own shutdown. Shut down in dependency order:
+// transports first, then the server, then the providers underneath (a
+// revocation stream, a store). Close is safe to call more than once.
+func (s *Server) Close() {
+	s.closeOnce.Do(func() {
+		s.cancel()
+		<-s.watchDone
+		if s.push != nil {
+			s.push.stop()
+			s.push.wg.Wait()
+		}
+	})
 }
 
 // BaseURL returns the external URL prefix the server was constructed
@@ -158,6 +200,10 @@ func (r *Registration) Advertise(sessionValue, accountValue any) *Registration {
 		return r
 	}
 	s := r.s
+	if _, dup := s.sessionCaps[r.uri]; dup {
+		r.err = fmt.Errorf("runtime: capability %s already advertised", r.uri)
+		return r
+	}
 	s.sessionCaps[r.uri] = sv
 	s.accountCaps[r.uri] = av
 	s.capOrder = append(s.capOrder, r.uri)
@@ -170,6 +216,10 @@ func (r *Registration) Advertise(sessionValue, accountValue any) *Registration {
 // (RFC 8620 section 3.3).
 func (r *Registration) Method(name string, h Handler) *Registration {
 	if r.err != nil {
+		return r
+	}
+	if _, dup := r.s.proc.methods[name]; dup {
+		r.err = fmt.Errorf("runtime: capability %s: method %q already registered", r.uri, name)
 		return r
 	}
 	r.s.proc.Register(name, r.uri, h)

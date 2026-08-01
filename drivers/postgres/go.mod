@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/naust-mail/naust-jmap/core v0.1.0
+	github.com/naust-mail/naust-jmap/core v0.2.0
 )
 
 require (
