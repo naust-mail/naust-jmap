@@ -19,10 +19,10 @@ github.com/jackc/puddle/v2 v2.2.2 h1:PR8nw+E/1w0GLuRFSmiioY6UooMp6KJv0/61nB7icHo
 github.com/jackc/puddle/v2 v2.2.2/go.mod h1:vriiEXHvEE654aYKXXjOvZM39qJ0q+azkZFrfEOc3H4=
 github.com/mattn/go-isatty v0.0.23 h1:cYwCQTQf3HB6xUC+BtyCLZNr7IzbOmoZbmssVNzSyiQ=
 github.com/mattn/go-isatty v0.0.23/go.mod h1:nMCL3Zebbrt45jsMDgnfIwz6ydEQApk5oEI3HqDio6A=
-github.com/naust-mail/naust-jmap/capabilities/websocket v0.1.1 h1:R7uaHbJfT7pZ8A8Rb2wo2staxzzbKjprCefNp/1xblY=
-github.com/naust-mail/naust-jmap/capabilities/websocket v0.1.1/go.mod h1:ADcP53/n1Vx1vT0sZjWVrC9Yi51tNqGCzFoD6vXMdoE=
-github.com/naust-mail/naust-jmap/core v0.2.0 h1:NSQRjjW8ykd0Ijt1o3V3Dh3kHlfpm7ulKTWHB+fAFt0=
-github.com/naust-mail/naust-jmap/core v0.2.0/go.mod h1:TjPDhlaN8mGxYdE3iWAcTsn5Wl1b7rxZ6C8xe3YuzSM=
+github.com/naust-mail/naust-jmap/capabilities/websocket v0.1.2 h1:UOBLzC/gY50HWfQ9agi2/wmBR4lHAVAcCGtilH2vWUE=
+github.com/naust-mail/naust-jmap/capabilities/websocket v0.1.2/go.mod h1:ADcP53/n1Vx1vT0sZjWVrC9Yi51tNqGCzFoD6vXMdoE=
+github.com/naust-mail/naust-jmap/core v0.3.0 h1:Se8NoOY+sw4RIlxF/a1lrj6almB02OiYnzKGP6fzcQU=
+github.com/naust-mail/naust-jmap/core v0.3.0/go.mod h1:TjPDhlaN8mGxYdE3iWAcTsn5Wl1b7rxZ6C8xe3YuzSM=
 github.com/naust-mail/naust-jmap/datatypes/mail v0.1.1 h1:MB9bqlL3WUWE3xRloSHi5zbcCbtjhjsSaZpUXk0/K5o=
 github.com/naust-mail/naust-jmap/datatypes/mail v0.1.1/go.mod h1:hwhnPWkSU1n3W03I5gXGsisrwBY1lFPRM1pyiQaWmmU=
 github.com/naust-mail/naust-jmap/drivers/postgres v0.1.1 h1:VGHRHlukL4kTxZXNzb1m8a/tReDAODXMUIQ9HrUz9YM=
