@@ -130,7 +130,7 @@ reference; the site covers tasks. Nothing is duplicated across the three.
 
 | You want                                  | Look in                                                                                                                                                                                                   |
 |-------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| What a module provides and its public API | That module's README - [`core`](core), [`datatypes/mail`](datatypes/mail), [`drivers/sqlite`](drivers/sqlite), [`drivers/postgres`](drivers/postgres), [`capabilities/websocket`](capabilities/websocket) |
+| What a module provides and its public API | That module's README - [`core`](core), [`datatypes/mail`](datatypes/mail), [`drivers/sqlite`](drivers/sqlite), [`drivers/postgres`](drivers/postgres), [`capabilities/websocket`](capabilities/websocket), [`capabilities/mdn`](capabilities/mdn) |
 | The API reference                         | [pkg.go.dev](https://pkg.go.dev/github.com/naust-mail/naust-jmap/core)                                                                                                                                    |
 | Working code                              | [`examples/`](examples) - quickstart, a full mail server, a two-instance cluster proof                                                                                                                    |
 | How to accomplish a task                  | [naust.email/naust-jmap](https://naust.email/naust-jmap) - quickstart, auth, mail, websocket, fleet, reference                                                                                            |
@@ -286,11 +286,11 @@ go run ./examples/mailserver
 naust-jmap is pre-release (pre-1.0): modules version independently and
 breaking changes may still land in minor bumps. The mail module (see Mail
 above) reads, composes and sends, over either the sqlite or postgres driver
-(the latter including a multi-node cluster hint layer). Coming next, in
-order:
+(the latter including a multi-node cluster hint layer); read receipts are
+covered by [`capabilities/mdn`](capabilities/mdn) (MDN send/parse, RFC
+9007). Coming next, in order:
 
-- MDN send/parse (RFC 9007), S/MIME verification, and quotas as further
-  RFC 8621-family modules
+- S/MIME verification and quotas as further RFC 8621-family modules
 
 ## License
 

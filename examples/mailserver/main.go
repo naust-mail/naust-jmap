@@ -77,6 +77,11 @@
 // rejected per recipient, exactly as a relay would report an unknown
 // mailbox. Point -relay at a real smarthost (with -relay-user, -relay-pass,
 // -relay-tls) to relay outbound instead.
+//
+// Read receipts (RFC 9007) are deliberately not wired: many deployments
+// treat disposition notifications as tracking and decline to answer them.
+// An embedder that wants them imports capabilities/mdn and registers it
+// per that module's README - three calls on the same seams used here.
 package main
 
 import (
