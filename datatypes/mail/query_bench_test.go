@@ -45,13 +45,13 @@ func benchEmailServer(b *testing.B) (*httptest.Server, *objectdb.DB, blob.Store,
 	store := kvstore.New(memory.New())
 	p := runtime.NewProcessor()
 	core := runtime.DefaultCoreCapabilities()
-	if err := RegisterMailbox(p, db, core); err != nil {
+	if err := RegisterMailbox(p, MailboxConfig{DB: db, Core: core}); err != nil {
 		b.Fatal(err)
 	}
-	if err := RegisterThread(p, db, core); err != nil {
+	if err := RegisterThread(p, ThreadConfig{DB: db, Core: core}); err != nil {
 		b.Fatal(err)
 	}
-	if err := RegisterEmail(p, db, store, core, DefaultAccountCapability(), search.New(store)); err != nil {
+	if err := RegisterEmail(p, EmailConfig{DB: db, Store: store, Core: core, AccountCapability: DefaultAccountCapability(), Searcher: search.New(store)}); err != nil {
 		b.Fatal(err)
 	}
 	srv, err := runtime.NewServer(a, p, "https://jmap.example.com", core)

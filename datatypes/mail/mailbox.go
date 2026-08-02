@@ -56,11 +56,24 @@ func mailboxType() *descriptor.Type {
 	}
 }
 
+// MailboxConfig configures RegisterMailbox.
+type MailboxConfig struct {
+	// DB is the object database Mailbox records live in. Required.
+	DB *objectdb.DB
+	// Core is the RFC 8620 capability object whose limits the derived
+	// methods enforce.
+	Core jmap.CoreCapabilities
+}
+
 // RegisterMailbox registers the Mailbox type and its RFC 8621 method
 // extensions. The embedder must also register CapabilityURI on the
 // server: session value an empty object, account value an
 // AccountCapability.
-func RegisterMailbox(p *runtime.Processor, db *objectdb.DB, core jmap.CoreCapabilities) error {
+func RegisterMailbox(p *runtime.Processor, cfg MailboxConfig) error {
+	if cfg.DB == nil {
+		return errors.New("mail: RegisterMailbox: MailboxConfig missing required field: DB")
+	}
+	db, core := cfg.DB, cfg.Core
 	ext := &runtime.Extensions{
 		// Mailbox has no /copy: RFC 8621 defines cross-account copy only
 		// for Email (section 2 lists get/changes/query/queryChanges/set).

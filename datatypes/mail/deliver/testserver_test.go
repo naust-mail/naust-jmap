@@ -126,23 +126,23 @@ func newEmailServer(t *testing.T, acctCap mail.AccountCapability) (*httptest.Ser
 	policy := mail.NewStaticSendPolicy()
 	policy.Allow(testAccount, "john@example.com", "*@corp.example")
 	fake := &fakeSubmitter{}
-	if err := mail.RegisterMailbox(p, db, core); err != nil {
+	if err := mail.RegisterMailbox(p, mail.MailboxConfig{DB: db, Core: core}); err != nil {
 		t.Fatal(err)
 	}
-	if err := mail.RegisterThread(p, db, core); err != nil {
+	if err := mail.RegisterThread(p, mail.ThreadConfig{DB: db, Core: core}); err != nil {
 		t.Fatal(err)
 	}
-	if err := mail.RegisterEmail(p, db, store, core, acctCap, search.New(store)); err != nil {
+	if err := mail.RegisterEmail(p, mail.EmailConfig{DB: db, Store: store, Core: core, AccountCapability: acctCap, Searcher: search.New(store)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := mail.RegisterIdentity(p, db, policy, core); err != nil {
+	if err := mail.RegisterIdentity(p, mail.IdentityConfig{DB: db, Core: core, Policy: policy}); err != nil {
 		t.Fatal(err)
 	}
-	q, err := submit.Register(p, db, store, core, policy, submit.DefaultLimits())
+	q, err := submit.Register(p, submit.Config{DB: db, Store: store, Core: core, Policy: policy, Limits: nil})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := mail.RegisterVacationResponse(p, db); err != nil {
+	if err := mail.RegisterVacationResponse(p, mail.VacationResponseConfig{DB: db}); err != nil {
 		t.Fatal(err)
 	}
 	w, err := submit.NewWorker(q, fake, submit.WorkerConfig{})

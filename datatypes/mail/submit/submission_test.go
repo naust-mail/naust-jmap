@@ -59,19 +59,19 @@ func newSubmissionServer(t *testing.T, limits Limits) (*httptest.Server, *object
 	core := runtime.DefaultCoreCapabilities()
 	policy := &submissionPolicy{StaticSendPolicy: mail.NewStaticSendPolicy()}
 	policy.Allow(testAccount, "john@example.com", "*@corp.example")
-	if err := mail.RegisterMailbox(p, db, core); err != nil {
+	if err := mail.RegisterMailbox(p, mail.MailboxConfig{DB: db, Core: core}); err != nil {
 		t.Fatal(err)
 	}
-	if err := mail.RegisterThread(p, db, core); err != nil {
+	if err := mail.RegisterThread(p, mail.ThreadConfig{DB: db, Core: core}); err != nil {
 		t.Fatal(err)
 	}
-	if err := mail.RegisterEmail(p, db, store, core, mail.DefaultAccountCapability(), search.New(store)); err != nil {
+	if err := mail.RegisterEmail(p, mail.EmailConfig{DB: db, Store: store, Core: core, AccountCapability: mail.DefaultAccountCapability(), Searcher: search.New(store)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := mail.RegisterIdentity(p, db, policy, core); err != nil {
+	if err := mail.RegisterIdentity(p, mail.IdentityConfig{DB: db, Core: core, Policy: policy}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Register(p, db, store, core, policy, limits); err != nil {
+	if _, err := Register(p, Config{DB: db, Store: store, Core: core, Policy: policy, Limits: &limits}); err != nil {
 		t.Fatal(err)
 	}
 	srv, err := runtime.NewServer(a, p, "https://jmap.example.com", core)

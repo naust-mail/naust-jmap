@@ -176,15 +176,21 @@ and submission are their own packages, `datatypes/mail/deliver` and
 `datatypes/mail/submit`, imported only when you need them:
 
 ```go
-// Register the five RFC 8621 (mail) types. RegisterEmail takes its search
-// implementation explicitly - here the built-in substring search.
-mail.RegisterMailbox(proc, db, core)
-mail.RegisterThread(proc, db, core)
-mail.RegisterEmail(proc, db, blobs, core, mail.DefaultAccountCapability(), search.New(blobs))
-mail.RegisterIdentity(proc, db, policy, core)
+// Register the five RFC 8621 (mail) types. Each takes a config struct;
+// RegisterEmail takes its search implementation explicitly - here the
+// built-in substring search.
+mail.RegisterMailbox(proc, mail.MailboxConfig{DB: db, Core: core})
+mail.RegisterThread(proc, mail.ThreadConfig{DB: db, Core: core})
+mail.RegisterEmail(proc, mail.EmailConfig{
+    DB: db, Store: blobs, Core: core,
+    AccountCapability: mail.DefaultAccountCapability(),
+    Searcher:          search.New(blobs),
+})
+mail.RegisterIdentity(proc, mail.IdentityConfig{DB: db, Core: core, Policy: policy})
 
 // submit.Register returns the submission queue a sending worker reads.
-queue, _ := submit.Register(proc, db, blobs, core, policy, submit.DefaultLimits())
+// A nil Limits means submit.DefaultLimits().
+queue, _ := submit.Register(proc, submit.Config{DB: db, Store: blobs, Core: core, Policy: policy})
 ```
 
 Full file: [`examples/mailserver`](examples/mailserver), which also wires LMTP

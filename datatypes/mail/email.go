@@ -2,7 +2,8 @@ package mail
 
 import (
 	"encoding/json"
-	"errors"
+	"fmt"
+	"strings"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
 	"github.com/naust-mail/naust-jmap/core/jmap"
@@ -97,42 +98,74 @@ var emailDefaultGetProperties = []string{
 	"preview", "bodyValues", "textBody", "htmlBody", "attachments",
 }
 
-// EmailOption configures RegisterEmail.
-type EmailOption func(*emailmethods.GenConfig)
-
-// WithMessageIDDomain sets the domain synthesized Message-IDs are scoped
-// to when a creation omits one (RFC 5322 section 3.6.4) - conventionally
-// the host's mail name, the same value an ingest greeting would use.
-// Without it, the domain falls back to the creation's From address, then
-// "localhost".
-func WithMessageIDDomain(domain string) EmailOption {
-	return func(c *emailmethods.GenConfig) { c.MsgIDDomain = domain }
+// EmailConfig configures RegisterEmail.
+type EmailConfig struct {
+	// DB is the object database Email records live in. Required.
+	DB *objectdb.DB
+	// Store is where message blobs live; the Email/get computed resolver
+	// reads it to derive body properties on demand. Required.
+	Store blob.Store
+	// Core is the RFC 8620 capability object whose limits the derived
+	// methods enforce.
+	Core jmap.CoreCapabilities
+	// AccountCapability supplies the enforced mail limits, which MUST
+	// match the AccountCapability advertised for the account so the wire
+	// never promises what the server does not enforce.
+	AccountCapability AccountCapability
+	// Searcher is the text-search socket (RFC 8621 section 4.4.1 text
+	// conditions and section 5 snippets). Required, since the built-in
+	// substring implementation (datatypes/mail/search) is a separate
+	// package a host chooses to import rather than a default this package
+	// can fall back to; pass search.New(blobs) for it.
+	Searcher Searcher
+	// MessageIDDomain is the domain synthesized Message-IDs are scoped
+	// to when a creation omits one (RFC 5322 section 3.6.4) -
+	// conventionally the host's mail name, the same value an ingest
+	// greeting would use. Empty falls back to the creation's From
+	// address, then "localhost".
+	MessageIDDomain string
+	// InternalProperties declares additional stored properties on the
+	// Email record for packages built on this one. Each is forced
+	// Internal: never on the wire, invisible to clients, writable only
+	// through objectdb's internal-write path. A name colliding with an
+	// Email property is a registration error.
+	InternalProperties map[string]descriptor.Property
 }
 
 // RegisterEmail registers the Email type, its method extensions, and
-// SearchSnippet/get. store is where message blobs live; the Email/get computed
-// resolver reads it to derive body properties on demand. cap supplies the
-// enforced limits, which MUST match the AccountCapability advertised for the
-// account so the wire never promises what the server does not enforce.
-// searcher is the text-search socket (RFC 8621 section 4.4.1 text conditions
-// and section 5 snippets); it is required, since the built-in substring
-// implementation (datatypes/mail/search) is a separate package a host
-// chooses to import rather than a default this package can fall back to.
+// SearchSnippet/get.
 //
 // The Email method implementation (get/query/create/copy/import/parse/
 // generation) lives in internal/emailmethods; this function's job is
 // wiring those hooks onto the descriptor and the runtime, not implementing
 // them.
-func RegisterEmail(p *runtime.Processor, db *objectdb.DB, store blob.Store, core jmap.CoreCapabilities, acctCap AccountCapability, searcher Searcher, opts ...EmailOption) error {
-	if searcher == nil {
-		return errors.New("mail: RegisterEmail: nil Searcher (pass search.New(blobs) for the built-in substring searcher)")
+func RegisterEmail(p *runtime.Processor, cfg EmailConfig) error {
+	var missing []string
+	if cfg.DB == nil {
+		missing = append(missing, "DB")
 	}
-	var cfg emailmethods.GenConfig
-	for _, opt := range opts {
-		opt(&cfg)
+	if cfg.Store == nil {
+		missing = append(missing, "Store")
 	}
+	if cfg.Searcher == nil {
+		missing = append(missing, "Searcher")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("mail: RegisterEmail: EmailConfig missing required fields: %s", strings.Join(missing, ", "))
+	}
+	db, store, acctCap := cfg.DB, cfg.Store, cfg.AccountCapability
+	t := emailType()
+	for name, prop := range cfg.InternalProperties {
+		if _, exists := t.Properties[name]; exists {
+			return fmt.Errorf("mail: RegisterEmail: InternalProperties[%q] collides with an Email property", name)
+		}
+		prop.Internal = true
+		t.Properties[name] = prop
+	}
+	searcher := cfg.Searcher
+	gen := emailmethods.GenConfig{MsgIDDomain: cfg.MessageIDDomain}
 	mat := emailmethods.Materializer{DB: db, Store: store, MaxMailboxes: acctCap.MaxMailboxesPerEmail}
-	creator := emailmethods.EmailCreate{Mat: mat, Cfg: cfg, MaxAttachBytes: acctCap.MaxSizeAttachmentsPerEmail}
+	creator := emailmethods.EmailCreate{Mat: mat, Cfg: gen, MaxAttachBytes: acctCap.MaxSizeAttachmentsPerEmail}
 	ext := &runtime.Extensions{
 		// Email/copy is not derived: it is a cross-account ingest that must
 		// run threading, counters, and the mailboxIds invariant through the
@@ -160,7 +193,7 @@ func RegisterEmail(p *runtime.Processor, db *objectdb.DB, store blob.Store, core
 		// collapseThreads keyed on threadId.
 		Query: emailmethods.EmailQueryHooks(db, searcher),
 	}
-	if err := runtime.RegisterStandardTypeExt(p, db, emailType(), core, ext); err != nil {
+	if err := runtime.RegisterStandardTypeExt(p, db, t, cfg.Core, ext); err != nil {
 		return err
 	}
 	// EmailDelivery (RFC 8621 section 1.5) is registered as a method-less
@@ -171,14 +204,14 @@ func RegisterEmail(p *runtime.Processor, db *objectdb.DB, store blob.Store, core
 	}
 	// SearchSnippet/get (RFC 8621 section 5.1) is a custom method: SearchSnippet
 	// is not a stored type, so it is not derived from a descriptor.
-	p.Register("SearchSnippet/get", CapabilityURI, searchSnippet{db: db, searcher: searcher, core: core}.get)
+	p.Register("SearchSnippet/get", CapabilityURI, searchSnippet{db: db, searcher: searcher, core: cfg.Core}.get)
 	// Email/import (section 4.8), Email/copy (section 4.7), and Email/parse
 	// (section 4.9) are custom methods: import ingests an uploaded blob
 	// through the materialize seam, copy ingests another account's message
 	// through it, parse renders a blob as an Email without storing it.
-	p.Register("Email/import", CapabilityURI, emailmethods.EmailImport{Mat: mat, Core: core}.Handle)
-	p.Register("Email/copy", CapabilityURI, emailmethods.EmailCopy{Mat: mat, Proc: p, Core: core}.Handle)
-	p.Register("Email/parse", CapabilityURI, emailmethods.EmailParse{DB: db, Store: store, Core: core, EmailType: emailType()}.Handle)
+	p.Register("Email/import", CapabilityURI, emailmethods.EmailImport{Mat: mat, Core: cfg.Core}.Handle)
+	p.Register("Email/copy", CapabilityURI, emailmethods.EmailCopy{Mat: mat, Proc: p, Core: cfg.Core}.Handle)
+	p.Register("Email/parse", CapabilityURI, emailmethods.EmailParse{DB: db, Store: store, Core: cfg.Core, EmailType: t}.Handle)
 	return nil
 }
 

@@ -13,6 +13,7 @@ package submit
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -76,4 +77,35 @@ func (q *Queue) probe(ctx context.Context, acct jmap.Id) (time.Time, bool, error
 		return time.Time{}, false, nil
 	}
 	return due, true, nil
+}
+
+// EmailIDForMessageID resolves the Message-ID of a message this account
+// submitted to the Email the submission carried, via the indexed
+// messageId snapshot on EmailSubmission. It answers the reverse
+// correlation an inbound disposition or delivery report poses
+// (Original-Message-ID, RFC 8098 section 3.2.5). ok is false when no
+// submission matches, when more than one does (an ambiguous Message-ID
+// identifies nothing), or when the matching record vanished between
+// scan and read; false is an answer, not an error - a caller maps it
+// to a null correlation.
+func (q *Queue) EmailIDForMessageID(ctx context.Context, acct jmap.Id, messageID string) (jmap.Id, bool, error) {
+	ids, err := q.db.IdsWhereEqual(ctx, acct, record.TypeEmailSubmission, "messageId", record.MustJSON(messageID), 2)
+	if err != nil {
+		return "", false, err
+	}
+	if len(ids) != 1 {
+		return "", false, nil
+	}
+	rec, err := q.db.Get(ctx, acct, record.TypeEmailSubmission, ids[0])
+	if errors.Is(err, objectdb.ErrNotFound) {
+		return "", false, nil // destroyed between scan and read
+	}
+	if err != nil {
+		return "", false, err
+	}
+	var emailID jmap.Id
+	if json.Unmarshal(rec["emailId"], &emailID) != nil || emailID == "" {
+		return "", false, nil
+	}
+	return emailID, true, nil
 }

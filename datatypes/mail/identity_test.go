@@ -34,7 +34,7 @@ func identityServer(t *testing.T) *httptest.Server {
 	core := runtime.DefaultCoreCapabilities()
 	policy := NewStaticSendPolicy()
 	policy.Allow(testAccount, "joe@example.com", "*@corp.example")
-	if err := RegisterIdentity(p, db, policy, core); err != nil {
+	if err := RegisterIdentity(p, IdentityConfig{DB: db, Core: core, Policy: policy}); err != nil {
 		t.Fatal(err)
 	}
 	srv, err := runtime.NewServer(a, p, "https://jmap.example.com", core)

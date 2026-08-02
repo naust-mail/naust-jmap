@@ -13,6 +13,7 @@ package mail
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
@@ -41,9 +42,22 @@ func threadType() *descriptor.Type {
 	}
 }
 
+// ThreadConfig configures RegisterThread.
+type ThreadConfig struct {
+	// DB is the object database Thread records live in. Required.
+	DB *objectdb.DB
+	// Core is the RFC 8620 capability object whose limits the derived
+	// methods enforce.
+	Core jmap.CoreCapabilities
+}
+
 // RegisterThread registers the Thread type. It must be registered before
 // Email, whose delivery/import path creates Thread records.
-func RegisterThread(p *runtime.Processor, db *objectdb.DB, core jmap.CoreCapabilities) error {
+func RegisterThread(p *runtime.Processor, cfg ThreadConfig) error {
+	if cfg.DB == nil {
+		return errors.New("mail: RegisterThread: ThreadConfig missing required field: DB")
+	}
+	db, core := cfg.DB, cfg.Core
 	ext := &runtime.Extensions{
 		// Thread supports only Thread/get and Thread/changes (RFC 8621
 		// section 3); it has no set, copy, or query.

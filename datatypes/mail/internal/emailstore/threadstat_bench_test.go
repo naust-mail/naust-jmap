@@ -66,13 +66,13 @@ func benchDB(b *testing.B) (*objectdb.DB, blob.Store, jmap.Id) {
 	store := kvstore.New(be)
 	p := runtime.NewProcessor()
 	core := runtime.DefaultCoreCapabilities()
-	if err := mail.RegisterMailbox(p, db, core); err != nil {
+	if err := mail.RegisterMailbox(p, mail.MailboxConfig{DB: db, Core: core}); err != nil {
 		b.Fatal(err)
 	}
-	if err := mail.RegisterThread(p, db, core); err != nil {
+	if err := mail.RegisterThread(p, mail.ThreadConfig{DB: db, Core: core}); err != nil {
 		b.Fatal(err)
 	}
-	if err := mail.RegisterEmail(p, db, store, core, mail.DefaultAccountCapability(), search.New(store)); err != nil {
+	if err := mail.RegisterEmail(p, mail.EmailConfig{DB: db, Store: store, Core: core, AccountCapability: mail.DefaultAccountCapability(), Searcher: search.New(store)}); err != nil {
 		b.Fatal(err)
 	}
 	var inbox jmap.Id

@@ -144,18 +144,43 @@ type FieldGroup []headerKV
 // ParseFieldGroups splits header-format content into groups of fields
 // separated by blank lines (the "*(field CRLF) CRLF" structure of RFC 3464
 // section 2.1), unfolding continuation lines (RFC 5322 section 2.2.3).
-// Fields whose lines carry no colon are skipped, not errors.
+// Fields whose lines carry no colon are skipped, not errors. An unfolded
+// value is stored directly - the common case pays nothing extra - and a
+// field switches to Builder accumulation on its first fold line, so a
+// value folded across arbitrarily many lines still unfolds in linear
+// time rather than re-copying itself once per fold.
 func ParseFieldGroups(raw []byte) []FieldGroup {
 	var groups []FieldGroup
 	var cur FieldGroup
+	var val strings.Builder
+	folding := false // the last field's value is accumulating in val
+	flushField := func() {
+		if folding {
+			cur[len(cur)-1].value = val.String()
+			val.Reset()
+			folding = false
+		}
+	}
 	flushGroup := func() {
+		flushField()
 		if len(cur) > 0 {
 			groups = append(groups, cur)
 			cur = nil
 		}
 	}
-	lines := bytes.Split(raw, []byte("\n"))
-	for _, line := range lines {
+	// Lines are walked in place rather than materialized with
+	// bytes.Split: the split's per-line slice headers would allocate a
+	// multiple of the input for degenerate tiny-line content, for a
+	// table this loop reads exactly once.
+	for start, last := 0, false; !last; {
+		var line []byte
+		if i := bytes.IndexByte(raw[start:], '\n'); i >= 0 {
+			line = raw[start : start+i]
+			start += i + 1
+		} else {
+			line = raw[start:]
+			last = true
+		}
 		line = bytes.TrimSuffix(line, []byte("\r"))
 		if len(line) == 0 {
 			flushGroup()
@@ -163,7 +188,12 @@ func ParseFieldGroups(raw []byte) []FieldGroup {
 		}
 		if line[0] == ' ' || line[0] == '\t' {
 			if len(cur) > 0 { // folded continuation of the previous field
-				cur[len(cur)-1].value += " " + strings.TrimSpace(string(line))
+				if !folding {
+					val.WriteString(cur[len(cur)-1].value)
+					folding = true
+				}
+				val.WriteString(" ")
+				val.WriteString(strings.TrimSpace(string(line)))
 			}
 			continue
 		}
@@ -171,6 +201,7 @@ func ParseFieldGroups(raw []byte) []FieldGroup {
 		if !ok {
 			continue
 		}
+		flushField()
 		cur = append(cur, headerKV{name: strings.TrimSpace(name), value: strings.TrimSpace(value)})
 	}
 	flushGroup()

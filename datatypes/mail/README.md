@@ -62,7 +62,7 @@ go deliver.ServeLMTP(lmtpLn, d, "mx.example.com")   // behind an MTA
 mux.Handle("/ingest", deliver.NewHTTPIngest(d))     // or over plain HTTP
 
 // Outbound. Register returns the queue; the worker reads it.
-queue, _ := submit.Register(proc, db, blobs, core, policy, submit.DefaultLimits())
+queue, _ := submit.Register(proc, submit.Config{DB: db, Store: blobs, Core: core, Policy: policy})
 relay, _ := submit.NewSMTPRelay(submit.SMTPRelayConfig{Addr: "smarthost.example.com:587"})
 w, _ := submit.NewWorker(queue, relay, submit.WorkerConfig{})
 go w.Run(ctx)
@@ -86,6 +86,11 @@ actually calls, grouped by package and then by what you are trying to do.
 ### mail (root package)
 
 **Registering the types**
+
+Each `Register*` takes a config struct (`MailboxConfig`, `ThreadConfig`,
+`EmailConfig`, `IdentityConfig`, `VacationResponseConfig`, `submit.Config`):
+required dependencies are validated at registration with an error naming
+every missing field, optional ones are nil-able with documented defaults.
 
 | Symbol                                                                       | Kind  | What it is                                                                            |
 |--------------------------------------------------------------------------------|-------|--------------------------------------------------------------------------------------|
@@ -158,6 +163,7 @@ migration script)
 |--------------------------------------------------------------------------|------------------|-------------------------------------------------------------------------------------------|
 | `Register`                                                                | func             | Registers `EmailSubmission` and returns the `Queue`                                       |
 | `Queue`                                                                   | type             | The live queue view a `Worker` consumes; `Queue.Sender()` returns the server-side `Sender` |
+| `Queue.EmailIDForMessageID(ctx, acct, mid)`                               | method           | Resolves a sent message's Message-ID to its Email via the indexed submission snapshot      |
 | `NewWorker`, `WorkerConfig`, `WorkerStats`                                | func / type      | The worker that drains due submissions                                                    |
 | `Worker.Run(ctx)`                                                         | method           | Start sending. Blocks until the context is cancelled                                      |
 | `Worker.ProcessDue(ctx, limit)`                                           | method           | The manual crank: a queue flush, a pacer, a test                                          |
@@ -188,7 +194,7 @@ case-insensitive substring matching over stored fast fields and the
 on-demand parsed message blob (RFC 8621 section 4.4.1 leaves exact search
 semantics server-defined). It satisfies `mail.Searcher` structurally without
 importing the root package, so a host that wants real relevance can plug an
-index-backed `Searcher` of its own into `RegisterEmail`'s `searcher` argument
+index-backed `Searcher` of its own into `EmailConfig`'s `Searcher` field
 without this package in its build.
 
 ### report
@@ -201,8 +207,12 @@ correlation needs (`Inbound`, `ParseDeliveryStatus`, `ParseDispositionNotificati
 host does not call the parse side directly unless it is building its own
 correlation logic. The other half, `Write` and `Message`, generates a
 complete RFC 8098 MDN message from a `Message` value - the primitive a
-disposition-notification hook, or a future MDN/send handler, would call to
-answer a `Disposition-Notification-To` request.
+disposition-notification hook, or an MDN/send handler, would call to
+answer a `Disposition-Notification-To` request. Its inverse, `ParseMDN`,
+reads a complete MDN message back into a `ParsedMDN` carrying every
+notification field - the primitive an MDN/parse handler renders the RFC
+9007 MDN object from; recognition is strict and a non-MDN yields the
+distinguished `ErrNotMDN`.
 
 ## Concepts
 

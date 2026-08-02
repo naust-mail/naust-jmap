@@ -34,7 +34,7 @@ func mailServer(t *testing.T) (*httptest.Server, *objectdb.DB) {
 	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
 	p := runtime.NewProcessor()
 	p.VerifyQueryProjection()
-	if err := RegisterMailbox(p, db, runtime.DefaultCoreCapabilities()); err != nil {
+	if err := RegisterMailbox(p, MailboxConfig{DB: db, Core: runtime.DefaultCoreCapabilities()}); err != nil {
 		t.Fatal(err)
 	}
 	srv, err := runtime.NewServer(a, p, "https://jmap.example.com", runtime.DefaultCoreCapabilities())

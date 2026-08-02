@@ -13,6 +13,7 @@ package mail
 
 import (
 	"encoding/json"
+	"errors"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
 	"github.com/naust-mail/naust-jmap/core/jmap"
@@ -60,12 +61,27 @@ func identityType() *descriptor.Type {
 	}
 }
 
+// IdentityConfig configures RegisterIdentity.
+type IdentityConfig struct {
+	// DB is the object database Identity records live in. Required.
+	DB *objectdb.DB
+	// Core is the RFC 8620 capability object whose limits the derived
+	// methods enforce.
+	Core jmap.CoreCapabilities
+	// Policy gates which addresses the account may hold identities for.
+	// Nil installs an empty StaticSendPolicy, which denies everything -
+	// the safe default, so a server that serves identities must wire a
+	// policy with grants.
+	Policy SendPolicy
+}
+
 // RegisterIdentity registers the Identity type with its derived methods
-// (RFC 8621 sections 6.1-6.3). policy gates which addresses the account
-// may hold identities for; nil installs an empty StaticSendPolicy, which
-// denies everything - the safe default, so a server that serves
-// identities must wire a policy with grants.
-func RegisterIdentity(p *runtime.Processor, db *objectdb.DB, policy SendPolicy, core jmap.CoreCapabilities) error {
+// (RFC 8621 sections 6.1-6.3).
+func RegisterIdentity(p *runtime.Processor, cfg IdentityConfig) error {
+	if cfg.DB == nil {
+		return errors.New("mail: RegisterIdentity: IdentityConfig missing required field: DB")
+	}
+	db, core, policy := cfg.DB, cfg.Core, cfg.Policy
 	if policy == nil {
 		policy = NewStaticSendPolicy()
 	}

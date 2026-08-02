@@ -13,9 +13,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/naust-mail/naust-jmap/datatypes/mail"
+	"log/slog"
 	"sort"
+	"strings"
 	"time"
+
+	"github.com/naust-mail/naust-jmap/datatypes/mail"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
 	"github.com/naust-mail/naust-jmap/core/jmap"
@@ -85,6 +88,27 @@ func emailSubmissionType() *descriptor.Type {
 	}
 }
 
+// Config configures Register.
+type Config struct {
+	// DB is the object database submission records live in. Required.
+	DB *objectdb.DB
+	// Store is where message blobs live; a submission snapshots its
+	// message's blob there for the sending worker. Required.
+	Store blob.Store
+	// Core is the RFC 8620 capability object whose limits the derived
+	// methods enforce.
+	Core jmap.CoreCapabilities
+	// Policy gates sending. Nil installs the deny-everything
+	// StaticSendPolicy.
+	Policy mail.SendPolicy
+	// Limits are the enforced sending limits, applied verbatim, and MUST
+	// match the AccountCapability advertised for the account. Nil means
+	// DefaultLimits(). A set value is never second-guessed: zero
+	// MaxRecipients or MaxMessageBytes rejects every submission (logged
+	// once at registration), zero MaxDelayedSend disables delayed send.
+	Limits *Limits
+}
+
 // Register registers the EmailSubmission type with its
 // derived methods (RFC 8621 sections 7.1-7.5) and returns the
 // Queue: the live queue view a Worker consumes
@@ -92,14 +116,32 @@ func emailSubmissionType() *descriptor.Type {
 // the queue, so sending is wired by constructing and running a worker
 // over it - a host without one still queues records durably, and a
 // worker attached any time later resumes them from its startup pass.
-// policy gates
-// sending (nil installs the deny-everything StaticSendPolicy); limits
-// are enforced verbatim and MUST match the AccountCapability
-// advertised for the account. The Email and Identity types must be
-// registered on the same db (a submission resolves both).
-func Register(p *runtime.Processor, db *objectdb.DB, store blob.Store, core jmap.CoreCapabilities, policy mail.SendPolicy, limits Limits) (*Queue, error) {
+// The Email and Identity types must be registered on the same db (a
+// submission resolves both).
+func Register(p *runtime.Processor, cfg Config) (*Queue, error) {
+	var missingFields []string
+	if cfg.DB == nil {
+		missingFields = append(missingFields, "DB")
+	}
+	if cfg.Store == nil {
+		missingFields = append(missingFields, "Store")
+	}
+	if len(missingFields) > 0 {
+		return nil, fmt.Errorf("submit: Register: Config missing required fields: %s", strings.Join(missingFields, ", "))
+	}
+	db, store, core, policy := cfg.DB, cfg.Store, cfg.Core, cfg.Policy
 	if policy == nil {
 		policy = mail.NewStaticSendPolicy()
+	}
+	limits := DefaultLimits()
+	if cfg.Limits != nil {
+		limits = *cfg.Limits
+		if limits.MaxRecipients == 0 {
+			slog.Warn("naust-jmap: submit: Limits.MaxRecipients is 0; every submission will be rejected")
+		}
+		if limits.MaxMessageBytes == 0 {
+			slog.Warn("naust-jmap: submit: Limits.MaxMessageBytes is 0; every submission will be rejected")
+		}
 	}
 	// The internal SubmissionReport records (received DSNs/MDNs) live in the
 	// same db; no JMAP methods, so registered with the database only.

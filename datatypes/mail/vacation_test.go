@@ -33,7 +33,7 @@ func newVacationResponseServer(t *testing.T) *httptest.Server {
 	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
 	p := runtime.NewProcessor()
 	core := runtime.DefaultCoreCapabilities()
-	if err := RegisterVacationResponse(p, db); err != nil {
+	if err := RegisterVacationResponse(p, VacationResponseConfig{DB: db}); err != nil {
 		t.Fatal(err)
 	}
 	srv, err := runtime.NewServer(a, p, "https://jmap.example.com", core)

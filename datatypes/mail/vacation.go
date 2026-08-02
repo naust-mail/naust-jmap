@@ -16,6 +16,7 @@ package mail
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
@@ -60,12 +61,23 @@ func vacationResponseType() *descriptor.Type {
 // vacationWireProps is every property of the wire object, id excluded.
 var vacationWireProps = []string{"isEnabled", "fromDate", "toDate", "subject", "textBody", "htmlBody"}
 
+// VacationResponseConfig configures RegisterVacationResponse.
+type VacationResponseConfig struct {
+	// DB is the object database the VacationResponse singleton lives in.
+	// Required.
+	DB *objectdb.DB
+}
+
 // RegisterVacationResponse registers the VacationResponse type and its two
 // methods (RFC 8621 sections 8.1-8.2) on the processor. The embedder
 // advertises VacationCapabilityURI on its server for the type to be
 // callable; the delivery-side responder, and the suppression ledger it
 // owns, are registered separately (deliver.New with WithVacationResponder).
-func RegisterVacationResponse(p *runtime.Processor, db *objectdb.DB) error {
+func RegisterVacationResponse(p *runtime.Processor, cfg VacationResponseConfig) error {
+	if cfg.DB == nil {
+		return errors.New("mail: RegisterVacationResponse: VacationResponseConfig missing required field: DB")
+	}
+	db := cfg.DB
 	if err := db.RegisterType(vacationResponseType()); err != nil {
 		return err
 	}

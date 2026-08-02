@@ -108,19 +108,19 @@ func newWorkerServer(t *testing.T, limits Limits, wcfg WorkerConfig) (*httptest.
 	policy := &submissionPolicy{StaticSendPolicy: mail.NewStaticSendPolicy()}
 	policy.Allow(testAccount, "john@example.com", "*@corp.example")
 	fake := &fakeSubmitter{}
-	if err := mail.RegisterMailbox(p, db, core); err != nil {
+	if err := mail.RegisterMailbox(p, mail.MailboxConfig{DB: db, Core: core}); err != nil {
 		t.Fatal(err)
 	}
-	if err := mail.RegisterThread(p, db, core); err != nil {
+	if err := mail.RegisterThread(p, mail.ThreadConfig{DB: db, Core: core}); err != nil {
 		t.Fatal(err)
 	}
-	if err := mail.RegisterEmail(p, db, store, core, mail.DefaultAccountCapability(), search.New(store)); err != nil {
+	if err := mail.RegisterEmail(p, mail.EmailConfig{DB: db, Store: store, Core: core, AccountCapability: mail.DefaultAccountCapability(), Searcher: search.New(store)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := mail.RegisterIdentity(p, db, policy, core); err != nil {
+	if err := mail.RegisterIdentity(p, mail.IdentityConfig{DB: db, Core: core, Policy: policy}); err != nil {
 		t.Fatal(err)
 	}
-	q, err := Register(p, db, store, core, policy, limits)
+	q, err := Register(p, Config{DB: db, Store: store, Core: core, Policy: policy, Limits: &limits})
 	if err != nil {
 		t.Fatal(err)
 	}

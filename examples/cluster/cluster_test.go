@@ -186,20 +186,20 @@ func newInstance(t *testing.T, dsn string, accts []testAccount, cfg instanceConf
 	proc := runtime.NewProcessor()
 	core := runtime.DefaultCoreCapabilities()
 	acctCap := mail.DefaultAccountCapability()
-	if err := mail.RegisterMailbox(proc, db, core); err != nil {
+	if err := mail.RegisterMailbox(proc, mail.MailboxConfig{DB: db, Core: core}); err != nil {
 		t.Fatal(err)
 	}
-	if err := mail.RegisterThread(proc, db, core); err != nil {
+	if err := mail.RegisterThread(proc, mail.ThreadConfig{DB: db, Core: core}); err != nil {
 		t.Fatal(err)
 	}
-	if err := mail.RegisterEmail(proc, db, blobs, core, acctCap, search.New(blobs)); err != nil {
+	if err := mail.RegisterEmail(proc, mail.EmailConfig{DB: db, Store: blobs, Core: core, AccountCapability: acctCap, Searcher: search.New(blobs)}); err != nil {
 		t.Fatal(err)
 	}
 	limits := mailsubmit.DefaultLimits()
-	if err := mail.RegisterIdentity(proc, db, policy, core); err != nil {
+	if err := mail.RegisterIdentity(proc, mail.IdentityConfig{DB: db, Core: core, Policy: policy}); err != nil {
 		t.Fatal(err)
 	}
-	queue, err := mailsubmit.Register(proc, db, blobs, core, policy, limits)
+	queue, err := mailsubmit.Register(proc, mailsubmit.Config{DB: db, Store: blobs, Core: core, Policy: policy, Limits: &limits})
 	if err != nil {
 		t.Fatal(err)
 	}

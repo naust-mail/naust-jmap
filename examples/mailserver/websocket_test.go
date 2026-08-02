@@ -39,7 +39,7 @@ func TestWebSocketEndToEnd(t *testing.T) {
 
 	proc := runtime.NewProcessor()
 	core := runtime.DefaultCoreCapabilities()
-	if err := mail.RegisterMailbox(proc, db, core); err != nil {
+	if err := mail.RegisterMailbox(proc, mail.MailboxConfig{DB: db, Core: core}); err != nil {
 		t.Fatal(err)
 	}
 	srv, err := runtime.NewServer(users, proc, "http://mail.example.com", core)
