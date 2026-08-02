@@ -87,7 +87,7 @@ func submissionCount(t *testing.T, db *objectdb.DB) int {
 // live in the deliver package, unreachable from here).
 func newSenderServer(t *testing.T) (*httptest.Server, *objectdb.DB, blob.Store, *Queue, *Worker, *fakeSubmitter) {
 	t.Helper()
-	ts, db, store, w, fake, _ := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, _ := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	if err := db.RegisterType(&descriptor.Type{
 		Name:       record.TypeVacationNotified,
 		Capability: CapabilityURI,

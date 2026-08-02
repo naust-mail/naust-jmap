@@ -78,12 +78,21 @@ type SMTPRelayConfig struct {
 	// connection is refused unless AllowPlaintextAuth is also set.
 	Auth               *PlainAuth
 	AllowPlaintextAuth bool
-	// Hello is the EHLO name; empty means "localhost".
+	// Hello is the EHLO name. Required; DefaultSMTPRelayConfig sets
+	// "localhost".
 	Hello string
 	// Timeout bounds one Submit end to end - dial, TLS, AUTH, DATA
 	// upload, and the final reply share one absolute deadline. The
-	// deadline also caps at ctx's, whichever is sooner. Default 2m.
+	// deadline also caps at ctx's, whichever is sooner. Required;
+	// DefaultSMTPRelayConfig sets 2m.
 	Timeout time.Duration
+}
+
+// DefaultSMTPRelayConfig returns this package's default relay
+// configuration. Values in an SMTPRelayConfig are used verbatim -
+// start here and override; Addr always needs setting.
+func DefaultSMTPRelayConfig() SMTPRelayConfig {
+	return SMTPRelayConfig{Hello: "localhost", Timeout: 2 * time.Minute}
 }
 
 // SMTPRelay implements Submitter over one SMTP session per Submit call.
@@ -103,10 +112,16 @@ func NewSMTPRelay(cfg SMTPRelayConfig) (*SMTPRelay, error) {
 		return nil, errors.New("mail: refusing SASL PLAIN over a Plaintext connection; set AllowPlaintextAuth to permit it")
 	}
 	if cfg.Hello == "" {
-		cfg.Hello = "localhost"
+		return nil, errors.New("mail: SMTPRelay Hello is required (start from DefaultSMTPRelayConfig)")
+	}
+	// The EHLO name reaches the wire verbatim, under the same standard
+	// as every other caller-supplied command token (RFC 5321 section
+	// 4.1.1.1 allows only a domain or address literal there).
+	if !addr.TokenSafe(cfg.Hello) {
+		return nil, errors.New("mail: SMTPRelay Hello must be printable ASCII with no white space")
 	}
 	if cfg.Timeout <= 0 {
-		cfg.Timeout = 2 * time.Minute
+		return nil, errors.New("mail: SMTPRelay Timeout must be positive (start from DefaultSMTPRelayConfig)")
 	}
 	return &SMTPRelay{cfg: cfg}, nil
 }
@@ -370,7 +385,11 @@ func buildMailCmd(env Envelope, ext map[string]string, dsnOK bool) (string, erro
 	// addresses, but SMTPRelay is a public Submitter any caller can drive
 	// with a raw envelope, so an address with a smuggled CR/LF (or a
 	// framing-breaking angle bracket) never reaches tp.Cmd.
-	if !addr.WireSafe(env.MailFrom) {
+	// The null reverse-path is legal here (RFC 5321 section 4.1.1.2)
+	// and mandatory for auto-replies and reports (RFC 3834 section
+	// 3.1.6, RFC 8098 section 3): empty renders as MAIL FROM:<>. RCPT
+	// TO keeps its non-empty requirement.
+	if env.MailFrom != "" && !addr.WireSafe(env.MailFrom) {
 		return "", fmt.Errorf("mail: unsafe MAIL FROM address %q", env.MailFrom)
 	}
 	var b strings.Builder

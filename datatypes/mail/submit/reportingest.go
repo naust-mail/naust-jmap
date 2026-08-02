@@ -121,7 +121,7 @@ func loadReportRows(get func(string, jmap.Id) (objectdb.Object, error), index fu
 // a *Deliverer directly (its nouns are submission-side, not delivery-side).
 type IngestOptions struct {
 	// MessageIDFallback additionally correlates DSNs by the returned
-	// content's Message-ID (see WithMessageIDCorrelation).
+	// content's Message-ID (see deliver Config.MessageIDCorrelation).
 	MessageIDFallback bool
 }
 
@@ -265,7 +265,7 @@ func IngestReport(u *objectdb.Update, rep *report.Inbound, blobID jmap.Id, now t
 // 5.4), or an MDN's Original-Message-ID - RFC 8098 defines no envelope
 // identifier, so that is the only key an MDN can ever present. The DSN
 // Message-ID fallback (returned-content headers) is the weak key: enabled
-// only by WithMessageIDCorrelation, and never exact. An ambiguous
+// only by Config.MessageIDCorrelation, and never exact. An ambiguous
 // Message-ID (several submissions of the same message) matches nothing.
 func correlateSubmission(u *objectdb.Update, rep *report.Inbound, opts IngestOptions) (jmap.Id, objectdb.Object, bool, error) {
 	bySubmissionId := func(id jmap.Id) (objectdb.Object, error) {

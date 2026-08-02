@@ -48,7 +48,7 @@ type Event struct {
 	Outcome    mail.Outcome // the verdict (see Outcome)
 	Reason     string       // short human/log reason, for a bounce or a log line
 	Account    jmap.Id      // resolved account, set when a recipient resolves
-	EmailId    jmap.Id      // the created Email, set only when mail.Accepted (empty for a swallowed report, see WithReportIngestion)
+	EmailId    jmap.Id      // the created Email, set only when mail.Accepted (empty for a swallowed report, see Config.ReportIngestion)
 	BlobId     jmap.Id      // content-addressed blob id of the raw message
 	Size       int64        // octets of the raw message
 	ReceivedAt time.Time    // server receive time (the Email's receivedAt)
@@ -104,13 +104,13 @@ func (nopSink) Record(context.Context, []Event) {}
 // read, so a few slow senders could hold every slot and stall delivery for
 // everyone.
 
-// defaultMaxMessageSize is the raw-message ceiling, in octets, a Deliverer
-// accepts when the embedder passes no WithMaxMessageSize. It mirrors the JMAP
-// maxSizeUpload default (core runtime, 50_000_000 octets) so a message
-// delivered over LMTP and a blob imported via Email/import share one effective
-// ceiling - an imported blob was uploaded through that same-capped endpoint. It
-// mirrors a typical MTA message_size_limit too. An embedder that raises the
-// session's maxSizeUpload should raise this to match with WithMaxMessageSize.
+// defaultMaxMessageSize is the raw-message ceiling, in octets, DefaultConfig
+// carries. It mirrors the JMAP maxSizeUpload default (core runtime,
+// 50_000_000 octets) so a message delivered over LMTP and a blob imported via
+// Email/import share one effective ceiling - an imported blob was uploaded
+// through that same-capped endpoint. It mirrors a typical MTA
+// message_size_limit too. An embedder that raises the session's maxSizeUpload
+// should raise this to match.
 const defaultMaxMessageSize = 50_000_000
 
 // errNoInbox reports an account with no inbox role Mailbox: delivery cannot
@@ -125,69 +125,89 @@ type Deliverer struct {
 	resolver Resolver
 	sink     Sink
 	maxSize  int64
-	// reports enables DSN/MDN ingestion (WithReportIngestion): a delivered
-	// report that correlates with an EmailSubmission updates it. Requires
-	// RegisterEmailSubmission on the same db.
+	// reports enables DSN/MDN ingestion (Config.ReportIngestion): a
+	// delivered report that correlates with an EmailSubmission updates it.
+	// Requires RegisterEmailSubmission on the same db.
 	reports bool
 	// msgIDFallback additionally correlates DSNs by the returned content's
-	// Message-ID (WithMessageIDCorrelation).
+	// Message-ID (Config.MessageIDCorrelation).
 	msgIDFallback bool
-	// vacationQ, when set (WithVacationResponder), enables the RFC 3834
+	// vacationQ, when set (Config.VacationQueue), enables the RFC 3834
 	// auto-responder and names the queue its replies are submitted through.
 	vacationQ *submit.Queue
 }
 
-// Option configures a Deliverer.
-type Option func(*Deliverer)
+// Config is a Deliverer's construction-time configuration. Values are
+// used verbatim - start from DefaultConfig and override.
+type Config struct {
+	// MaxMessageSize caps the raw message size a Deliverer will accept,
+	// in octets. Applied verbatim: a zero cap rejects every message
+	// (logged once at construction). DefaultConfig sets the JMAP
+	// maxSizeUpload default, 50_000_000.
+	MaxMessageSize int64
 
-// WithMaxMessageSize caps the raw message size a Deliverer will accept.
-func WithMaxMessageSize(n int64) Option {
-	return func(d *Deliverer) { d.maxSize = n }
+	// Sink receives delivery outcomes. Nil discards them.
+	Sink Sink
+
+	// ReportIngestion makes delivery recognize inbound delivery status
+	// notifications (RFC 3464) and message disposition notifications
+	// (RFC 8098) and apply them to the EmailSubmission they report on:
+	// deliveryStatus is updated and the report becomes fetchable through
+	// dsnBlobIds/mdnBlobIds (RFC 8621 section 7). Only messages with the
+	// null envelope sender are considered (both formats require it),
+	// correlation is by the ENVID this server stamps on relay (the
+	// submission id) or, for MDNs, the Original-Message-ID. Uncorrelated
+	// reports are ordinary mail. Requires RegisterEmailSubmission on the
+	// same db.
+	ReportIngestion bool
+
+	// MessageIDCorrelation additionally correlates DSNs whose ENVID was
+	// lost in transit by the returned content's Message-ID. A report
+	// matched this way is recorded and shown but can never finalize
+	// deliveryStatus - a Message-ID is quotable by anyone who saw the
+	// message, so it proves less than the envelope ENVID does (RFC 3464
+	// section 4.1 warns DSNs are forgeable; the strong key stays the one
+	// this server itself stamped).
+	MessageIDCorrelation bool
+
+	// VacationQueue, when set, enables the delivery-side RFC 3834
+	// auto-responder, wired to the submission queue the replies are sent
+	// through (the value submit.Register returned;
+	// mail.RegisterVacationResponse must also be registered on the same
+	// db, it owns the configuration the responder reads). One field,
+	// because the responder IS the coupling of delivery to the send
+	// queue - without a queue there is nowhere spec-compliant to put a
+	// reply. New registers this responder's suppression ledger type when
+	// the field is set.
+	VacationQueue *submit.Queue
 }
 
-// WithSink installs a sink for delivery outcomes (default: discard).
-func WithSink(s Sink) Option {
-	return func(d *Deliverer) { d.sink = s }
-}
-
-// WithReportIngestion makes delivery recognize inbound delivery status
-// notifications (RFC 3464) and message disposition notifications (RFC 8098)
-// and apply them to the EmailSubmission they report on: deliveryStatus is
-// updated and the report becomes fetchable through dsnBlobIds/mdnBlobIds
-// (RFC 8621 section 7). Only messages with the null envelope sender are
-// considered (both formats require it), correlation is by the ENVID this
-// server stamps on relay (the submission id) or, for MDNs, the
-// Original-Message-ID. Uncorrelated reports are ordinary mail. Requires
-// RegisterEmailSubmission on the same db.
-func WithReportIngestion() Option {
-	return func(d *Deliverer) { d.reports = true }
-}
-
-// WithMessageIDCorrelation additionally correlates DSNs whose ENVID was
-// lost in transit by the returned content's Message-ID. A report matched
-// this way is recorded and shown but can never finalize deliveryStatus -
-// a Message-ID is quotable by anyone who saw the message, so it proves
-// less than the envelope ENVID does (RFC 3464 section 4.1 warns DSNs are
-// forgeable; the strong key stays the one this server itself stamped).
-func WithMessageIDCorrelation() Option {
-	return func(d *Deliverer) { d.msgIDFallback = true }
+// DefaultConfig returns this package's default delivery configuration.
+func DefaultConfig() Config {
+	return Config{MaxMessageSize: defaultMaxMessageSize}
 }
 
 // New builds a Deliverer. db is where Emails land, store holds the
 // raw-message blobs, and resolver maps recipients to accounts. The only
-// failure mode is WithVacationResponder: enabling the auto-responder
+// failure mode is Config.VacationQueue: enabling the auto-responder
 // registers its suppression ledger type on db, which can fail like any
 // other RegisterType call.
-func New(db *objectdb.DB, store blob.Store, resolver Resolver, opts ...Option) (*Deliverer, error) {
+func New(db *objectdb.DB, store blob.Store, resolver Resolver, cfg Config) (*Deliverer, error) {
 	d := &Deliverer{
-		db:       db,
-		store:    store,
-		resolver: resolver,
-		sink:     nopSink{},
-		maxSize:  defaultMaxMessageSize,
+		db:            db,
+		store:         store,
+		resolver:      resolver,
+		sink:          cfg.Sink,
+		maxSize:       cfg.MaxMessageSize,
+		reports:       cfg.ReportIngestion,
+		msgIDFallback: cfg.MessageIDCorrelation,
+		vacationQ:     cfg.VacationQueue,
 	}
-	for _, o := range opts {
-		o(d)
+	if d.sink == nil {
+		d.sink = nopSink{}
+	}
+	if d.maxSize <= 0 {
+		slog.Warn("naust-jmap: deliver: Config.MaxMessageSize is not positive; every message will be rejected")
 	}
 	if d.vacationQ != nil {
 		if err := db.RegisterType(vacationNotifiedType()); err != nil {
@@ -217,6 +237,26 @@ func (d *Deliverer) MaxMessageSize() int64 { return d.maxSize }
 // "panic"; a local processing failure is a 4yz transient outcome (the MTA
 // retries), which LMTP maps to 451.
 func (d *Deliverer) Deliver(ctx context.Context, env Envelope, r io.Reader) (events []Event) {
+	events, respond := d.deliverDeferred(ctx, env, r)
+	if respond != nil {
+		respond(ctx)
+	}
+	return events
+}
+
+// respondTimeout bounds the deferred auto-response work an ingest
+// adapter runs after answering its peer, so a stalled backend loses the
+// courtesy (RFC 3834 replies are best-effort) instead of pinning the
+// session or handler.
+const respondTimeout = 30 * time.Second
+
+// deliverDeferred is Deliver with the auto-response work handed back
+// instead of run: every verdict is settled and recorded when it returns,
+// and respond (nil when there is none) carries the RFC 3834 replies, so
+// an ingest adapter can answer its peer before any responder work runs.
+// respond isolates its own failures - it can be run on any context,
+// after any reply, and affect nothing about the delivery.
+func (d *Deliverer) deliverDeferred(ctx context.Context, env Envelope, r io.Reader) (events []Event, respond func(context.Context)) {
 	events = make([]Event, len(env.Recipients))
 	for i, rcpt := range env.Recipients {
 		events[i] = Event{MailFrom: env.MailFrom, Recipient: rcpt}
@@ -230,15 +270,16 @@ func (d *Deliverer) Deliver(ctx context.Context, env Envelope, r io.Reader) (eve
 			slog.Error("naust-jmap delivery: recovered panic", "panic", p)
 		}
 	}()
-	d.deliver(ctx, env, r, events)
-	return events
+	respond = d.deliver(ctx, env, r, events)
+	return events, respond
 }
 
-// deliver is the delivery pipeline proper; Deliver wraps it in the panic
-// boundary above and owns the events slice, which deliver fills in place: each
-// entry already carries its MailFrom and Recipient and the safe default
-// verdict (mail.TempFailed).
-func (d *Deliverer) deliver(ctx context.Context, env Envelope, r io.Reader, events []Event) {
+// deliver is the delivery pipeline proper; deliverDeferred wraps it in the
+// panic boundary above and owns the events slice, which deliver fills in
+// place: each entry already carries its MailFrom and Recipient and the safe
+// default verdict (mail.TempFailed). The returned respond closure is the
+// pending auto-response work, nil when there is none.
+func (d *Deliverer) deliver(ctx context.Context, env Envelope, r io.Reader, events []Event) (respond func(context.Context)) {
 	// Resolve recipients first: an unknown recipient is rejected without
 	// the body ever being read (no wasted parse, no way to make the server
 	// buffer a message for an address it will refuse).
@@ -377,17 +418,36 @@ func (d *Deliverer) deliver(ctx context.Context, env Envelope, r io.Reader, even
 		}
 	}
 
-	// Auto-responses run after every verdict is settled: a reply is a
-	// consequence of a delivery, never a participant in it (RFC 8621
-	// section 8 delivers first, responds per RFC 3834 after). A swallowed
-	// report has no EmailId and gets no reply - an ingested DSN/MDN is
-	// automatic mail anyway, refused by the Auto-Submitted/null-sender
-	// gates.
-	if d.vacationQ != nil {
-		for _, t := range targets {
-			if ev := events[t.idx]; ev.Outcome == mail.Accepted && ev.EmailId != "" {
-				d.maybeVacationReply(ctx, t.account, ev.Recipient, env, msg, now)
+	// Auto-responses run after every verdict is settled AND answered: a
+	// reply is a consequence of a delivery, never a participant in it
+	// (RFC 8621 section 8 delivers first, responds per RFC 3834 after),
+	// so the work is handed back as a closure the adapter runs once its
+	// peer has its replies. A swallowed report has no EmailId and gets no
+	// reply - an ingested DSN/MDN is automatic mail anyway, refused by
+	// the Auto-Submitted/null-sender gates.
+	if d.vacationQ == nil {
+		return nil
+	}
+	var due []target
+	for _, t := range targets {
+		if ev := events[t.idx]; ev.Outcome == mail.Accepted && ev.EmailId != "" {
+			due = append(due, t)
+		}
+	}
+	if len(due) == 0 {
+		return nil
+	}
+	return func(ctx context.Context) {
+		// The closure runs outside deliverDeferred's panic boundary;
+		// a courtesy may fail any way it likes without taking the
+		// adapter's session down.
+		defer func() {
+			if p := recover(); p != nil {
+				slog.Error("naust-jmap vacation: recovered panic", "panic", p)
 			}
+		}()
+		for _, t := range due {
+			d.maybeVacationReply(ctx, t.account, events[t.idx].Recipient, env, msg, now)
 		}
 	}
 }

@@ -5,6 +5,7 @@ package deliver
 // command sequencing / hostile-input cases.
 
 import (
+	"context"
 	"io"
 	"net"
 	"net/textproto"
@@ -20,7 +21,7 @@ import (
 func lmtpDial(t *testing.T, d *Deliverer, hostname string) (*textproto.Conn, func()) {
 	t.Helper()
 	cli, srv := net.Pipe()
-	go serveLMTPConn(srv, d, hostname)
+	go serveLMTPConn(context.Background(), srv, d, hostname)
 	c := textproto.NewConn(cli)
 	if code, _ := readReply(t, c); code != 220 {
 		t.Fatalf("greeting code = %d, want 220", code)
@@ -64,11 +65,11 @@ func wantCode(t *testing.T, c *textproto.Conn, line string, want int) {
 
 // lmtpDeliverer builds a Deliverer over a fresh server with an inbox in
 // testAccount and the given recipient->account resolver.
-func lmtpDeliverer(t *testing.T, resolver mapResolver, opts ...Option) *Deliverer {
+func lmtpDeliverer(t *testing.T, resolver mapResolver, cfg ...Config) *Deliverer {
 	t.Helper()
 	ts, db, store := emailServer(t)
 	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
-	return mustDeliverer(t, db, store, resolver, opts...)
+	return mustDeliverer(t, db, store, resolver, cfg...)
 }
 
 // TestLMTPConformanceDialogue reproduces the RFC 2033 section 4.2 example:
@@ -159,7 +160,7 @@ func TestLMTPSequencing(t *testing.T) {
 // TestLMTPSizeRejectedAtMail: a SIZE parameter over the limit is refused at
 // MAIL, before the body is ever sent.
 func TestLMTPSizeRejectedAtMail(t *testing.T) {
-	d := lmtpDeliverer(t, mapResolver{"a@foo.edu": testAccount}, WithMaxMessageSize(1024))
+	d := lmtpDeliverer(t, mapResolver{"a@foo.edu": testAccount}, Config{MaxMessageSize: 1024})
 	c, done := lmtpDial(t, d, "foo.edu")
 	defer done()
 
@@ -191,7 +192,7 @@ func TestLMTPDotStuffedBody(t *testing.T) {
 func TestLMTPBareLF(t *testing.T) {
 	d := lmtpDeliverer(t, mapResolver{"a@foo.edu": testAccount})
 	cli, srv := net.Pipe()
-	go serveLMTPConn(srv, d, "foo.edu")
+	go serveLMTPConn(context.Background(), srv, d, "foo.edu")
 	defer cli.Close()
 	c := textproto.NewConn(cli)
 
@@ -225,4 +226,32 @@ func replyHas(lines []string, token string) bool {
 		}
 	}
 	return false
+}
+
+// TestLMTPSessionShutdown: cancelling the session context makes an idle
+// session answer 421 and close (RFC 5321 3.8: fail with a reply, not a
+// bare drop) and refuses further commands.
+func TestLMTPSessionShutdown(t *testing.T) {
+	d := lmtpDeliverer(t, mapResolver{"a@foo.edu": testAccount})
+	ctx, cancel := context.WithCancel(context.Background())
+	cli, srv := net.Pipe()
+	go serveLMTPConn(ctx, srv, d, "foo.edu")
+	c := textproto.NewConn(cli)
+	defer c.Close()
+	if code, _ := readReply(t, c); code != 220 {
+		t.Fatalf("greeting code = %d, want 220", code)
+	}
+	if err := c.PrintfLine("LHLO bar.example"); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := readReply(t, c); code != 250 {
+		t.Fatalf("LHLO code = %d, want 250", code)
+	}
+	cancel()
+	if code, _ := readReply(t, c); code != 421 {
+		t.Fatalf("post-cancel reply = %d, want 421", code)
+	}
+	if _, err := c.ReadLine(); err == nil {
+		t.Error("connection still open after shutdown reply")
+	}
 }

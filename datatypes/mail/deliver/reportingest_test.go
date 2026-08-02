@@ -95,9 +95,9 @@ type reportHarness struct {
 }
 
 // newReportHarness relays one submission of msgWithID(mid) and returns the
-// harness plus the delivering side, with report ingestion enabled and any
-// extra options applied.
-func newReportHarness(t *testing.T, mid string, opts ...Option) *reportHarness {
+// harness plus the delivering side, with report ingestion enabled on top
+// of the optional config (at most one).
+func newReportHarness(t *testing.T, mid string, cfg ...Config) *reportHarness {
 	t.Helper()
 	ts, db, store, _, w, fake := newEmailServer(t, mail.DefaultAccountCapability())
 	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
@@ -114,8 +114,12 @@ func newReportHarness(t *testing.T, mid string, opts ...Option) *reportHarness {
 	if got := fake.call(0).env.MailParameters["ENVID"]; got == nil || *got != subId {
 		t.Fatalf("ENVID stamp = %v, want %q", got, subId)
 	}
-	d, err := New(db, store, mapResolver{"john@example.com": testAccount},
-		append([]Option{WithReportIngestion()}, opts...)...)
+	c := DefaultConfig()
+	if len(cfg) > 0 {
+		c = cfg[0]
+	}
+	c.ReportIngestion = true
+	d, err := New(db, store, mapResolver{"john@example.com": testAccount}, c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +293,7 @@ func TestReportIngestDSNForgery(t *testing.T) {
 	}
 }
 
-// TestReportIngestMessageIDFallback: without WithMessageIDCorrelation a
+// TestReportIngestMessageIDFallback: without Config.MessageIDCorrelation a
 // DSN with no ENVID is ordinary mail; with it, the returned content's
 // Message-ID pins the report and consumes the slot, but can never flip
 // delivered - the weak key must not finalize (RFC 3464 section 4.1).
@@ -303,7 +307,7 @@ func TestReportIngestMessageIDFallback(t *testing.T) {
 		t.Fatalf("fallback off pinned a report: %v", l)
 	}
 
-	on := newReportHarness(t, "fb2@example.com", WithMessageIDCorrelation())
+	on := newReportHarness(t, "fb2@example.com", Config{MaxMessageSize: defaultMaxMessageSize, MessageIDCorrelation: true})
 	ev = on.deliverReport(t, dsnFor("", "jane@remote.example", "failed", "5.1.1", "550 5.1.1 unknown", "fb2@example.com"))
 	if ev.EmailId == "" {
 		t.Fatalf("fallback-matched DSN should still reach the inbox: %+v", ev)

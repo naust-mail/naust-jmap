@@ -57,14 +57,16 @@ those two paths sit below the protocol, in `deliver` and `submit`:
 ```go
 // Inbound. One engine, two adapters; resolver is yours - it decides who a
 // recipient is and whether to accept them.
-d, _ := deliver.New(db, blobs, myResolver)
-go deliver.ServeLMTP(lmtpLn, d, "mx.example.com")   // behind an MTA
-mux.Handle("/ingest", deliver.NewHTTPIngest(d))     // or over plain HTTP
+d, _ := deliver.New(db, blobs, myResolver, deliver.DefaultConfig())
+go deliver.ServeLMTP(lmtpLn, d, "mx.example.com", deliver.DefaultLMTPConfig())
+mux.Handle("/ingest", deliver.NewHTTPIngest(d, deliver.DefaultHTTPIngestConfig()))
 
 // Outbound. Register returns the queue; the worker reads it.
 queue, _ := submit.Register(proc, submit.Config{DB: db, Store: blobs, Core: core, Policy: policy})
-relay, _ := submit.NewSMTPRelay(submit.SMTPRelayConfig{Addr: "smarthost.example.com:587"})
-w, _ := submit.NewWorker(queue, relay, submit.WorkerConfig{})
+rcfg := submit.DefaultSMTPRelayConfig()
+rcfg.Addr = "smarthost.example.com:587"
+relay, _ := submit.NewSMTPRelay(rcfg)
+w, _ := submit.NewWorker(queue, relay, submit.DefaultWorkerConfig())
 go w.Run(ctx)
 ```
 
@@ -148,6 +150,7 @@ migration script)
 | Symbol                                              | Kind             | What it is                                                                                                 |
 |-------------------------------------------------------|------------------|------------------------------------------------------------------------------------------------------------|
 | `New`                                                 | func             | Builds a `*Deliverer`, the transport-agnostic delivery engine                                             |
+| `Config`, `LMTPConfig`, `HTTPIngestConfig`            | type             | Construction configs; values verbatim - start from the matching `Default*Config()` and override                                             |
 | `Deliverer.Deliver(ctx, env, r)`                      | method           | Deliver one message. The method every adapter calls; returns one `Event` per recipient, never an error    |
 | `Deliverer.MaxMessageSize()`                          | method           | The configured cap, for an adapter that must reject early                                                 |
 | `ServeLMTP`                                           | func             | RFC 2033 LMTP server over a listener                                                                       |
@@ -181,7 +184,7 @@ migration script)
 **`Sender` - server-side sending.** `Queue.Sender()` returns a `*Sender`, the
 seam for mail a host originates itself rather than a JMAP client's
 `EmailSubmission/set` create: the vacation responder (`deliver`'s
-`WithVacationResponder`) is the shipped consumer, and a host's own hooks
+`Config.VacationQueue`) is the shipped consumer, and a host's own hooks
 (a welcome message, an automated notice) use it the same way. `Sender.Send`
 stores the message, files it under a mailbox role, and queues an
 `EmailSubmission`, all in one commit - with neither `SendPolicy` nor the
@@ -204,7 +207,7 @@ without this package in its build.
 a multipart/report container (RFC 6522) - into the few values submission
 correlation needs (`Inbound`, `ParseDeliveryStatus`, `ParseDispositionNotification`,
 `ParseFieldGroups`, `MessageIDFromHeaderBlock`). `deliver`'s
-`WithReportIngestion` and `submit`'s `IngestReport` use these internally; a
+`Config.ReportIngestion` and `submit`'s `IngestReport` use these internally; a
 host does not call the parse side directly unless it is building its own
 correlation logic. The other half, `Write` and `Message`, generates a
 complete RFC 8098 MDN message from a `Message` value - the primitive a
@@ -358,7 +361,7 @@ delivering a message both ways, and reading it back over JMAP. With no
 
 ## Status and compatibility
 
-Pre-release, tagged v0.3.1. Breaking changes may land in minor bumps until 1.0.
+Pre-release, tagged v0.3.2. Breaking changes may land in minor bumps until 1.0.
 Requires `core` v0.3.0 or later.
 
 Not yet implemented as separate datatype modules: S/MIME verification

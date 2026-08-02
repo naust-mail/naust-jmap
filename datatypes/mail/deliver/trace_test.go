@@ -102,7 +102,7 @@ func TestLMTPDeliveryStampsTrace(t *testing.T) {
 	ts, db, store := emailServer(t)
 	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
 	sink := &captureSink{}
-	d := mustDeliverer(t, db, store, mapResolver{"jane@example.com": testAccount}, WithSink(sink))
+	d := mustDeliverer(t, db, store, mapResolver{"jane@example.com": testAccount}, Config{MaxMessageSize: defaultMaxMessageSize, Sink: sink})
 
 	c, done := lmtpDial(t, d, "mx.example")
 	defer done()
@@ -145,14 +145,14 @@ func TestLMTPDeliveryStampsTrace(t *testing.T) {
 	}
 }
 
-// TestHTTPIngestStampsTrace: with WithIngestHostname the HTTP adapter stamps
+// TestHTTPIngestStampsTrace: with HTTPIngestConfig.Hostname the HTTP adapter stamps
 // a Received with the observed peer and no WITH clause (HTTP has no
 // registered protocol value); without it, Return-Path only.
 func TestHTTPIngestStampsTrace(t *testing.T) {
 	ts, db, store := emailServer(t)
 	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
 	sink := &captureSink{}
-	d := mustDeliverer(t, db, store, mapResolver{"jane@example.com": testAccount}, WithSink(sink))
+	d := mustDeliverer(t, db, store, mapResolver{"jane@example.com": testAccount}, Config{MaxMessageSize: defaultMaxMessageSize, Sink: sink})
 
 	deliver := func(h *HTTPIngest) string {
 		t.Helper()
@@ -175,12 +175,12 @@ func TestHTTPIngestStampsTrace(t *testing.T) {
 		return string(stored)
 	}
 
-	got := deliver(NewHTTPIngest(d, WithIngestHostname("mx.example")))
+	got := deliver(NewHTTPIngest(d, HTTPIngestConfig{MaxInFlight: defaultMaxIngestInFlight, Hostname: "mx.example"}))
 	if !strings.Contains(got, "Received: from [192.0.2.5] by mx.example; ") {
 		t.Fatalf("stamped ingest blob = %q", got[:min(len(got), 160)])
 	}
 
-	got = deliver(NewHTTPIngest(d))
+	got = deliver(NewHTTPIngest(d, DefaultHTTPIngestConfig()))
 	if strings.Contains(got, "Received:") || !strings.HasPrefix(got, "Return-Path: <joe@example.com>\r\n") {
 		t.Fatalf("unstamped ingest blob = %q", got[:min(len(got), 160)])
 	}

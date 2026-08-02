@@ -62,7 +62,7 @@ func TestDeliverHappyPath(t *testing.T) {
 	ts, db, store := emailServer(t)
 	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
 	sink := &captureSink{}
-	d := mustDeliverer(t, db, store, mapResolver{"jane@example.com": testAccount}, WithSink(sink))
+	d := mustDeliverer(t, db, store, mapResolver{"jane@example.com": testAccount}, Config{MaxMessageSize: defaultMaxMessageSize, Sink: sink})
 
 	evs := d.Deliver(context.Background(), deliveryEnv("joe@example.com", "jane@example.com"), strings.NewReader(simpleMessage))
 	if len(evs) != 1 {
@@ -156,7 +156,7 @@ func TestDeliverNoRecipientSkipsBody(t *testing.T) {
 func TestDeliverTooLarge(t *testing.T) {
 	ts, db, store := emailServer(t)
 	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
-	d := mustDeliverer(t, db, store, mapResolver{"jane@example.com": testAccount}, WithMaxMessageSize(16))
+	d := mustDeliverer(t, db, store, mapResolver{"jane@example.com": testAccount}, Config{MaxMessageSize: 16})
 
 	evs := d.Deliver(context.Background(), deliveryEnv("joe@example.com", "jane@example.com"), strings.NewReader(simpleMessage))
 	if len(evs) != 1 || evs[0].Outcome != mail.Rejected || evs[0].Reason != "message too large" {

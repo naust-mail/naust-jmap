@@ -31,7 +31,7 @@ func TestLMTPConnectionCeiling(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	go ServeLMTP(ln, d, "test.example", WithMaxLMTPConnections(1))
+	go ServeLMTP(ln, d, "test.example", LMTPConfig{MaxConnections: 1})
 
 	// The first connection takes the only slot, and keeps it: it is a sender in
 	// the middle of a session, which is exactly what a busy server is full of.
@@ -99,7 +99,7 @@ func readLMTPLine(t *testing.T, conn net.Conn) string {
 func TestHTTPIngestRecipientCeiling(t *testing.T) {
 	ts, db, store := emailServer(t)
 	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
-	h := NewHTTPIngest(mustDeliverer(t, db, store, mapResolver{"jane@example.com": testAccount}))
+	h := NewHTTPIngest(mustDeliverer(t, db, store, mapResolver{"jane@example.com": testAccount}), DefaultHTTPIngestConfig())
 
 	many := make([]string, maxRecipients+1)
 	for i := range many {
@@ -125,7 +125,7 @@ func TestHTTPIngestCeiling(t *testing.T) {
 	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
 	h := NewHTTPIngest(
 		mustDeliverer(t, db, store, mapResolver{"jane@example.com": testAccount}),
-		WithMaxIngestInFlight(1),
+		HTTPIngestConfig{MaxInFlight: 1},
 	)
 
 	// A sender whose message is still arriving holds the only slot. The write

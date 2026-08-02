@@ -34,7 +34,7 @@ func unparkSubmission(t *testing.T, db *objectdb.DB, id string, at time.Time) {
 // TestWorkerStatsSendFlow: a clean drain moves exactly the claim and
 // sweep counters - every failure-signal counter stays zero.
 func TestWorkerStatsSendFlow(t *testing.T) {
-	ts, db, store, w, _, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, _, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -60,7 +60,7 @@ func TestWorkerStatsSendFlow(t *testing.T) {
 // ClaimsReclaimed, and the leftover stamp - a full window in the past -
 // never reads as future-dated.
 func TestWorkerStatsReclaim(t *testing.T) {
-	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -94,7 +94,7 @@ func TestWorkerStatsReclaim(t *testing.T) {
 // future-stamp signal ticks ONLY there: the laggard observes future
 // stamps, the fast peer observes past ones (the inward framing).
 func TestWorkerStatsClaimLossAndSkew(t *testing.T) {
-	ts, db, store, wB, _, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, wB, _, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -104,7 +104,7 @@ func TestWorkerStatsClaimLossAndSkew(t *testing.T) {
 	ctx := context.Background()
 	clock.advance(time.Second)
 
-	wA, err := NewWorker(newSubmissionQueue(db, store), &fakeSubmitter{}, WorkerConfig{})
+	wA, err := NewWorker(newSubmissionQueue(db, store), &fakeSubmitter{}, DefaultWorkerConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestWorkerStatsClaimLossAndSkew(t *testing.T) {
 // work and wins none of it - the zero-progress shape (in the field the
 // same window is a peer claiming first).
 func TestWorkerStatsZeroProgress(t *testing.T) {
-	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)

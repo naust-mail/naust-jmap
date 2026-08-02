@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/naust-mail/naust-jmap/datatypes/mail"
 )
 
 // postIngest builds an ingest POST with the given envelope headers and body
@@ -43,7 +45,7 @@ func decodeResults(t *testing.T, rec *httptest.ResponseRecorder) []httpResult {
 func TestHTTPIngestHappyPath(t *testing.T) {
 	ts, db, store := emailServer(t)
 	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
-	h := NewHTTPIngest(mustDeliverer(t, db, store, mapResolver{"jane@example.com": testAccount}))
+	h := NewHTTPIngest(mustDeliverer(t, db, store, mapResolver{"jane@example.com": testAccount}), DefaultHTTPIngestConfig())
 
 	rec := postIngest(t, h, "joe@example.com", []string{"jane@example.com"}, simpleMessage)
 	if rec.Code != http.StatusOK {
@@ -64,7 +66,7 @@ func TestHTTPIngestHappyPath(t *testing.T) {
 func TestHTTPIngestMixedResults(t *testing.T) {
 	ts, db, store := emailServer(t)
 	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
-	h := NewHTTPIngest(mustDeliverer(t, db, store, mapResolver{"a@example.com": testAccount}))
+	h := NewHTTPIngest(mustDeliverer(t, db, store, mapResolver{"a@example.com": testAccount}), DefaultHTTPIngestConfig())
 
 	rec := postIngest(t, h, "s@example.com", []string{"a@example.com, ghost@example.com"}, simpleMessage)
 	if rec.Code != http.StatusOK {
@@ -84,7 +86,7 @@ func TestHTTPIngestMixedResults(t *testing.T) {
 func TestHTTPIngestDeclaredOversize(t *testing.T) {
 	ts, db, store := emailServer(t)
 	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
-	h := NewHTTPIngest(mustDeliverer(t, db, store, mapResolver{"jane@example.com": testAccount}, WithMaxMessageSize(16)))
+	h := NewHTTPIngest(mustDeliverer(t, db, store, mapResolver{"jane@example.com": testAccount}, Config{MaxMessageSize: 16}), DefaultHTTPIngestConfig())
 
 	req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(simpleMessage))
 	req.Header.Set(headerRcptTo, "jane@example.com")
@@ -100,7 +102,7 @@ func TestHTTPIngestDeclaredOversize(t *testing.T) {
 func TestHTTPIngestNoRecipient(t *testing.T) {
 	ts, db, store := emailServer(t)
 	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
-	h := NewHTTPIngest(mustDeliverer(t, db, store, mapResolver{}))
+	h := NewHTTPIngest(mustDeliverer(t, db, store, mapResolver{}), DefaultHTTPIngestConfig())
 
 	rec := postIngest(t, h, "s@example.com", nil, simpleMessage)
 	if rec.Code != http.StatusBadRequest {
@@ -113,7 +115,7 @@ func TestHTTPIngestNoRecipient(t *testing.T) {
 func TestHTTPIngestMethodNotAllowed(t *testing.T) {
 	ts, db, store := emailServer(t)
 	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
-	h := NewHTTPIngest(mustDeliverer(t, db, store, mapResolver{}))
+	h := NewHTTPIngest(mustDeliverer(t, db, store, mapResolver{}), DefaultHTTPIngestConfig())
 
 	req := httptest.NewRequest(http.MethodGet, "/ingest", nil)
 	rec := httptest.NewRecorder()
@@ -123,5 +125,28 @@ func TestHTTPIngestMethodNotAllowed(t *testing.T) {
 	}
 	if rec.Header().Get("Allow") != http.MethodPost {
 		t.Fatalf("Allow = %q, want POST", rec.Header().Get("Allow"))
+	}
+}
+
+// TestHTTPIngestVacationReply: the HTTP adapter runs the deferred
+// auto-response after writing its results, so a delivery for an
+// active-vacation recipient still queues the RFC 3834 reply.
+func TestHTTPIngestVacationReply(t *testing.T) {
+	ts, db, store, q, _, _ := newEmailServer(t, mail.DefaultAccountCapability())
+	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
+	createMailbox(t, ts, `{"name":"Sent","role":"sent"}`)
+	createIdentity(t, ts, "john@example.com")
+	enableVacation(t, ts, `,"textBody":"I am away."`)
+	h := NewHTTPIngest(mustDeliverer(t, db, store,
+		mapResolver{"john@example.com": testAccount}, Config{MaxMessageSize: defaultMaxMessageSize, VacationQueue: q}), DefaultHTTPIngestConfig())
+
+	raw := bodyMsg("visitor@remote.example", "john@example.com", "hi",
+		"are you around?", map[string]string{"Message-ID": "<http-vac-1@remote.example>"})
+	rec := postIngest(t, h, "visitor@remote.example", []string{"john@example.com"}, raw)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	if n := submissionCount(t, db); n != 1 {
+		t.Fatalf("queued replies = %d, want 1", n)
 	}
 }

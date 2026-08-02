@@ -90,6 +90,17 @@ func TestRelayAddressInjectionRejected(t *testing.T) {
 	if _, err := buildRcptCmd(Recipient{Email: "jane@remote.example"}, false); err != nil {
 		t.Errorf("buildRcptCmd rejected a valid address: %v", err)
 	}
+
+	// The null reverse-path builds MAIL FROM:<> (RFC 5321 section
+	// 4.1.1.2; auto-replies and reports depend on it), while an empty
+	// recipient stays refused - RCPT TO:<> has no legal reading.
+	cmd, err := buildMailCmd(Envelope{MailFrom: ""}, nil, false)
+	if err != nil || cmd != "MAIL FROM:<>" {
+		t.Errorf("null reverse-path = %q, %v; want MAIL FROM:<>", cmd, err)
+	}
+	if _, err := buildRcptCmd(Recipient{Email: ""}, false); err == nil {
+		t.Error("buildRcptCmd accepted an empty recipient")
+	}
 }
 
 // ptr returns a pointer to s, for the *string parameter values.

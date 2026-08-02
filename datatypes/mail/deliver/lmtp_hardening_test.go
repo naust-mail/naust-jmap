@@ -74,7 +74,7 @@ func TestLMTPControlCharAddressRejected(t *testing.T) {
 func TestLMTPCommandLineTooLong(t *testing.T) {
 	d := lmtpDeliverer(t, mapResolver{"a@foo.edu": testAccount})
 	cli, srv := net.Pipe()
-	go serveLMTPConn(srv, d, "foo.edu")
+	go serveLMTPConn(context.Background(), srv, d, "foo.edu")
 	defer cli.Close()
 	c := textproto.NewConn(cli)
 	readReply(t, c) // greeting
@@ -127,7 +127,7 @@ func TestLMTPRcptAttemptCap(t *testing.T) {
 	var calls int
 	d := mustDeliverer(t, db, store, countingResolver{&calls})
 	cli, srv := net.Pipe()
-	go serveLMTPConn(srv, d, "foo.edu")
+	go serveLMTPConn(context.Background(), srv, d, "foo.edu")
 	defer cli.Close()
 	c := textproto.NewConn(cli)
 	readReply(t, c) // greeting
@@ -151,9 +151,9 @@ func TestLMTPRcptAttemptCap(t *testing.T) {
 // rejected by Deliver, and the bounded drain abandons resync and closes the
 // connection rather than reading forever.
 func TestLMTPOversizeDrainCloses(t *testing.T) {
-	d := lmtpDeliverer(t, mapResolver{"a@foo.edu": testAccount}, WithMaxMessageSize(16))
+	d := lmtpDeliverer(t, mapResolver{"a@foo.edu": testAccount}, Config{MaxMessageSize: 16})
 	cli, srv := net.Pipe()
-	go serveLMTPConn(srv, d, "foo.edu")
+	go serveLMTPConn(context.Background(), srv, d, "foo.edu")
 	defer cli.Close()
 	c := textproto.NewConn(cli)
 	readReply(t, c) // greeting
@@ -182,7 +182,7 @@ func TestLMTPRcptPanicBackstop(t *testing.T) {
 	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
 	d := mustDeliverer(t, db, store, panicResolver{})
 	cli, srv := net.Pipe()
-	go serveLMTPConn(srv, d, "foo.edu")
+	go serveLMTPConn(context.Background(), srv, d, "foo.edu")
 	defer cli.Close()
 	c := textproto.NewConn(cli)
 	readReply(t, c) // greeting

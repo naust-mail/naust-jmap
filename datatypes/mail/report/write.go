@@ -26,6 +26,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -39,6 +41,74 @@ import (
 type Address struct {
 	Name  string
 	Email string
+}
+
+// GenericAddress is one generic-address of RFC 8098 sections 3.2.3 and
+// 3.2.4: the address-type label and the address it qualifies, carried
+// separately so the label a requester stated survives to the wire. An
+// empty Type means "rfc822". Write emits "type; addr" and accepts only
+// the labels it implements - see Validate.
+type GenericAddress struct {
+	Type string
+	Addr string
+}
+
+// label is the address-type Write emits: the stated one, or "rfc822".
+func (g GenericAddress) label() string {
+	if g.Type == "" {
+		return "rfc822"
+	}
+	return g.Type
+}
+
+// String renders the generic-address as it appears on the wire:
+// "type; addr", with rfc822 supplied when no type was stated.
+func (g GenericAddress) String() string {
+	return g.label() + "; " + g.Addr
+}
+
+// Validate reports whether the generic-address can appear in a
+// generated report. The label must be "rfc822" or "utf-8" (RFC 8098
+// section 3.2.4; RFC 6533 section 3), compared case-insensitively, and
+// the address must be a clean addr-spec token. A non-ASCII address is
+// refused by the half that carries it: a domain is named as needing its
+// IDNA A-label form (RFC 5890), which this package carries but does not
+// produce, and a local part as needing the internationalized report
+// format (message/global-disposition-notification, RFC 6533 section 5),
+// which Write does not generate.
+func (g GenericAddress) Validate() error {
+	switch t := strings.ToLower(g.Type); t {
+	case "", "rfc822", "utf-8":
+	default:
+		return fmt.Errorf("address-type %q is not supported (rfc822, utf-8)", g.Type)
+	}
+	if g.Addr == "" {
+		return errors.New("the address is empty")
+	}
+	// The two halves of an address fail for different reasons, and only
+	// one of them is a dead end. A non-ASCII domain has an ASCII form
+	// (the IDNA A-label, RFC 5890 section 2.3.2.1) that this server can
+	// carry today, so it is named as the fix; a non-ASCII local part
+	// has none - RFC 6530 section 6 records that the paired all-ASCII
+	// address of the experimental model was abandoned - so it needs the
+	// internationalized format itself. An address with no domain is
+	// treated as all local part.
+	at := strings.LastIndexByte(g.Addr, '@')
+	for i := 0; i < len(g.Addr); i++ {
+		if g.Addr[i] >= 0x80 {
+			if at >= 0 && i > at {
+				return errors.New("a non-ASCII domain must be given in its IDNA A-label form (RFC 5890); this server does not encode it for you")
+			}
+			return errors.New("a non-ASCII local part requires the internationalized report format (RFC 6533), which this server does not generate")
+		}
+		if g.Addr[i] <= 0x20 || g.Addr[i] == 0x7f {
+			return fmt.Errorf("address %q is not a usable addr-spec", g.Addr)
+		}
+	}
+	if strings.ContainsAny(g.Addr, ";<>") {
+		return fmt.Errorf("address %q is not a usable addr-spec", g.Addr)
+	}
+	return nil
 }
 
 // Disposition is the three grammar values of the Disposition field (RFC
@@ -89,11 +159,9 @@ type Message struct {
 	// omits the field, which section 3.2.1 permits and which has the
 	// better privacy properties.
 	ReportingUA string
-	// FinalRecipient is the recipient the MDN is issued for, as a bare
-	// generic-address (RFC 8098 section 3.2.4). Required. Write supplies
-	// the "rfc822" address-type; a value carrying its own type prefix is
-	// rejected.
-	FinalRecipient string
+	// FinalRecipient is the recipient the MDN is issued for (RFC 8098
+	// section 3.2.4). Required.
+	FinalRecipient GenericAddress
 	// OriginalMessageID is the Message-ID of the message being reported
 	// on, without angle brackets (RFC 8098 section 3.2.5). Empty omits the
 	// field, which section 3.2.5 requires when the original message
@@ -101,10 +169,10 @@ type Message struct {
 	// by, so a caller that has one should always set it.
 	OriginalMessageID string
 	// OriginalRecipient is the recipient address as the sender of the
-	// original message specified it, as a bare generic-address (RFC 8098
-	// section 3.2.3). Empty omits the field, which section 3.2.3 requires
-	// when no reliable original-recipient information exists.
-	OriginalRecipient string
+	// original message specified it (RFC 8098 section 3.2.3). A zero
+	// value omits the field, which section 3.2.3 requires when no
+	// reliable original-recipient information exists.
+	OriginalRecipient GenericAddress
 	// Disposition is the required Disposition field (RFC 8098 section
 	// 3.2.6).
 	Disposition Disposition
@@ -214,10 +282,10 @@ func (m Message) notificationContent() string {
 	if m.ReportingUA != "" {
 		field("Reporting-UA", m.ReportingUA)
 	}
-	if m.OriginalRecipient != "" {
-		field("Original-Recipient", "rfc822; "+m.OriginalRecipient)
+	if m.OriginalRecipient.Addr != "" {
+		field("Original-Recipient", m.OriginalRecipient.String())
 	}
-	field("Final-Recipient", "rfc822; "+m.FinalRecipient)
+	field("Final-Recipient", m.FinalRecipient.String())
 	if m.OriginalMessageID != "" {
 		field("Original-Message-ID", "<"+m.OriginalMessageID+">")
 	}

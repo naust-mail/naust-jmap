@@ -171,6 +171,14 @@ func (h *smarthost) session(t *testing.T, conn net.Conn, greet bool) {
 
 func strptr(s string) *string { return &s }
 
+// plainCfg is DefaultSMTPRelayConfig over a Plaintext smarthost at addr.
+func plainCfg(addr string) SMTPRelayConfig {
+	c := DefaultSMTPRelayConfig()
+	c.Addr = addr
+	c.Mode = Plaintext
+	return c
+}
+
 func relayFor(t *testing.T, cfg SMTPRelayConfig) *SMTPRelay {
 	t.Helper()
 	r, err := NewSMTPRelay(cfg)
@@ -197,7 +205,9 @@ func findCmd(t *testing.T, cmds []string, prefix string) string {
 func TestSMTPRelayFlow(t *testing.T) {
 	h := &smarthost{ext: []string{"DSN", "SIZE 100000"}}
 	addr := newSmarthost(t, h)
-	r := relayFor(t, SMTPRelayConfig{Addr: addr, Mode: Plaintext, Hello: "box.example"})
+	cfg := plainCfg(addr)
+	cfg.Hello = "box.example"
+	r := relayFor(t, cfg)
 
 	msg := "From: a@x\r\nTo: b@x\r\n\r\nline one\r\n.leading dot\r\n"
 	res, err := r.Submit(context.Background(), Envelope{
@@ -243,7 +253,7 @@ func TestSMTPRelayFlow(t *testing.T) {
 func TestSMTPRelayNoDSN(t *testing.T) {
 	h := &smarthost{}
 	addr := newSmarthost(t, h)
-	r := relayFor(t, SMTPRelayConfig{Addr: addr, Mode: Plaintext})
+	r := relayFor(t, plainCfg(addr))
 	_, err := r.Submit(context.Background(), Envelope{
 		MailFrom:       "john@example.com",
 		MailParameters: map[string]*string{"ENVID": strptr("x"), "RET": strptr("FULL"), "FOO": nil},
@@ -273,7 +283,7 @@ func TestSMTPRelayNoDSN(t *testing.T) {
 func TestSMTPRelayOrcptXtext(t *testing.T) {
 	h := &smarthost{ext: []string{"DSN"}}
 	addr := newSmarthost(t, h)
-	r := relayFor(t, SMTPRelayConfig{Addr: addr, Mode: Plaintext})
+	r := relayFor(t, plainCfg(addr))
 	_, err := r.Submit(context.Background(), Envelope{
 		MailFrom: "john@example.com",
 		Recipients: []Recipient{
@@ -303,7 +313,7 @@ func TestSMTPRelayPerRecipient(t *testing.T) {
 		}
 	}}
 	addr := newSmarthost(t, h)
-	r := relayFor(t, SMTPRelayConfig{Addr: addr, Mode: Plaintext})
+	r := relayFor(t, plainCfg(addr))
 	res, err := r.Submit(context.Background(), Envelope{
 		MailFrom: "john@example.com",
 		Recipients: []Recipient{
@@ -333,7 +343,7 @@ func TestSMTPRelayPerRecipient(t *testing.T) {
 func TestSMTPRelayAllRejected(t *testing.T) {
 	h := &smarthost{rcpt: func(string) string { return "550 5.1.1 no" }}
 	addr := newSmarthost(t, h)
-	r := relayFor(t, SMTPRelayConfig{Addr: addr, Mode: Plaintext})
+	r := relayFor(t, plainCfg(addr))
 	res, err := r.Submit(context.Background(), Envelope{
 		MailFrom:   "john@example.com",
 		Recipients: []Recipient{{Email: "a@x.example"}, {Email: "b@x.example"}},
@@ -361,7 +371,7 @@ func TestSMTPRelayAllRejected(t *testing.T) {
 func TestSMTPRelayDataRejected(t *testing.T) {
 	h := &smarthost{data: "554 5.6.0 content rejected"}
 	addr := newSmarthost(t, h)
-	r := relayFor(t, SMTPRelayConfig{Addr: addr, Mode: Plaintext})
+	r := relayFor(t, plainCfg(addr))
 	res, err := r.Submit(context.Background(), Envelope{
 		MailFrom:   "john@example.com",
 		Recipients: []Recipient{{Email: "a@x.example"}},
@@ -379,7 +389,7 @@ func TestSMTPRelayDataRejected(t *testing.T) {
 func TestSMTPRelaySizeFastFail(t *testing.T) {
 	h := &smarthost{ext: []string{"SIZE 10"}}
 	addr := newSmarthost(t, h)
-	r := relayFor(t, SMTPRelayConfig{Addr: addr, Mode: Plaintext})
+	r := relayFor(t, plainCfg(addr))
 	res, err := r.Submit(context.Background(), Envelope{
 		MailFrom:   "john@example.com",
 		Recipients: []Recipient{{Email: "a@x.example"}},
@@ -403,7 +413,7 @@ func TestSMTPRelaySizeFastFail(t *testing.T) {
 func TestSMTPRelayBadParamValue(t *testing.T) {
 	h := &smarthost{}
 	addr := newSmarthost(t, h)
-	r := relayFor(t, SMTPRelayConfig{Addr: addr, Mode: Plaintext})
+	r := relayFor(t, plainCfg(addr))
 	res, err := r.Submit(context.Background(), Envelope{
 		MailFrom:       "john@example.com",
 		MailParameters: map[string]*string{"FOO": strptr("has space")},
@@ -423,7 +433,9 @@ func TestSMTPRelayBadParamValue(t *testing.T) {
 func TestSMTPRelayRequireSTARTTLS(t *testing.T) {
 	h := &smarthost{} // no STARTTLS in EHLO
 	addr := newSmarthost(t, h)
-	r := relayFor(t, SMTPRelayConfig{Addr: addr})
+	cfg := DefaultSMTPRelayConfig()
+	cfg.Addr = addr
+	r := relayFor(t, cfg)
 	_, err := r.Submit(context.Background(), Envelope{
 		MailFrom:   "john@example.com",
 		Recipients: []Recipient{{Email: "a@x.example"}},
@@ -474,11 +486,11 @@ func TestSMTPRelaySTARTTLSAndAuth(t *testing.T) {
 	srvTLS, pool := selfSigned(t)
 	h := &smarthost{ext: []string{"STARTTLS", "AUTH PLAIN"}, tls: srvTLS}
 	addr := newSmarthost(t, h)
-	r := relayFor(t, SMTPRelayConfig{
-		Addr: addr,
-		TLS:  &tls.Config{RootCAs: pool, ServerName: "127.0.0.1"},
-		Auth: &PlainAuth{Username: "user", Password: "pass"},
-	})
+	cfg := DefaultSMTPRelayConfig()
+	cfg.Addr = addr
+	cfg.TLS = &tls.Config{RootCAs: pool, ServerName: "127.0.0.1"}
+	cfg.Auth = &PlainAuth{Username: "user", Password: "pass"}
+	r := relayFor(t, cfg)
 	res, err := r.Submit(context.Background(), Envelope{
 		MailFrom:   "john@example.com",
 		Recipients: []Recipient{{Email: "a@x.example"}},
@@ -518,11 +530,11 @@ func TestSMTPRelayImplicitTLS(t *testing.T) {
 	srvTLS, pool := selfSigned(t)
 	h := &smarthost{tls: srvTLS, implicitTLS: true}
 	addr := newSmarthost(t, h)
-	r := relayFor(t, SMTPRelayConfig{
-		Addr: addr,
-		Mode: ImplicitTLS,
-		TLS:  &tls.Config{RootCAs: pool, ServerName: "127.0.0.1"},
-	})
+	cfg := DefaultSMTPRelayConfig()
+	cfg.Addr = addr
+	cfg.Mode = ImplicitTLS
+	cfg.TLS = &tls.Config{RootCAs: pool, ServerName: "127.0.0.1"}
+	r := relayFor(t, cfg)
 	res, err := r.Submit(context.Background(), Envelope{
 		MailFrom:   "john@example.com",
 		Recipients: []Recipient{{Email: "a@x.example"}},
@@ -559,11 +571,34 @@ func TestSMTPRelayConfigValidation(t *testing.T) {
 	}); err == nil {
 		t.Error("PLAIN over Plaintext accepted without AllowPlaintextAuth")
 	}
-	if _, err := NewSMTPRelay(SMTPRelayConfig{
-		Addr: "127.0.0.1:25", Mode: Plaintext, Auth: &PlainAuth{Username: "u", Password: "p"},
-		AllowPlaintextAuth: true,
-	}); err != nil {
+	allowed := plainCfg("127.0.0.1:25")
+	allowed.Auth = &PlainAuth{Username: "u", Password: "p"}
+	allowed.AllowPlaintextAuth = true
+	if _, err := NewSMTPRelay(allowed); err != nil {
 		t.Errorf("explicit AllowPlaintextAuth rejected: %v", err)
+	}
+	for _, hello := range []string{"a\r\nMAIL FROM:<x@example.com>", "two words", "utf8é"} {
+		if _, err := NewSMTPRelay(SMTPRelayConfig{Addr: "127.0.0.1:25", Hello: hello}); err == nil {
+			t.Errorf("Hello %q accepted", hello)
+		}
+	}
+	named := DefaultSMTPRelayConfig()
+	named.Addr = "127.0.0.1:25"
+	named.Hello = "mx.example.com"
+	if _, err := NewSMTPRelay(named); err != nil {
+		t.Errorf("valid Hello rejected: %v", err)
+	}
+	noHello := DefaultSMTPRelayConfig()
+	noHello.Addr = "127.0.0.1:25"
+	noHello.Hello = ""
+	if _, err := NewSMTPRelay(noHello); err == nil {
+		t.Error("empty Hello accepted")
+	}
+	noTimeout := DefaultSMTPRelayConfig()
+	noTimeout.Addr = "127.0.0.1:25"
+	noTimeout.Timeout = 0
+	if _, err := NewSMTPRelay(noTimeout); err == nil {
+		t.Error("zero Timeout accepted")
 	}
 }
 
@@ -587,7 +622,11 @@ func TestSMTPRelayTLSConfig(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			r := relayFor(t, SMTPRelayConfig{Addr: "smarthost.example.com:587", Mode: c.mode, TLS: c.tls})
+			cfg := DefaultSMTPRelayConfig()
+			cfg.Addr = "smarthost.example.com:587"
+			cfg.Mode = c.mode
+			cfg.TLS = c.tls
+			r := relayFor(t, cfg)
 			got := r.tlsConfig()
 			if c.tls != nil {
 				if got != c.tls {

@@ -72,7 +72,7 @@ type VacationResponseConfig struct {
 // methods (RFC 8621 sections 8.1-8.2) on the processor. The embedder
 // advertises VacationCapabilityURI on its server for the type to be
 // callable; the delivery-side responder, and the suppression ledger it
-// owns, are registered separately (deliver.New with WithVacationResponder).
+// owns, are registered separately (deliver.New with Config.VacationQueue).
 func RegisterVacationResponse(p *runtime.Processor, cfg VacationResponseConfig) error {
 	if cfg.DB == nil {
 		return errors.New("mail: RegisterVacationResponse: VacationResponseConfig missing required field: DB")

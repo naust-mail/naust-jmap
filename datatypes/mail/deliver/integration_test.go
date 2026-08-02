@@ -49,7 +49,7 @@ func TestMailIntegrationEndToEnd(t *testing.T) {
 	root := bodyMsg("a@example.net", "john@example.com", "Project kickoff",
 		"Let us begin the project on Monday.",
 		map[string]string{"Message-ID": "<m1@example.net>"})
-	rec := postIngest(t, NewHTTPIngest(deliverer), "a@example.net", []string{"john@example.com"}, root)
+	rec := postIngest(t, NewHTTPIngest(deliverer, DefaultHTTPIngestConfig()), "a@example.net", []string{"john@example.com"}, root)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("ingest status = %d, want 200 (%s)", rec.Code, rec.Body.String())
 	}

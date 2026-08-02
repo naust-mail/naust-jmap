@@ -173,8 +173,19 @@ func encodePhrase(name string) []string {
 
 // FormatAddrSpec serializes one addr-spec, quoting the local part when it
 // is not a dot-atom. ok is false when the address cannot be represented in
-// a header: it is not printable ASCII or has an empty side (EAI addresses,
-// RFC 6532, are out of scope).
+// a header: it has an empty side, or it is not printable ASCII (EAI
+// addresses, RFC 6532, are out of scope).
+//
+// That is a scope decision, not a limit of this function. This package
+// generates RFC 5322 messages, not the RFC 6532 message/global form, so
+// a non-ASCII local part has nowhere legal to go. Lifting it means RFC
+// 6532 section 3.2 (atext extended with UTF8-non-ascii), section 3.3
+// (UTF-8 message-ids) and section 3.6 (encoded-words no longer
+// generated) together, plus a transport that negotiates SMTPUTF8 -
+// never this predicate alone, which would emit a quoted local part
+// isDotAtom rejects and RFC 6532 does not describe. A non-ASCII DOMAIN
+// is a separate case and works today: its IDNA A-label (RFC 5890) is
+// ASCII and passes here unchanged.
 func FormatAddrSpec(email string) (string, bool) {
 	at := strings.LastIndexByte(email, '@')
 	if at <= 0 || at == len(email)-1 || !isPrintableASCII(email) {

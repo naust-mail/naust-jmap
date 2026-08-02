@@ -66,7 +66,7 @@ func TestDeliveryOversizeIsRejectedAsItArrives(t *testing.T) {
 	const sent = 16 << 20
 	ts, db, _ := emailServer(t)
 	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
-	d := mustDeliverer(t, db, streamingStore{}, mapResolver{"jane@example.com": testAccount}, WithMaxMessageSize(limit))
+	d := mustDeliverer(t, db, streamingStore{}, mapResolver{"jane@example.com": testAccount}, Config{MaxMessageSize: limit})
 
 	w := testsupport.WatchHeap(testsupport.TextMessage("utf-8", testsupport.Filler(sent)))
 	evs := d.Deliver(context.Background(), deliveryEnv("joe@example.com", "jane@example.com"), w)

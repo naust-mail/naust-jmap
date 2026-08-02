@@ -6,9 +6,9 @@ package deliver
 // sequential A-then-B comparison, so each comparison here interleaves its
 // two variants message-by-message and reports the paired delta:
 //
-//   bare vs wired    - WithReportIngestion + WithVacationResponder with the
+//   bare vs wired    - ReportIngestion + VacationQueue with the
 //                      vacation record absent: the always-on overhead an
-//                      embedder pays for wiring the options (per accepted
+//                      embedder pays for wiring the config (per accepted
 //                      recipient: the RFC 3834 header gates plus one
 //                      vacation-config read)
 //   bare vs enabled  - vacation on, sender already suppressed: the
@@ -50,7 +50,7 @@ func TestZZProfileDeliveryOptions(t *testing.T) {
 	resolve := mapResolver{"john@example.com": testAccount}
 	bare := mustDeliverer(t, db, store, resolve)
 	wired := mustDeliverer(t, db, store, resolve,
-		WithReportIngestion(), WithVacationResponder(q))
+		Config{MaxMessageSize: defaultMaxMessageSize, ReportIngestion: true, VacationQueue: q})
 
 	env := deliveryEnv("joe@remote.example", "john@example.com")
 	seq := 0

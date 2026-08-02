@@ -32,14 +32,14 @@ func vacGet(t *testing.T, ts *httptest.Server, extra string) map[string]any {
 	return list[0].(map[string]any)
 }
 
-func vacSet(t *testing.T, ts *httptest.Server, args string) map[string]any {
+func vacSet(t testing.TB, ts *httptest.Server, args string) map[string]any {
 	t.Helper()
 	r := callMail(t, ts, inv("VacationResponse/set", fmt.Sprintf(`{"accountId":%q,%s}`, testAccount, args), "0"))
 	return methodArgs(t, r, 0, "VacationResponse/set")
 }
 
 // enableVacation turns the responder on with the given extra properties.
-func enableVacation(t *testing.T, ts *httptest.Server, extraProps string) {
+func enableVacation(t testing.TB, ts *httptest.Server, extraProps string) {
 	t.Helper()
 	res := vacSet(t, ts, `"update":{"singleton":{"isEnabled":true`+extraProps+`}}`)
 	if _, ok := res["updated"].(map[string]any)["singleton"]; !ok {
@@ -57,7 +57,7 @@ func newVacationDeliverer(t *testing.T, db *objectdb.DB, store blob.Store, q *su
 	return mustDeliverer(t, db, store, mapResolver{
 		"john@example.com": testAccount,
 		"jane@example.com": testAccount,
-	}, WithVacationResponder(q))
+	}, Config{MaxMessageSize: defaultMaxMessageSize, VacationQueue: q})
 }
 
 // vacationDeliver delivers raw for sender -> john@example.com through d.
@@ -249,4 +249,48 @@ func mustParse(t *testing.T, raw string) *parse.Parsed {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// TestVacationReplyDeferred: deliverDeferred settles and reports every
+// verdict with no reply created until the returned respond closure runs -
+// the adapter answers its peer before any responder work - and a
+// cancelled context loses the courtesy without failing anything.
+func TestVacationReplyDeferred(t *testing.T) {
+	ts, db, store, q, _, _ := newEmailServer(t, mail.DefaultAccountCapability())
+	createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
+	createMailbox(t, ts, `{"name":"Sent","role":"sent"}`)
+	createIdentity(t, ts, "john@example.com")
+	enableVacation(t, ts, `,"textBody":"I am away until August."`)
+	d := newVacationDeliverer(t, db, store, q)
+
+	events, respond := d.deliverDeferred(context.Background(),
+		deliveryEnv("visitor@remote.example", "john@example.com"), strings.NewReader(inboundMsg("")))
+	if events[0].Outcome != mail.Accepted {
+		t.Fatalf("delivery not accepted: %+v", events[0])
+	}
+	if respond == nil {
+		t.Fatal("no respond closure for an accepted delivery with vacation on")
+	}
+	if n := submissionCount(t, db); n != 0 {
+		t.Fatalf("submissions before respond = %d, want 0", n)
+	}
+	respond(context.Background())
+	if n := submissionCount(t, db); n != 1 {
+		t.Fatalf("submissions after respond = %d, want 1", n)
+	}
+
+	// A cancelled context: the delivery already succeeded, the courtesy is
+	// simply lost.
+	other := strings.ReplaceAll(inboundMsg(""), "visitor@remote.example", "other@remote.example")
+	events, respond = d.deliverDeferred(context.Background(),
+		deliveryEnv("other@remote.example", "john@example.com"), strings.NewReader(other))
+	if events[0].Outcome != mail.Accepted || respond == nil {
+		t.Fatalf("second delivery: %+v, respond nil=%v", events[0], respond == nil)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	respond(cancelled)
+	if n := submissionCount(t, db); n != 1 {
+		t.Fatalf("submissions after cancelled respond = %d, want 1", n)
+	}
 }

@@ -76,29 +76,46 @@ const (
 // this bound to match; see the kvstore package doc.
 const defaultMaxLMTPConns = 64
 
-// LMTPOption configures an LMTP server.
-type LMTPOption func(*lmtpConfig)
+// LMTPConfig is an LMTP server's configuration. Values are used
+// verbatim - start from DefaultLMTPConfig and override.
+type LMTPConfig struct {
+	// MaxConnections bounds how many LMTP connections are served at
+	// once. Applied verbatim: zero refuses every connection (logged
+	// once at startup); DefaultLMTPConfig sets 64. Beyond it a
+	// connection is answered with 421 and closed (RFC 5321 section
+	// 3.8: a server that cannot take the transaction says so and
+	// closes the channel, rather than dropping the TCP connection or
+	// accepting work it cannot do).
+	MaxConnections int
 
-type lmtpConfig struct{ maxConns int }
+	// SessionContext is the context every session runs under.
+	// Cancelling it aborts in-flight delivery work (its commits roll
+	// back and the sender sees 451, so the MTA retries), answers the
+	// next command with 421, and closes - the clean-shutdown path. The
+	// listener still governs accepting: close it to stop new
+	// connections. Nil means context.Background(), under which sessions
+	// are never interrupted.
+	SessionContext context.Context
+}
 
-// WithMaxLMTPConnections bounds how many LMTP connections are served at once.
-// Beyond it a connection is answered with 421 and closed (RFC 5321 section 3.8:
-// a server that cannot take the transaction says so and closes the channel,
-// rather than dropping the TCP connection or accepting work it cannot do).
-func WithMaxLMTPConnections(n int) LMTPOption {
-	return func(c *lmtpConfig) { c.maxConns = n }
+// DefaultLMTPConfig returns this package's default LMTP configuration.
+func DefaultLMTPConfig() LMTPConfig {
+	return LMTPConfig{MaxConnections: defaultMaxLMTPConns}
 }
 
 // ServeLMTP accepts connections on ln and serves LMTP on each until ln is
 // closed, returning the Accept error. hostname names this server in the
 // greeting and LHLO response. Each connection is handled in its own goroutine,
 // and no more than the connection limit are served at once.
-func ServeLMTP(ln net.Listener, d *Deliverer, hostname string, opts ...LMTPOption) error {
-	cfg := lmtpConfig{maxConns: defaultMaxLMTPConns}
-	for _, o := range opts {
-		o(&cfg)
+func ServeLMTP(ln net.Listener, d *Deliverer, hostname string, cfg LMTPConfig) error {
+	if cfg.MaxConnections <= 0 {
+		slog.Warn("naust-jmap lmtp: LMTPConfig.MaxConnections is not positive; every connection will be refused")
+		cfg.MaxConnections = 0
 	}
-	slots := make(chan struct{}, cfg.maxConns)
+	if cfg.SessionContext == nil {
+		cfg.SessionContext = context.Background()
+	}
+	slots := make(chan struct{}, cfg.MaxConnections)
 
 	var backoff time.Duration
 	for {
@@ -126,7 +143,7 @@ func ServeLMTP(ln net.Listener, d *Deliverer, hostname string, opts ...LMTPOptio
 		case slots <- struct{}{}:
 			go func() {
 				defer func() { <-slots }()
-				serveLMTPConn(conn, d, hostname)
+				serveLMTPConn(cfg.SessionContext, conn, d, hostname)
 			}()
 		default:
 			// At the ceiling: tell the sender to come back rather than serving a
@@ -140,8 +157,9 @@ func ServeLMTP(ln net.Listener, d *Deliverer, hostname string, opts ...LMTPOptio
 	}
 }
 
-// serveLMTPConn runs the command loop for one connection.
-func serveLMTPConn(conn net.Conn, d *Deliverer, hostname string) {
+// serveLMTPConn runs the command loop for one connection under ctx (see
+// LMTPConfig.SessionContext).
+func serveLMTPConn(ctx context.Context, conn net.Conn, d *Deliverer, hostname string) {
 	tp := textproto.NewConn(conn)
 	defer tp.Close()
 	// Connection-level panic backstop. Deliver has its own panic boundary at
@@ -155,16 +173,42 @@ func serveLMTPConn(conn net.Conn, d *Deliverer, hostname string) {
 			_ = tp.PrintfLine("421 4.3.0 %s service error, closing channel", hostname)
 		}
 	}()
-	s := &lmtpSession{d: d, hostname: hostname, conn: conn, tp: tp, ctx: context.Background()}
+	s := &lmtpSession{d: d, hostname: hostname, conn: conn, tp: tp, ctx: ctx}
+
+	// A cancellable session context needs its cancellation to reach a read
+	// blocked on the socket: an expired read deadline fails the read, and
+	// the loop below turns a cancelled context into 421 instead of retrying.
+	if done := ctx.Done(); done != nil {
+		stop := make(chan struct{})
+		defer close(stop)
+		go func() {
+			select {
+			case <-done:
+				_ = conn.SetReadDeadline(time.Now())
+			case <-stop:
+			}
+		}()
+	}
 
 	_ = tp.PrintfLine("220 %s LMTP server ready", hostname)
 	for {
+		// Shutdown answers with a reply rather than a bare drop (RFC 5321
+		// 3.8), checked before the deadline reset below re-arms the read.
+		if s.ctx.Err() != nil {
+			_ = tp.PrintfLine("421 4.3.2 %s shutting down, closing channel", hostname)
+			return
+		}
 		// Per-command idle deadline (RFC 5321 4.5.3.2.7: a server SHOULD wait at
 		// least 5 minutes for the next command), reset before each read so a
 		// connection that goes silent is reclaimed instead of pinned.
 		_ = conn.SetReadDeadline(time.Now().Add(lmtpCommandTimeout))
 		line, tooLong, err := readLimitedLine(tp.R, maxCommandLine)
 		if err != nil {
+			// A read failed by the cancellation watcher above is the
+			// shutdown path, not a peer failure; it still gets the reply.
+			if s.ctx.Err() != nil {
+				_ = tp.PrintfLine("421 4.3.2 %s shutting down, closing channel", hostname)
+			}
 			return // connection closed, read error, or idle timeout
 		}
 		if tooLong {
@@ -359,7 +403,7 @@ func (s *lmtpSession) data() bool {
 	// 4.4): the LHLO claim, the observed peer address, "LMTP" as the WITH
 	// value (IANA Mail Transmission Types, registered by RFC 2033), and this
 	// server's name for the BY clause.
-	events := s.d.Deliver(s.ctx, Envelope{
+	events, respond := s.d.deliverDeferred(s.ctx, Envelope{
 		MailFrom:   s.from,
 		Recipients: s.rcpts,
 		HeloName:   s.heloName,
@@ -385,6 +429,15 @@ func (s *lmtpSession) data() bool {
 		_ = s.tp.PrintfLine("%s", lmtpReply(ev))
 	}
 	s.resetTxn()
+	// Auto-responses run only after the peer has every reply line: they
+	// are a consequence of the delivery, never a participant in it, and
+	// the bound means a stalled backend loses a courtesy rather than the
+	// session.
+	if respond != nil {
+		rctx, cancel := context.WithTimeout(s.ctx, respondTimeout)
+		respond(rctx)
+		cancel()
+	}
 	return true
 }
 

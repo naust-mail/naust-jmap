@@ -71,13 +71,17 @@ import (
 	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/record"
 )
 
-// WorkerConfig tunes the sending worker. The zero value of
-// every field selects the documented default.
+// WorkerConfig tunes the sending worker. Values are used verbatim -
+// start from DefaultWorkerConfig and override; NewWorker refuses a
+// config with an empty schedule or a non-positive field.
 type WorkerConfig struct {
 	// RetrySchedule is the backoff after each temporarily failed
 	// attempt: attempt n reschedules RetrySchedule[n-1] later, and
-	// attempts beyond the schedule use RetryPlateau. Defaults: 1m, 5m,
-	// 15m, 1h, 4h, then every 8h.
+	// attempts beyond the schedule use RetryPlateau. Values are used
+	// verbatim - start from DefaultWorkerConfig (1m, 5m, 15m, 1h, 4h,
+	// then every 8h) and override; a config with an empty schedule or
+	// a non-positive field is refused at construction. A caller
+	// wanting plateau-only sets a single-entry schedule.
 	RetrySchedule []time.Duration
 	RetryPlateau  time.Duration
 	// GiveUpAfter bounds retrying: when a still-undelivered recipient's
@@ -86,7 +90,7 @@ type WorkerConfig struct {
 	// delivery is abandoned with a synthetic permanent failure - but
 	// never before MinAttempts real attempts, so a long worker outage
 	// gives stale mail a genuine burst of tries instead of an instant
-	// bounce. Defaults 48h, 3 attempts.
+	// bounce. DefaultWorkerConfig sets 48h and 3 attempts.
 	GiveUpAfter time.Duration
 	MinAttempts int
 	// ClaimWindow is how long a claim holds a record: on claim the due
@@ -99,14 +103,14 @@ type WorkerConfig struct {
 	// can reclaim each other's live claims (see the coordination model
 	// above), so it must dwarf worst-case skew - trivial under working
 	// NTP. It is also the recovery latency for a crashed worker's mail,
-	// so bigger is not free. Default 15m.
+	// so bigger is not free. DefaultWorkerConfig sets 15m.
 	ClaimWindow time.Duration
 	// TransmitTimeout bounds one transmission attempt end to end.
-	// Default 2m.
+	// DefaultWorkerConfig sets 2m.
 	TransmitTimeout time.Duration
 	// BatchSize caps how many records one account may claim per pass,
 	// which is also the fairness unit: accounts take turns in batches,
-	// so one flooded account cannot starve the rest. Default 16.
+	// so one flooded account cannot starve the rest. DefaultWorkerConfig sets 16.
 	BatchSize int
 	// QueueScanInterval is the reconciliation cadence: the worst-case
 	// delay (within scanJitter) before this worker picks up work whose
@@ -114,41 +118,59 @@ type WorkerConfig struct {
 	// no Notifier attached, or a dropped notification (see the
 	// coordination model above). Each sweep reads the queue tag's
 	// members and probes them, so its cost tracks accounts with actual
-	// queued work, near zero when idle. Default 1m.
+	// queued work, near zero when idle. DefaultWorkerConfig sets 1m.
 	QueueScanInterval time.Duration
 }
 
-func (c *WorkerConfig) applyDefaults() {
-	// An explicit empty (non-nil) slice is a config foot-gun - it would put
-	// every retry straight onto the plateau - so treat empty like unset and
-	// use the default schedule; a caller wanting plateau-only sets a
-	// single-entry schedule.
-	if len(c.RetrySchedule) == 0 {
-		c.RetrySchedule = []time.Duration{
+// DefaultWorkerConfig returns this package's default worker
+// configuration.
+func DefaultWorkerConfig() WorkerConfig {
+	return WorkerConfig{
+		RetrySchedule: []time.Duration{
 			time.Minute, 5 * time.Minute, 15 * time.Minute, time.Hour, 4 * time.Hour,
-		}
+		},
+		RetryPlateau:      8 * time.Hour,
+		GiveUpAfter:       48 * time.Hour,
+		MinAttempts:       3,
+		ClaimWindow:       15 * time.Minute,
+		TransmitTimeout:   2 * time.Minute,
+		BatchSize:         16,
+		QueueScanInterval: time.Minute,
+	}
+}
+
+// validate names every unusable WorkerConfig field: an empty schedule
+// or a non-positive value is misconfiguration, never a default.
+func (c *WorkerConfig) validate() error {
+	var bad []string
+	if len(c.RetrySchedule) == 0 {
+		bad = append(bad, "RetrySchedule")
 	}
 	if c.RetryPlateau <= 0 {
-		c.RetryPlateau = 8 * time.Hour
+		bad = append(bad, "RetryPlateau")
 	}
 	if c.GiveUpAfter <= 0 {
-		c.GiveUpAfter = 48 * time.Hour
+		bad = append(bad, "GiveUpAfter")
 	}
 	if c.MinAttempts <= 0 {
-		c.MinAttempts = 3
+		bad = append(bad, "MinAttempts")
 	}
 	if c.ClaimWindow <= 0 {
-		c.ClaimWindow = 15 * time.Minute
+		bad = append(bad, "ClaimWindow")
 	}
 	if c.TransmitTimeout <= 0 {
-		c.TransmitTimeout = 2 * time.Minute
+		bad = append(bad, "TransmitTimeout")
 	}
 	if c.BatchSize <= 0 {
-		c.BatchSize = 16
+		bad = append(bad, "BatchSize")
 	}
 	if c.QueueScanInterval <= 0 {
-		c.QueueScanInterval = time.Minute
+		bad = append(bad, "QueueScanInterval")
 	}
+	if len(bad) > 0 {
+		return fmt.Errorf("mail: NewWorker: WorkerConfig fields empty or not positive: %s (start from DefaultWorkerConfig)", strings.Join(bad, ", "))
+	}
+	return nil
 }
 
 // Worker sends queued EmailSubmissions through a Submitter.
@@ -200,7 +222,9 @@ func NewWorker(q *Queue, submitter Submitter, cfg WorkerConfig) (*Worker, error)
 	if q == nil || submitter == nil {
 		return nil, errors.New("mail: Worker needs a Queue and a Submitter")
 	}
-	cfg.applyDefaults()
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
 	if cfg.ClaimWindow < 3*cfg.TransmitTimeout {
 		return nil, fmt.Errorf("mail: ClaimWindow %v must be at least 3x TransmitTimeout %v", cfg.ClaimWindow, cfg.TransmitTimeout)
 	}

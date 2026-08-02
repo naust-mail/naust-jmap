@@ -40,12 +40,12 @@ func TestParseMDNRoundTrip(t *testing.T) {
 	if p.ReportingUA != m.ReportingUA {
 		t.Errorf("ReportingUA = %q, want %q", p.ReportingUA, m.ReportingUA)
 	}
-	// Write supplies the rfc822 address-type prefix (RFC 8098 sections
-	// 3.2.3-3.2.4); the parse keeps the field value whole.
-	if want := "rfc822; " + m.FinalRecipient; p.FinalRecipient != want {
+	// Write supplies the rfc822 address-type when none was stated (RFC
+	// 8098 sections 3.2.3-3.2.4); the parse keeps the field value whole.
+	if want := "rfc822; " + m.FinalRecipient.Addr; p.FinalRecipient != want {
 		t.Errorf("FinalRecipient = %q, want %q", p.FinalRecipient, want)
 	}
-	if want := "rfc822; " + m.OriginalRecipient; p.OriginalRecipient != want {
+	if want := "rfc822; " + m.OriginalRecipient.Addr; p.OriginalRecipient != want {
 		t.Errorf("OriginalRecipient = %q, want %q", p.OriginalRecipient, want)
 	}
 	if p.OriginalMessageID != m.OriginalMessageID {
@@ -82,7 +82,7 @@ func TestParseMDNMinimal(t *testing.T) {
 	m := Message{
 		From:           Address{Email: "joe@example.com"},
 		To:             Address{Email: "jane@example.org"},
-		FinalRecipient: "joe@example.com",
+		FinalRecipient: GenericAddress{Addr: "joe@example.com"},
 		Disposition: Disposition{
 			ActionMode:  "automatic-action",
 			SendingMode: "mdn-sent-automatically",

@@ -23,7 +23,7 @@ import (
 // leaves a held message alone, then release the clock and watch the send
 // drive undoStatus and deliveryStatus to their final values.
 func TestWorkerEndToEndFutureRelease(t *testing.T) {
-	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	ctx := context.Background()
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	sent := createMailbox(t, ts, `{"name":"Sent"}`)
@@ -128,12 +128,11 @@ func TestWorkerEndToEndFutureRelease(t *testing.T) {
 func TestWorkerQueueTransitionInvariants(t *testing.T) {
 	const seed = 20260718
 	rng := rand.New(rand.NewSource(seed))
-	cfg := WorkerConfig{
-		RetrySchedule: []time.Duration{time.Minute, 2 * time.Minute},
-		RetryPlateau:  5 * time.Minute,
-		GiveUpAfter:   30 * time.Minute,
-		MinAttempts:   3,
-	}
+	cfg := DefaultWorkerConfig()
+	cfg.RetrySchedule = []time.Duration{time.Minute, 2 * time.Minute}
+	cfg.RetryPlateau = 5 * time.Minute
+	cfg.GiveUpAfter = 30 * time.Minute
+	cfg.MinAttempts = 3
 	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), cfg)
 	ctx := context.Background()
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)

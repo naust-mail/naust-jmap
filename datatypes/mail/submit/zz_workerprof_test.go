@@ -36,7 +36,7 @@ func writeAllocsProfile(t *testing.T, name string) {
 // claim -> transmit -> finalize path.
 func TestZZProfileWorkerSend(t *testing.T) {
 	runtime.MemProfileRate = 4096
-	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -89,7 +89,7 @@ func TestZZProfileWorkerSend(t *testing.T) {
 // send.
 func TestZZProfileWorkerIdle(t *testing.T) {
 	runtime.MemProfileRate = 4096
-	ts, db, store, w, fake, _ := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, _ := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)

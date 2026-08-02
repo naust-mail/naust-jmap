@@ -50,12 +50,16 @@ const simpleMessage = "From: Joe Bloggs <joe@example.com>\r\n" +
 	"\r\n" +
 	"Hi Jane, are you free on Thursday evening?\r\n"
 
-// mustDeliverer is New, failing the test on error - the convenience every
-// caller here wants (none of these tests exercise WithVacationResponder,
-// New's only failure path).
-func mustDeliverer(t *testing.T, db *objectdb.DB, store blob.Store, resolver Resolver, opts ...Option) *Deliverer {
+// mustDeliverer is New, failing the test on error. The trailing config
+// is optional (at most one) and used verbatim; omitting it means
+// DefaultConfig, so the common no-config call stays short.
+func mustDeliverer(t testing.TB, db *objectdb.DB, store blob.Store, resolver Resolver, cfg ...Config) *Deliverer {
 	t.Helper()
-	d, err := New(db, store, resolver, opts...)
+	c := DefaultConfig()
+	if len(cfg) > 0 {
+		c = cfg[0]
+	}
+	d, err := New(db, store, resolver, c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +70,7 @@ func inv(name, args, callID string) jmap.Invocation {
 	return jmap.Invocation{Name: name, Args: json.RawMessage(args), CallID: callID}
 }
 
-func methodArgs(t *testing.T, r *jmap.Response, i int, wantName string) map[string]any {
+func methodArgs(t testing.TB, r *jmap.Response, i int, wantName string) map[string]any {
 	t.Helper()
 	if i >= len(r.MethodResponses) {
 		t.Fatalf("no method response %d (have %d)", i, len(r.MethodResponses))
@@ -84,7 +88,7 @@ func methodArgs(t *testing.T, r *jmap.Response, i int, wantName string) map[stri
 
 // callMail posts a request opted into core + mail + submission + vacation:
 // the superset every test server in this package advertises.
-func callMail(t *testing.T, ts *httptest.Server, calls ...jmap.Invocation) *jmap.Response {
+func callMail(t testing.TB, ts *httptest.Server, calls ...jmap.Invocation) *jmap.Response {
 	t.Helper()
 	req := map[string]any{
 		"using":       []string{jmap.CoreCapability, mail.CapabilityURI, submit.CapabilityURI, mail.VacationCapabilityURI},
@@ -114,7 +118,7 @@ func callMail(t *testing.T, ts *httptest.Server, calls ...jmap.Invocation) *jmap
 // advertised Email capability and the enforced limits. Every test server in
 // this package needs the full set: delivery lands Emails, and the vacation
 // responder relays replies through a real submission queue.
-func newEmailServer(t *testing.T, acctCap mail.AccountCapability) (*httptest.Server, *objectdb.DB, blob.Store, *submit.Queue, *submit.Worker, *fakeSubmitter) {
+func newEmailServer(t testing.TB, acctCap mail.AccountCapability) (*httptest.Server, *objectdb.DB, blob.Store, *submit.Queue, *submit.Worker, *fakeSubmitter) {
 	t.Helper()
 	a := testsupport.NewStaticAuth()
 	a.AddUser("john@example.com", "secret", testAccount)
@@ -145,7 +149,7 @@ func newEmailServer(t *testing.T, acctCap mail.AccountCapability) (*httptest.Ser
 	if err := mail.RegisterVacationResponse(p, mail.VacationResponseConfig{DB: db}); err != nil {
 		t.Fatal(err)
 	}
-	w, err := submit.NewWorker(q, fake, submit.WorkerConfig{})
+	w, err := submit.NewWorker(q, fake, submit.DefaultWorkerConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,14 +171,14 @@ func newEmailServer(t *testing.T, acctCap mail.AccountCapability) (*httptest.Ser
 	return ts, db, store, q, w, fake
 }
 
-func emailServer(t *testing.T) (*httptest.Server, *objectdb.DB, blob.Store) {
+func emailServer(t testing.TB) (*httptest.Server, *objectdb.DB, blob.Store) {
 	ts, db, store, _, _, _ := newEmailServer(t, mail.DefaultAccountCapability())
 	return ts, db, store
 }
 
 // createMailbox makes one mailbox from a JSON properties object and
 // returns its id.
-func createMailbox(t *testing.T, ts *httptest.Server, props string) string {
+func createMailbox(t testing.TB, ts *httptest.Server, props string) string {
 	t.Helper()
 	r := callMail(t, ts, inv("Mailbox/set",
 		fmt.Sprintf(`{"accountId":%q,"create":{"c":%s}}`, testAccount, props), "0"))
@@ -316,7 +320,7 @@ func snippetByEmail(t *testing.T, args map[string]any) map[string]map[string]any
 }
 
 // submissionCount counts the account's EmailSubmission records.
-func submissionCount(t *testing.T, db *objectdb.DB) int {
+func submissionCount(t testing.TB, db *objectdb.DB) int {
 	t.Helper()
 	ids, err := db.AllIds(context.Background(), testAccount, mail.TypeEmailSubmission, 0)
 	if err != nil {
@@ -374,7 +378,7 @@ func submitEnvelope(t *testing.T, ts *httptest.Server, identityId, emailId, enve
 }
 
 // createIdentity creates one Identity for email and returns its id.
-func createIdentity(t *testing.T, ts *httptest.Server, email string) string {
+func createIdentity(t testing.TB, ts *httptest.Server, email string) string {
 	t.Helper()
 	r := callMail(t, ts, inv("Identity/set", fmt.Sprintf(
 		`{"accountId":%q,"create":{"i1":{"email":%q}}}`, testAccount, email), "0"))

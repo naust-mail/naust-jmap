@@ -111,7 +111,7 @@ func subSetHas(t *testing.T, r *jmap.Response, key, id string) bool {
 // (a transmit may be imminent), a user cancel is refused as cannotUnsend
 // and the send proceeds. The claim's presence is the unsend cutoff.
 func TestWorkerCancelAfterClaimRejected(t *testing.T) {
-	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -146,7 +146,7 @@ func TestWorkerCancelAfterClaimRejected(t *testing.T) {
 // then finds nothing to do (no nextAttemptAt) - the canceled message is
 // never sent.
 func TestWorkerCancelBeforeClaimSkipped(t *testing.T) {
-	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -178,7 +178,7 @@ func TestWorkerCancelBeforeClaimSkipped(t *testing.T) {
 // already handed to transmit (section 7.5); this only proves the worker
 // tolerates the record disappearing under it.
 func TestWorkerDestroyDuringSendTolerated(t *testing.T) {
-	ts, db, store, w, _, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, _, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -210,7 +210,7 @@ func TestWorkerDestroyDuringSendTolerated(t *testing.T) {
 // Whatever the lease ordering, only the current token's result is applied
 // - never a mix, never a double count.
 func TestWorkerConcurrentFinalizeSupersededDropped(t *testing.T) {
-	ts, db, store, w, _, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, _, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -259,7 +259,7 @@ func TestWorkerConcurrentFinalizeSupersededDropped(t *testing.T) {
 // send: sendOne's lease-held re-read sees the claim is no longer A's and
 // abandons BEFORE transmitting. A's submitter is never called.
 func TestWorkerSuspendedClaimAbandonedByReread(t *testing.T) {
-	cfg := WorkerConfig{}
+	cfg := DefaultWorkerConfig()
 	ts, db, store, _, _, clock := newWorkerServer(t, DefaultLimits(), cfg)
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
@@ -315,7 +315,7 @@ func TestWorkerSuspendedClaimAbandonedByReread(t *testing.T) {
 // the record already done). This is exactly the send a 3C elapsed-abandon
 // check would wrongly suppress, forcing an unnecessary re-send.
 func TestWorkerLateClaimUncontestedStillSends(t *testing.T) {
-	cfg := WorkerConfig{}
+	cfg := DefaultWorkerConfig()
 	ts, db, store, _, _, clock := newWorkerServer(t, DefaultLimits(), cfg)
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
@@ -357,7 +357,7 @@ func TestWorkerLateClaimUncontestedStillSends(t *testing.T) {
 // duplicate, never a double-finalize. (The duplicate itself is the
 // at-least-once window the step-4 suspension check is meant to shrink.)
 func TestWorkerReclaimDuringLiveTransmit(t *testing.T) {
-	cfg := WorkerConfig{}
+	cfg := DefaultWorkerConfig()
 	ts, db, store, _, _, clock := newWorkerServer(t, DefaultLimits(), cfg)
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
@@ -446,13 +446,13 @@ func TestWorkerReclaimDuringLiveTransmit(t *testing.T) {
 // parked out of the due set. Run many times, under -race, to shake the
 // interleaving.
 func TestWorkerConcurrentClaimMutualExclusion(t *testing.T) {
-	ts, db, store, _, _, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, _, _, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	ctx := context.Background()
 
 	mkWorker := func() *Worker {
-		w, err := NewWorker(newSubmissionQueue(db, store), &fakeSubmitter{}, WorkerConfig{})
+		w, err := NewWorker(newSubmissionQueue(db, store), &fakeSubmitter{}, DefaultWorkerConfig())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -512,7 +512,8 @@ func TestWorkerMultiWorkerStress(t *testing.T) {
 		crashProb = 0.35
 	)
 	rng := rand.New(rand.NewSource(seed))
-	cfg := WorkerConfig{GiveUpAfter: 1000 * time.Hour} // give-up must never interfere
+	cfg := DefaultWorkerConfig()
+	cfg.GiveUpAfter = 1000 * time.Hour // give-up must never interfere
 	ts, db, store, _, _, clock := newWorkerServer(t, DefaultLimits(), cfg)
 	ctx := context.Background()
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)

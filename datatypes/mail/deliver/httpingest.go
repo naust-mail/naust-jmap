@@ -8,7 +8,9 @@ package deliver
 // per-recipient verdicts LMTP returns on the wire).
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -52,22 +54,27 @@ type HTTPIngest struct {
 	slots chan struct{}
 }
 
-// HTTPIngestOption configures an HTTP ingest handler.
-type HTTPIngestOption func(*HTTPIngest)
+// HTTPIngestConfig is an HTTP ingest handler's configuration. Values
+// are used verbatim - start from DefaultHTTPIngestConfig and override.
+type HTTPIngestConfig struct {
+	// MaxInFlight bounds how many ingest requests are served at once.
+	// Applied verbatim: zero refuses every request (logged once at
+	// construction); DefaultHTTPIngestConfig sets 64. Beyond it a
+	// request is answered 503 with a Retry-After.
+	MaxInFlight int
 
-// WithMaxIngestInFlight bounds how many ingest requests are served at once.
-// Beyond it a request is answered 503 with a Retry-After.
-func WithMaxIngestInFlight(n int) HTTPIngestOption {
-	return func(h *HTTPIngest) { h.slots = make(chan struct{}, n) }
+	// Hostname names this server in the Received stamp each delivered
+	// message gets (RFC 5321 section 4.4, the BY clause). Empty stamps
+	// Return-Path only: HTTP has no registered WITH protocol value and
+	// no LHLO-style peer claim, so the stamp records the observed peer
+	// address and this name, nothing claimed.
+	Hostname string
 }
 
-// WithIngestHostname names this server in the Received stamp each delivered
-// message gets (RFC 5321 section 4.4, the BY clause). Without it the handler
-// stamps Return-Path only: HTTP has no registered WITH protocol value and no
-// LHLO-style peer claim, so the stamp records the observed peer address and
-// this name, nothing claimed.
-func WithIngestHostname(name string) HTTPIngestOption {
-	return func(h *HTTPIngest) { h.hostname = name }
+// DefaultHTTPIngestConfig returns this package's default ingest
+// configuration.
+func DefaultHTTPIngestConfig() HTTPIngestConfig {
+	return HTTPIngestConfig{MaxInFlight: defaultMaxIngestInFlight}
 }
 
 // NewHTTPIngest wraps a Deliverer as an HTTP ingest handler.
@@ -78,12 +85,12 @@ func WithIngestHostname(name string) HTTPIngestOption {
 // loopback or private address, or behind the host's own authentication -
 // never on a mux the public can reach, where it would accept mail for any
 // recipient from anyone.
-func NewHTTPIngest(d *Deliverer, opts ...HTTPIngestOption) *HTTPIngest {
-	h := &HTTPIngest{d: d, slots: make(chan struct{}, defaultMaxIngestInFlight)}
-	for _, o := range opts {
-		o(h)
+func NewHTTPIngest(d *Deliverer, cfg HTTPIngestConfig) *HTTPIngest {
+	if cfg.MaxInFlight <= 0 {
+		slog.Warn("naust-jmap ingest: HTTPIngestConfig.MaxInFlight is not positive; every request will be refused")
+		cfg.MaxInFlight = 0
 	}
-	return h
+	return &HTTPIngest{d: d, hostname: cfg.Hostname, slots: make(chan struct{}, cfg.MaxInFlight)}
 }
 
 func (h *HTTPIngest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -126,7 +133,7 @@ func (h *HTTPIngest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		PeerAddr:   r.RemoteAddr,
 		LocalName:  h.hostname,
 	}
-	events := h.d.Deliver(r.Context(), env, r.Body)
+	events, respond := h.d.deliverDeferred(r.Context(), env, r.Body)
 
 	results := make([]httpResult, len(events))
 	for i, ev := range events {
@@ -142,6 +149,18 @@ func (h *HTTPIngest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(results)
+	// Auto-responses run only after the peer has its results, flushed so
+	// they are readable while the work runs; detached from the request
+	// context so a client hanging up cannot cancel a courtesy mid-send,
+	// and bounded like every deferred respond.
+	if respond != nil {
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), respondTimeout)
+		respond(rctx)
+		cancel()
+	}
 }
 
 // parseRecipients flattens one or more X-Naust-Rcpt-To header values, each of

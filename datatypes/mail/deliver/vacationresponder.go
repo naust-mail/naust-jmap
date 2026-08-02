@@ -59,18 +59,6 @@ func vacationNotifiedType() *descriptor.Type {
 	}
 }
 
-// WithVacationResponder enables the delivery-side auto-responder, wired to
-// the submission queue the replies are sent through (the value
-// submit.Register returned; mail.RegisterVacationResponse must also be
-// registered on the same db, it owns the configuration the responder
-// reads). One option, because the responder IS the coupling of delivery
-// to the send queue - without a queue there is nowhere spec-compliant to
-// put a reply. New registers this responder's suppression ledger type
-// when the option is present.
-func WithVacationResponder(q *submit.Queue) Option {
-	return func(d *Deliverer) { d.vacationQ = q }
-}
-
 // maybeVacationReply runs after one recipient's delivery committed. Every
 // failure mode logs and returns: an auto-response is a courtesy (RFC 3834
 // section 1: "in some circumstances it is acceptable"), and nothing about

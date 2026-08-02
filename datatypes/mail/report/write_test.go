@@ -64,8 +64,8 @@ func sampleMDN() Message {
 		Subject:           "Read receipt for: quarterly report",
 		TextBody:          "This receipt shows the message was displayed.",
 		ReportingUA:       "mail.example.net; Naust 1.0",
-		FinalRecipient:    "joe@example.com",
-		OriginalRecipient: "joe-alias@example.com",
+		FinalRecipient:    GenericAddress{Addr: "joe@example.com"},
+		OriginalRecipient: GenericAddress{Addr: "joe-alias@example.com"},
 		OriginalMessageID: "orig-1@example.org",
 		Disposition: Disposition{
 			ActionMode:  "manual-action",
@@ -136,7 +136,7 @@ func TestWriteRoundTrip(t *testing.T) {
 	if n == nil {
 		t.Fatal("generated notification did not parse")
 	}
-	if n.FinalRecipient != m.FinalRecipient || n.OrigMessageID != m.OriginalMessageID || n.Disposition != "displayed" {
+	if n.FinalRecipient != m.FinalRecipient.Addr || n.OrigMessageID != m.OriginalMessageID || n.Disposition != "displayed" {
 		t.Fatalf("notification = %+v", n)
 	}
 	groups := ParseFieldGroups([]byte(notif))
@@ -146,8 +146,8 @@ func TestWriteRoundTrip(t *testing.T) {
 	g := groups[0]
 	for _, want := range []struct{ field, value string }{
 		{"Reporting-UA", m.ReportingUA},
-		{"Original-Recipient", "rfc822; " + m.OriginalRecipient},
-		{"Final-Recipient", "rfc822; " + m.FinalRecipient},
+		{"Original-Recipient", "rfc822; " + m.OriginalRecipient.Addr},
+		{"Final-Recipient", "rfc822; " + m.FinalRecipient.Addr},
 		{"Original-Message-ID", "<" + m.OriginalMessageID + ">"},
 		{"Disposition", "manual-action/mdn-sent-manually; displayed"},
 		{"X-Naust-Trace", "abc123"},
@@ -182,8 +182,8 @@ func TestWriteRFC8098Example(t *testing.T) {
 		Subject:           "Disposition notification",
 		TextBody:          "The message sent on 1995 Sep 19 has been displayed.",
 		ReportingUA:       "joes-pc.cs.example.com; Foomail 97.1",
-		OriginalRecipient: "Joe_Recipient@example.com",
-		FinalRecipient:    "Joe_Recipient@example.com",
+		OriginalRecipient: GenericAddress{Addr: "Joe_Recipient@example.com"},
+		FinalRecipient:    GenericAddress{Addr: "Joe_Recipient@example.com"},
 		OriginalMessageID: "199509192301.23456@example.org",
 		Disposition: Disposition{
 			ActionMode:  "manual-action",
@@ -276,8 +276,8 @@ func TestWriteRejectsHeaderInjection(t *testing.T) {
 		"To name":           func(m *Message, v string) { m.To.Name += v },
 		"To email":          func(m *Message, v string) { m.To.Email += v },
 		"ReportingUA":       func(m *Message, v string) { m.ReportingUA += v },
-		"FinalRecipient":    func(m *Message, v string) { m.FinalRecipient += v },
-		"OriginalRecipient": func(m *Message, v string) { m.OriginalRecipient += v },
+		"FinalRecipient":    func(m *Message, v string) { m.FinalRecipient.Addr += v },
+		"OriginalRecipient": func(m *Message, v string) { m.OriginalRecipient.Addr += v },
 		"OriginalMessageID": func(m *Message, v string) { m.OriginalMessageID += v },
 		"extension name":    func(m *Message, v string) { m.ExtensionFields[0].Name += v },
 		"extension value":   func(m *Message, v string) { m.ExtensionFields[0].Value += v },
@@ -311,12 +311,15 @@ func TestWriteRejectsHeaderInjection(t *testing.T) {
 
 // TestWriteRejectsMalformedFields covers the caller mistakes that are not
 // line-break smuggling: an unusable address, a missing required field, an
-// address-type prefix Write reserves for itself, an unknown disposition
-// value, and an extension field restating a defined one.
+// address-type label Write does not implement, a non-ASCII address (the
+// RFC 6533 format is not generated), an unknown disposition value, and
+// an extension field restating a defined one.
 func TestWriteRejectsMalformedFields(t *testing.T) {
 	cases := map[string]func(m *Message){
-		"no final recipient":   func(m *Message) { m.FinalRecipient = "" },
-		"typed final address":  func(m *Message) { m.FinalRecipient = "rfc822; joe@example.com" },
+		"no final recipient":   func(m *Message) { m.FinalRecipient = GenericAddress{} },
+		"unknown address type": func(m *Message) { m.FinalRecipient.Type = "x-panda" },
+		"non-ASCII address":    func(m *Message) { m.FinalRecipient = GenericAddress{Type: "utf-8", Addr: "jäne@example.com"} },
+		"prefixed address":     func(m *Message) { m.FinalRecipient.Addr = "rfc822; joe@example.com" },
 		"bracketed message id": func(m *Message) { m.OriginalMessageID = "<orig-1@example.org>" },
 		"domainless from":      func(m *Message) { m.From.Email = "joe" },
 		"unknown action mode":  func(m *Message) { m.Disposition.ActionMode = "semi-automatic" },
@@ -369,7 +372,7 @@ func TestWriteAutoSubmitted(t *testing.T) {
 	minimal := Message{
 		From:           Address{Email: "joe@example.com"},
 		To:             Address{Email: "jane@example.org"},
-		FinalRecipient: "joe@example.com",
+		FinalRecipient: GenericAddress{Addr: "joe@example.com"},
 		Disposition: Disposition{
 			ActionMode:  "automatic-action",
 			SendingMode: "mdn-sent-automatically",
@@ -401,7 +404,7 @@ func TestWriteCaptureBounds(t *testing.T) {
 	// round-trip.
 	base := Message{
 		From: Address{Email: "a@example.com"}, To: Address{Email: "b@example.com"},
-		FinalRecipient: "a@example.com",
+		FinalRecipient: GenericAddress{Addr: "a@example.com"},
 		Disposition:    Disposition{ActionMode: "manual-action", SendingMode: "mdn-sent-manually", Type: "displayed"},
 	}
 
@@ -440,5 +443,37 @@ func TestWriteCaptureBounds(t *testing.T) {
 	}
 	if len(p.ExtensionFields) != 60 {
 		t.Errorf("round-trip kept %d extension fields, want 60", len(p.ExtensionFields))
+	}
+}
+
+// TestWriteCarriesAddressType: a stated address-type survives to the
+// wire (RFC 6533 section 3 registers utf-8 alongside rfc822); an
+// unstated one stays rfc822.
+func TestWriteCarriesAddressType(t *testing.T) {
+	m := sampleMDN()
+	m.FinalRecipient = GenericAddress{Type: "utf-8", Addr: "joe@example.com"}
+	m.OriginalRecipient = GenericAddress{Type: "utf-8", Addr: "joe-alias@example.com"}
+	w := writeMDN(t, m)
+	notif := w.parts["message/disposition-notification"]
+	for _, want := range []string{
+		"Final-Recipient: utf-8; joe@example.com",
+		"Original-Recipient: utf-8; joe-alias@example.com",
+	} {
+		if !strings.Contains(notif, want) {
+			t.Errorf("notification missing %q:\n%s", want, notif)
+		}
+	}
+}
+
+// TestGenericAddressValidateDEL: DEL (0x7f) is ASCII, so it gets the
+// addr-spec refusal - the RFC 6533 pointer is only for bytes an
+// internationalized address could actually contain.
+func TestGenericAddressValidateDEL(t *testing.T) {
+	err := GenericAddress{Addr: "jo\x7fhn@example.com"}.Validate()
+	if err == nil {
+		t.Fatal("DEL address accepted")
+	}
+	if strings.Contains(err.Error(), "6533") {
+		t.Fatalf("DEL address pointed at RFC 6533: %v", err)
 	}
 }

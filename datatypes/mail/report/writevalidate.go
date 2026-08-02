@@ -144,23 +144,20 @@ func validateAddress(field string, a Address) error {
 }
 
 // validateGenericAddress checks a Final-Recipient or Original-Recipient
-// generic-address (RFC 8098 sections 3.2.3 and 3.2.4). The address-type
-// prefix is Write's to supply, so a value carrying a semicolon is rejected
-// rather than reinterpreted.
-func validateGenericAddress(field, value string, required bool) error {
-	if value == "" {
+// generic-address (RFC 8098 sections 3.2.3 and 3.2.4): the shared
+// GenericAddress.Validate rules, plus the line-length bound the wire
+// form must fit.
+func validateGenericAddress(field string, g GenericAddress, required bool) error {
+	if g.Addr == "" && g.Type == "" {
 		if required {
 			return errf("%s is required", field)
 		}
 		return nil
 	}
-	if !tokenSafe(value) {
-		return errf("%s %q is not printable ASCII without white space", field, value)
+	if err := g.Validate(); err != nil {
+		return errf("%s: %v", field, err)
 	}
-	if strings.ContainsAny(value, ";<>") {
-		return errf("%s %q must be a bare address with no address-type prefix", field, value)
-	}
-	if len(field)+2+len("rfc822; ")+len(value) > lineLimit {
+	if len(field)+2+len(g.label())+2+len(g.Addr) > lineLimit {
 		return errf("%s exceeds the maximum line length", field)
 	}
 	return nil

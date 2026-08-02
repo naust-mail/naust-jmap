@@ -21,8 +21,8 @@ import (
 // only for commits whose changed types include EmailSubmission - other
 // types' churn never wakes the worker.
 func TestWorkerPumpFiltersForSubmissionChanges(t *testing.T) {
-	_, db, store, _, _, _ := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
-	w, err := NewWorker(newSubmissionQueue(db, store), &fakeSubmitter{}, WorkerConfig{})
+	_, db, store, _, _, _ := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
+	w, err := NewWorker(newSubmissionQueue(db, store), &fakeSubmitter{}, DefaultWorkerConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestWorkerPumpFiltersForSubmissionChanges(t *testing.T) {
 // set to an hour, so only the firehose subscription can explain a fast
 // pickup.
 func TestWorkerNotifierCrossProcessWake(t *testing.T) {
-	ts, db, store, _, _, _ := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, _, _, _ := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	db.SetNotifier(notify.NewInProcess())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
@@ -69,8 +69,9 @@ func TestWorkerNotifierCrossProcessWake(t *testing.T) {
 
 	// "Process B": its own queue view; nothing rings its bell directly.
 	fakeB := &fakeSubmitter{}
-	wB, err := NewWorker(newSubmissionQueue(db, store), fakeB,
-		WorkerConfig{QueueScanInterval: time.Hour})
+	slowScan := DefaultWorkerConfig()
+	slowScan.QueueScanInterval = time.Hour
+	wB, err := NewWorker(newSubmissionQueue(db, store), fakeB, slowScan)
 	if err != nil {
 		t.Fatal(err)
 	}

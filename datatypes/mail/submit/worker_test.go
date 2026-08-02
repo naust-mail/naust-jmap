@@ -193,18 +193,22 @@ func TestWorkerConfigInvariant(t *testing.T) {
 	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
 	store := kvstore.New(memory.New())
 	q := newSubmissionQueue(db, store)
-	if _, err := NewWorker(q, &fakeSubmitter{}, WorkerConfig{
-		ClaimWindow: 3 * time.Minute, TransmitTimeout: 2 * time.Minute,
-	}); err == nil {
+	shortWindow := DefaultWorkerConfig()
+	shortWindow.ClaimWindow = 3 * time.Minute
+	shortWindow.TransmitTimeout = 2 * time.Minute
+	if _, err := NewWorker(q, &fakeSubmitter{}, shortWindow); err == nil {
 		t.Fatal("ClaimWindow < 3x TransmitTimeout must be rejected at construction")
 	}
-	if _, err := NewWorker(q, nil, WorkerConfig{}); err == nil {
+	if _, err := NewWorker(q, &fakeSubmitter{}, WorkerConfig{}); err == nil {
+		t.Fatal("zero config must be rejected at construction")
+	}
+	if _, err := NewWorker(q, nil, DefaultWorkerConfig()); err == nil {
 		t.Fatal("nil Submitter must be rejected")
 	}
-	if _, err := NewWorker(nil, &fakeSubmitter{}, WorkerConfig{}); err == nil {
+	if _, err := NewWorker(nil, &fakeSubmitter{}, DefaultWorkerConfig()); err == nil {
 		t.Fatal("nil Queue must be rejected")
 	}
-	if _, err := NewWorker(q, &fakeSubmitter{}, WorkerConfig{}); err != nil {
+	if _, err := NewWorker(q, &fakeSubmitter{}, DefaultWorkerConfig()); err != nil {
 		t.Fatalf("defaults rejected: %v", err)
 	}
 }
@@ -214,7 +218,7 @@ func TestWorkerConfigInvariant(t *testing.T) {
 // transmitted bytes MUST NOT (section 7.5) - the strip is verified on
 // the captured wire message.
 func TestWorkerSendFlow(t *testing.T) {
-	ts, db, store, w, fake, _ := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, _ := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(map[string]string{"Bcc": "secret@corp.example"}),
@@ -288,7 +292,7 @@ func TestWorkerSendFlow(t *testing.T) {
 // the retry only re-attempts the temp-failed recipient, and recipient
 // parameters ride along to the Submitter.
 func TestWorkerMixedRecipients(t *testing.T) {
-	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -368,7 +372,7 @@ func TestWorkerMixedRecipients(t *testing.T) {
 // the synthetic reply and retries. This is the fan-out shape: one
 // destination's transaction completed before another's failed.
 func TestWorkerPartialResultsWithError(t *testing.T) {
-	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -414,7 +418,7 @@ func TestWorkerPartialResultsWithError(t *testing.T) {
 // instead of leaving it stuck - the merge guarantees one verdict per
 // attempted recipient whatever the Submitter reports.
 func TestWorkerMissingResultTempFails(t *testing.T) {
-	ts, db, store, w, fake, _ := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, _ := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -442,11 +446,10 @@ func TestWorkerMissingResultTempFails(t *testing.T) {
 // are abandoned with a synthetic permanent failure. All-tempfail keeps
 // undoStatus pending (cancelable) until then.
 func TestWorkerBackoffGiveUp(t *testing.T) {
-	cfg := WorkerConfig{
-		RetrySchedule: []time.Duration{time.Minute, 2 * time.Minute},
-		RetryPlateau:  4 * time.Minute,
-		GiveUpAfter:   10 * time.Minute,
-	}
+	cfg := DefaultWorkerConfig()
+	cfg.RetrySchedule = []time.Duration{time.Minute, 2 * time.Minute}
+	cfg.RetryPlateau = 4 * time.Minute
+	cfg.GiveUpAfter = 10 * time.Minute
 	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), cfg)
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
@@ -499,7 +502,7 @@ func TestWorkerBackoffGiveUp(t *testing.T) {
 // passes until sendAt, and canceling removes it from the queue so the
 // release moment sends nothing.
 func TestWorkerFutureReleaseAndCancel(t *testing.T) {
-	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -536,7 +539,7 @@ func TestWorkerFutureReleaseAndCancel(t *testing.T) {
 // record only until ClaimWindow passes, then exactly one reclaim sends
 // it.
 func TestWorkerClaimRecovery(t *testing.T) {
-	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -576,7 +579,7 @@ func TestWorkerClaimRecovery(t *testing.T) {
 // leaves the due scan, and a no-progress pass reports a FUTURE next
 // rather than a past one - the busy-loop precondition is gone.
 func TestWorkerClaimParksDueIndex(t *testing.T) {
-	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -629,7 +632,7 @@ func TestWorkerClaimParksDueIndex(t *testing.T) {
 // still mint distinct tokens, so the superseded worker's finalize is
 // dropped by the exact-match identity check.
 func TestWorkerClaimTokenCollisionResistant(t *testing.T) {
-	ts, db, store, wA, _, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, wA, _, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -639,7 +642,7 @@ func TestWorkerClaimTokenCollisionResistant(t *testing.T) {
 
 	// A second process's worker over the same store, its own nonce, the
 	// same (frozen) clock.
-	wB, err := NewWorker(newSubmissionQueue(db, store), &fakeSubmitter{}, WorkerConfig{})
+	wB, err := NewWorker(newSubmissionQueue(db, store), &fakeSubmitter{}, DefaultWorkerConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -706,7 +709,7 @@ func TestWorkerClaimTokenCollisionResistant(t *testing.T) {
 // TestWorkerStaleFinalizeDropped: a finalize whose claim stamp was
 // superseded must not touch the record - the double-finalize guard.
 func TestWorkerStaleFinalizeDropped(t *testing.T) {
-	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -749,7 +752,7 @@ func TestWorkerStaleFinalizeDropped(t *testing.T) {
 // the queue from durable state alone - the due record sends, the held
 // one waits.
 func TestWorkerRestartResume(t *testing.T) {
-	ts, db, store, w1, fake1, _ := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w1, fake1, _ := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	dueEmail := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -762,7 +765,7 @@ func TestWorkerRestartResume(t *testing.T) {
 	_, _ = w1, fake1 // the "crashed" worker never ran
 
 	fake2 := &fakeSubmitter{}
-	w2, err := NewWorker(newSubmissionQueue(db, store), fake2, WorkerConfig{})
+	w2, err := NewWorker(newSubmissionQueue(db, store), fake2, DefaultWorkerConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -805,7 +808,7 @@ func TestWorkerRestartResume(t *testing.T) {
 // sweep reads what and when from durable state), and rings coalesce
 // instead of blocking or accumulating.
 func TestWorkerRingLeavesBellToken(t *testing.T) {
-	_, _, _, w, _, _ := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	_, _, _, w, _, _ := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	w.q.ring()
 	w.q.ring() // a second ring coalesces, never blocks
 	select {
@@ -827,7 +830,7 @@ func TestWorkerRingLeavesBellToken(t *testing.T) {
 // afterwards. This is the reconciliation floor working with every
 // accelerator absent.
 func TestWorkerCrossProcessDiscovery(t *testing.T) {
-	ts, db, store, w1, fake1, _ := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w1, fake1, _ := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -835,7 +838,7 @@ func TestWorkerCrossProcessDiscovery(t *testing.T) {
 	// "Process B": its own queue view over the same store, started
 	// before the work exists - its startup scan sees nothing.
 	fakeB := &fakeSubmitter{}
-	wB, err := NewWorker(newSubmissionQueue(db, store), fakeB, WorkerConfig{})
+	wB, err := NewWorker(newSubmissionQueue(db, store), fakeB, DefaultWorkerConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -886,7 +889,7 @@ func TestWorkerCrossProcessDiscovery(t *testing.T) {
 // remaining earliest due time, so a queue flush or a pacer needs no
 // Run loop.
 func TestWorkerProcessDue(t *testing.T) {
-	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
 	emailId := putEmail(t, db, store, sendableMsg(nil), map[string]bool{drafts: true}, nil)
@@ -937,12 +940,11 @@ func TestWorkerProcessDue(t *testing.T) {
 // abandonment - an outage must not convert a transient smarthost
 // failure into an instant bounce.
 func TestWorkerMinAttemptsFloor(t *testing.T) {
-	cfg := WorkerConfig{
-		RetrySchedule: []time.Duration{time.Minute},
-		RetryPlateau:  time.Minute,
-		GiveUpAfter:   5 * time.Minute,
-		MinAttempts:   3,
-	}
+	cfg := DefaultWorkerConfig()
+	cfg.RetrySchedule = []time.Duration{time.Minute}
+	cfg.RetryPlateau = time.Minute
+	cfg.GiveUpAfter = 5 * time.Minute
+	cfg.MinAttempts = 3
 	ts, db, store, w, fake, clock := newWorkerServer(t, DefaultLimits(), cfg)
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
@@ -982,19 +984,14 @@ func TestWorkerMinAttemptsFloor(t *testing.T) {
 
 // TestWorkerEmptyRetryScheduleUsesDefault: an explicit empty RetrySchedule
 // is treated as unset, not as "plateau only" (chaos finding #5), so the
-// first retry uses the default fast backoff rather than the 8h plateau.
-func TestWorkerEmptyRetryScheduleUsesDefault(t *testing.T) {
+func TestWorkerEmptyRetryScheduleRefused(t *testing.T) {
 	be := memory.New()
 	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
 	store := kvstore.New(memory.New())
-	w, err := NewWorker(newSubmissionQueue(db, store), &fakeSubmitter{},
-		WorkerConfig{RetrySchedule: []time.Duration{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	w.rand = func() float64 { return 0.5 } // pin jitter to the exact schedule
-	if got := w.backoff(1); got != time.Minute {
-		t.Errorf("first backoff with empty schedule = %v, want the 1m default (not the plateau)", got)
+	cfg := DefaultWorkerConfig()
+	cfg.RetrySchedule = nil
+	if _, err := NewWorker(newSubmissionQueue(db, store), &fakeSubmitter{}, cfg); err == nil {
+		t.Fatal("empty RetrySchedule accepted")
 	}
 }
 
@@ -1007,8 +1004,10 @@ func TestWorkerBackoffJitterBounds(t *testing.T) {
 	be := memory.New()
 	db := objectdb.New(be, lease.NewInProcess(be), objectdb.WithVerifyPreImages())
 	store := kvstore.New(memory.New())
-	w, err := NewWorker(newSubmissionQueue(db, store), &fakeSubmitter{},
-		WorkerConfig{RetrySchedule: []time.Duration{time.Minute}, RetryPlateau: 10 * time.Minute})
+	jcfg := DefaultWorkerConfig()
+	jcfg.RetrySchedule = []time.Duration{time.Minute}
+	jcfg.RetryPlateau = 10 * time.Minute
+	w, err := NewWorker(newSubmissionQueue(db, store), &fakeSubmitter{}, jcfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1042,7 +1041,7 @@ func TestWorkerBackoffJitterBounds(t *testing.T) {
 // empty (waiting on the bell or the next scheduled scan), submit,
 // observe the transmission, then shut down via ctx.
 func TestWorkerRunLoop(t *testing.T) {
-	ts, db, store, w, fake, _ := newWorkerServer(t, DefaultLimits(), WorkerConfig{})
+	ts, db, store, w, fake, _ := newWorkerServer(t, DefaultLimits(), DefaultWorkerConfig())
 	w.now = time.Now // real clock for the live loop
 	drafts := createMailbox(t, ts, `{"name":"Drafts"}`)
 	identityId := createIdentity(t, ts, "john@example.com")
