@@ -20,6 +20,7 @@ import (
 	"github.com/naust-mail/naust-jmap/core/jmap"
 	"github.com/naust-mail/naust-jmap/core/objectdb"
 	"github.com/naust-mail/naust-jmap/core/providers/blob"
+	"github.com/naust-mail/naust-jmap/datatypes/mail"
 	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/record"
 )
 
@@ -38,6 +39,11 @@ type Queue struct {
 	db    *objectdb.DB
 	store blob.Store
 
+	// The sending policy Register resolved: the queue is the door every
+	// outgoing message passes through, so it is where the policy is
+	// read back from (Policy).
+	policy mail.SendPolicy
+
 	// bell has capacity 1: a ring landing while the worker is mid-sweep
 	// is retained as one token, never lost, and rings coalesce.
 	bell chan struct{}
@@ -45,6 +51,28 @@ type Queue struct {
 
 func newSubmissionQueue(db *objectdb.DB, store blob.Store) *Queue {
 	return &Queue{db: db, store: store, bell: make(chan struct{}, 1)}
+}
+
+// Policy returns the SendPolicy this queue was registered with (the
+// resolved value: the deny-everything default when Config.Policy was
+// nil). Packages that originate mail through Sender re-check it at use,
+// so one policy answers for every outbound path. The returned value
+// carries only the two checks: the registered policy's concrete type -
+// and any mutator it has - is unreachable through it, so a policy in
+// service cannot be modified from here by construction.
+func (q *Queue) Policy() mail.SendPolicy { return policyView{q.policy} }
+
+// policyView narrows the registered SendPolicy to the SendPolicy
+// interface alone, defeating a type assertion back to the concrete
+// implementation.
+type policyView struct{ p mail.SendPolicy }
+
+func (v policyView) CanSend(ctx context.Context, acct jmap.Id) (bool, string) {
+	return v.p.CanSend(ctx, acct)
+}
+
+func (v policyView) CanSendAs(ctx context.Context, acct jmap.Id, from string) bool {
+	return v.p.CanSendAs(ctx, acct, from)
 }
 
 // ring wakes any worker draining the bell: work may have been queued.

@@ -9,6 +9,7 @@ package report
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -389,5 +390,55 @@ func TestWriteAutoSubmitted(t *testing.T) {
 		if n := strings.Count(w.raw, "Auto-Submitted"); n != 1 {
 			t.Fatalf("%s: Auto-Submitted appears %d times", name, n)
 		}
+	}
+}
+
+func TestWriteCaptureBounds(t *testing.T) {
+	// A generated MDN must be one this package's parser reads back: the
+	// notification content and the text body are bounded by the parse
+	// side's capture bound, so an over-bound Message is refused before a
+	// byte is emitted rather than producing a report that fails its own
+	// round-trip.
+	base := Message{
+		From: Address{Email: "a@example.com"}, To: Address{Email: "b@example.com"},
+		FinalRecipient: "a@example.com",
+		Disposition:    Disposition{ActionMode: "manual-action", SendingMode: "mdn-sent-manually", Type: "displayed"},
+	}
+
+	huge := base
+	for i := 0; len(huge.ExtensionFields) < 2000; i++ {
+		huge.ExtensionFields = append(huge.ExtensionFields, ExtensionField{
+			Name: fmt.Sprintf("X-Ext-%d", i), Value: strings.Repeat("v", 40),
+		})
+	}
+	var buf bytes.Buffer
+	if err := Write(context.Background(), &buf, huge); err == nil || !strings.Contains(err.Error(), "notification content exceeds") {
+		t.Errorf("over-bound notification: err = %v, want refusal naming the bound", err)
+	}
+
+	bigText := base
+	bigText.TextBody = strings.Repeat("x", (64<<10)+1)
+	buf.Reset()
+	if err := Write(context.Background(), &buf, bigText); err == nil || !strings.Contains(err.Error(), "TextBody exceeds") {
+		t.Errorf("over-bound TextBody: err = %v, want refusal naming the bound", err)
+	}
+
+	// Just under the bound: writes, and the parser reads it back whole.
+	nearly := base
+	for i := 0; i < 60; i++ {
+		nearly.ExtensionFields = append(nearly.ExtensionFields, ExtensionField{
+			Name: fmt.Sprintf("X-Ext-%d", i), Value: strings.Repeat("v", 900),
+		})
+	}
+	buf.Reset()
+	if err := Write(context.Background(), &buf, nearly); err != nil {
+		t.Fatalf("under-bound Write: %v", err)
+	}
+	p, err := ParseMDN(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("ParseMDN of generated MDN: %v", err)
+	}
+	if len(p.ExtensionFields) != 60 {
+		t.Errorf("round-trip kept %d extension fields, want 60", len(p.ExtensionFields))
 	}
 }

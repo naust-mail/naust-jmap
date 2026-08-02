@@ -138,7 +138,7 @@ migration script)
 | `StaticSendPolicy.Allow(acct, addrs...)`                    | method           | Grant an account the addresses it may send as                                       |
 | `Outcome`, `TempFailed`, `Rejected`, `Accepted`             | type / const     | Per-recipient delivery/send verdict, shared by `deliver.Event` and `submit.Result`  |
 | `EmailAddress`                                              | type             | One parsed address from an address header                                          |
-| `WithMessageIDDomain`                                       | func             | The domain synthesized Message-IDs live under. Configuration, never guessed          |
+| `EmailConfig.MessageIDDomain`                               | field            | The domain synthesized Message-IDs live under. Configuration, never guessed          |
 | `MigrateThreadCounters`                                     | func             | One-time counter migration helper                                                   |
 
 </details>
@@ -164,6 +164,7 @@ migration script)
 | `Register`                                                                | func             | Registers `EmailSubmission` and returns the `Queue`                                       |
 | `Queue`                                                                   | type             | The live queue view a `Worker` consumes; `Queue.Sender()` returns the server-side `Sender` |
 | `Queue.EmailIDForMessageID(ctx, acct, mid)`                               | method           | Resolves a sent message's Message-ID to its Email via the indexed submission snapshot      |
+| `Queue.Policy()`                                                          | method           | The resolved `SendPolicy` as a read-only view: one policy answers every outbound path      |
 | `NewWorker`, `WorkerConfig`, `WorkerStats`                                | func / type      | The worker that drains due submissions                                                    |
 | `Worker.Run(ctx)`                                                         | method           | Start sending. Blocks until the context is cancelled                                      |
 | `Worker.ProcessDue(ctx, limit)`                                           | method           | The manual crank: a queue flush, a pacer, a test                                          |
@@ -277,7 +278,7 @@ the simple behavior.
 represent faithfully is an `invalidProperties` SetError, not a silent fix-up.
 The server adds only what the spec assigns it, including missing `Date` and
 `Message-ID` headers; the domain synthesized Message-IDs live under is
-configuration (`mail.WithMessageIDDomain`), never guessed from a hostname.
+configuration (`EmailConfig.MessageIDDomain`), never guessed from a hostname.
 
 **The submission records are the queue.** There is no separate outbound queue
 store: an `EmailSubmission` with work remaining carries a due-time index
@@ -332,9 +333,10 @@ rejected, not clamped.
 | Mail/Submission capability objects          | Yes    | `maxMailboxesPerEmail`, `maxSizeAttachmentsPerEmail`, `maxDelayedSend`, etc. (sections 1.3.1/1.3.2)        |
 
 Search is a swappable interface (`mail.Searcher`); the built-in implementation
-(`search.InProcess`) is case-insensitive substring matching. MDN (RFC 9007),
-S/MIME verification (RFC 9219), and quotas (RFC 9425) are later datatype
-modules.
+(`search.InProcess`) is case-insensitive substring matching. MDN send/parse
+(RFC 9007) is [`capabilities/mdn`](../../capabilities/mdn), built on this
+module's public seams; S/MIME verification (RFC 9219) and quotas (RFC 9425)
+are later modules.
 
 </details>
 
@@ -356,11 +358,11 @@ delivering a message both ways, and reading it back over JMAP. With no
 
 ## Status and compatibility
 
-Pre-release, tagged v0.2.0. Breaking changes may land in minor bumps until 1.0.
+Pre-release, tagged v0.3.1. Breaking changes may land in minor bumps until 1.0.
 Requires `core` v0.3.0 or later.
 
-Not yet implemented as separate datatype modules: MDN send/parse (RFC 9007),
-S/MIME verification (RFC 9219), quotas (RFC 9425).
+Not yet implemented as separate datatype modules: S/MIME verification
+(RFC 9219), quotas (RFC 9425).
 
 ## Related modules
 
@@ -370,6 +372,7 @@ S/MIME verification (RFC 9219), quotas (RFC 9425).
 | [`drivers/sqlite`](../../drivers/sqlite)                 | Persistence for a single-node mail server           |
 | [`drivers/postgres`](../../drivers/postgres)             | Persistence for a multi-node one                    |
 | [`capabilities/websocket`](../../capabilities/websocket) | Adds RFC 8887 transport; independent of this module |
+| [`capabilities/mdn`](../../capabilities/mdn)             | Adds RFC 9007 MDN send/parse on this module's seams |
 
 For task-oriented guidance see the documentation site:
 [mail](https://naust.email/naust-jmap/mail) and the full

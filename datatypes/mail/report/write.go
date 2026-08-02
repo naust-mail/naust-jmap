@@ -198,11 +198,12 @@ func (m Message) textPart() *message.OutPart {
 	}
 }
 
-// notificationPart is the machine-readable second component: the
-// message/disposition-notification content, whose field order follows the
-// grammar of RFC 8098 section 3.1. Its encoding is 7bit, which section 3.1
-// requires (validation has already established the content is ASCII).
-func (m Message) notificationPart() *message.OutPart {
+// notificationContent assembles the message/disposition-notification
+// content, its field order following the grammar of RFC 8098 section 3.1.
+// Validation measures this same string against the parse-side capture
+// bound, so what it produces is by construction content the parser in
+// this package reads back whole.
+func (m Message) notificationContent() string {
 	var b strings.Builder
 	field := func(name, value string) {
 		b.WriteString(name)
@@ -224,13 +225,20 @@ func (m Message) notificationPart() *message.OutPart {
 	for _, ext := range m.ExtensionFields {
 		field(ext.Name, ext.Value)
 	}
+	return b.String()
+}
+
+// notificationPart is the machine-readable second component. Its encoding
+// is 7bit, which RFC 8098 section 3.1 requires (validation has already
+// established the content is ASCII).
+func (m Message) notificationPart() *message.OutPart {
 	return &message.OutPart{
 		Headers: []message.HeaderField{
 			{Name: "Content-Type", Value: "message/disposition-notification"},
 			{Name: "Content-Transfer-Encoding", Value: message.Enc7Bit},
 		},
 		Encoding: message.Enc7Bit,
-		Content:  readerOf(strings.NewReader(b.String())),
+		Content:  readerOf(strings.NewReader(m.notificationContent())),
 	}
 }
 

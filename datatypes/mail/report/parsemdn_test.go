@@ -218,3 +218,33 @@ func TestParseMDNThirdPartContentUnread(t *testing.T) {
 		t.Errorf("third-part content leaked into TextBody: %q", p.TextBody)
 	}
 }
+
+func TestParseMDNMultipartFirstComponent(t *testing.T) {
+	// The first component may itself be a multipart (RFC 6522 section 3);
+	// its leaves must not starve the machine part of capture, however
+	// many of them are text/plain. The text body stays "": only a
+	// text/plain first component is read.
+	var b strings.Builder
+	b.WriteString("From: joe@example.com\r\nTo: jane@example.org\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/report; report-type=disposition-notification; boundary=rr\r\n" +
+		"\r\n--rr\r\nContent-Type: multipart/alternative; boundary=aa\r\n")
+	for i := 0; i < 10; i++ {
+		b.WriteString("\r\n--aa\r\nContent-Type: text/plain\r\n\r\nDisplayed.\r\n")
+	}
+	b.WriteString("\r\n--aa--\r\n" +
+		"\r\n--rr\r\nContent-Type: message/disposition-notification\r\n\r\n" +
+		"Final-Recipient: rfc822; joe@example.com\r\n" +
+		"Disposition: manual-action/mdn-sent-manually; displayed\r\n" +
+		"\r\n--rr--\r\n")
+	p, err := ParseMDN(strings.NewReader(b.String()))
+	if err != nil {
+		t.Fatalf("ParseMDN: %v", err)
+	}
+	if p.FinalRecipient != "rfc822; joe@example.com" || p.Disposition.Type != "displayed" {
+		t.Errorf("notification misread: %+v", p)
+	}
+	if p.TextBody != "" {
+		t.Errorf("TextBody = %q, want empty for a multipart first component", p.TextBody)
+	}
+}

@@ -73,7 +73,7 @@ func (w *identityWriter) result() (digest [32]byte, size uint64) {
 // it is decoded once (RFC 2045 section 6) and the decoded octets are fanned to
 // the identity writer and every sink together; only a decoded part has a known
 // EncodingProblem. The only error is a failure reading body.
-func feedLeafContent(p *Part, body io.Reader, cte string, factory SinkFactory) error {
+func feedLeafContent(p *Part, body io.Reader, cte string, factory SinkFactory, copyBuf func() []byte) error {
 	if factory == nil {
 		return nil
 	}
@@ -93,9 +93,12 @@ func feedLeafContent(p *Part, body io.Reader, cte string, factory SinkFactory) e
 
 	// The content flows from the message straight through the decoder and out to
 	// every sink together, in pieces: neither its encoded nor its decoded form is
-	// ever assembled. What is kept is what a sink chose to keep.
+	// ever assembled. What is kept is what a sink chose to keep. The copy buffer
+	// is the walk's shared one (walkState.copyBuf): it is refilled leaf after
+	// leaf, which the fan-out may hand to sinks only because a sink copies what
+	// it keeps within its Write call, never retaining the slice.
 	dec := newCTEDecoder(body, cte)
-	if _, err := io.Copy(fanOut(writers), dec); err != nil {
+	if _, err := io.CopyBuffer(fanOut(writers), dec, copyBuf()); err != nil {
 		return err
 	}
 	p.EncodingProblem = dec.problem

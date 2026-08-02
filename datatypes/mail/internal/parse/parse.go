@@ -51,7 +51,7 @@ type Capture struct {
 	// message/disposition-notification part, and the returned-content part
 	// the Message-ID of the original message can be read from. Set by a
 	// delivery ingesting reports; each captured part is bounded
-	// (maxReportCapture).
+	// (MaxReportCapture).
 	Reports bool
 
 	previews    map[*message.Part]*previewSink

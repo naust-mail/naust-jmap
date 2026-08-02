@@ -17,6 +17,8 @@ package report
 import (
 	"fmt"
 	"strings"
+
+	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/parse"
 )
 
 // lineLimit is the RFC 5322 section 2.1.1 maximum line length, 998 octets
@@ -69,7 +71,22 @@ func (m Message) validate() error {
 	if err := m.Disposition.validate(); err != nil {
 		return err
 	}
-	return m.validateExtensions()
+	if err := m.validateExtensions(); err != nil {
+		return err
+	}
+	// Both bounds below are the parse side's capture bound: a generated
+	// MDN must be one this package's own parser reads back. Text past the
+	// bound would be truncated by any reader applying it, and a
+	// notification part past it is rejected outright (ErrNotMDN), so
+	// emitting either would produce a report that fails its own
+	// round-trip.
+	if len(m.TextBody) > parse.MaxReportCapture {
+		return errf("TextBody exceeds %d bytes", parse.MaxReportCapture)
+	}
+	if len(m.notificationContent()) > parse.MaxReportCapture {
+		return errf("notification content exceeds %d bytes; fewer or shorter extension fields are required", parse.MaxReportCapture)
+	}
+	return nil
 }
 
 // validate checks the Disposition field's three values against the closed
@@ -161,9 +178,9 @@ func msgIDSafe(s string) bool {
 // space - safe in a header field position whose grammar admits neither
 // folding nor quoting.
 //
-// This duplicates internal/addr's TokenSafe: report may import only
-// internal/message and the standard library, so the same small predicate
-// is defined here rather than shared.
+// This duplicates internal/addr's TokenSafe: report does not import
+// internal/addr, so the same small predicate is defined here rather than
+// shared.
 func tokenSafe(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] <= 0x20 || s[i] > 0x7e {

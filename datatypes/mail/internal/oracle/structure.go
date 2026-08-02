@@ -19,11 +19,15 @@ const maxMultipartDepth = 64
 // maxParts bounds the total number of body parts a single message yields.
 // maxMultipartDepth caps nesting depth, but not breadth: a bounded-size
 // message can still declare millions of tiny sibling parts, and one Part
-// struct per part balloons a small upload into hundreds of megabytes of
-// heap (roughly 15x). A real message has at most dozens of parts, so this
-// cap is far above anything legitimate; parts beyond it are dropped, the
-// same best-effort truncation maxMultipartDepth uses for over-deep nesting.
-const maxParts = 10000
+// struct per part multiplies a small upload into megabytes of heap and
+// milliseconds of walk. A real message has at most dozens of parts, so
+// this cap is far above anything legitimate; parts beyond it are dropped,
+// the same best-effort truncation maxMultipartDepth uses for over-deep
+// nesting.
+// The value tracks internal/message's: the two caps must agree for the
+// differential comparison to be meaningful on many-part inputs (a bound is
+// shared configuration, not parsing behavior the freeze protects).
+const maxParts = 2048
 
 // parsePart builds the bodyStructure node for one MIME entity.
 // defaultType applies when the entity has no usable Content-Type

@@ -232,6 +232,21 @@ type walkState struct {
 	counter int
 	budget  int
 	factory SinkFactory
+	// buf is the one copy buffer every sink-fed leaf of this walk shares,
+	// allocated on first use. Without it each leaf's copy rents its own,
+	// and a message near the maxParts bound turns that per-leaf rental
+	// into tens of megabytes of transient heap. The walk is
+	// sequential, so reuse is safe as long as sinks honor the io.Writer
+	// contract and never retain the slice they are handed.
+	buf []byte
+}
+
+// copyBuf returns the walk's shared copy buffer.
+func (st *walkState) copyBuf() []byte {
+	if st.buf == nil {
+		st.buf = make([]byte, 32<<10)
+	}
+	return st.buf
 }
 
 // walkEntity builds the bodyStructure node for one MIME entity whose header
@@ -269,7 +284,7 @@ func walkEntity(st *walkState, lr *lineReader, headers []HeaderField, defaultTyp
 		// past, never decoded.
 		st.counter++
 		p.PartID = strconv.Itoa(st.counter)
-		err = feedLeafContent(p, lr, cteOf(headers), st.factory)
+		err = feedLeafContent(p, lr, cteOf(headers), st.factory, st.copyBuf)
 	}
 	if err != nil {
 		return p, err

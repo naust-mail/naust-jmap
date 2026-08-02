@@ -149,6 +149,7 @@ func Register(p *runtime.Processor, cfg Config) (*Queue, error) {
 		return nil, err
 	}
 	q := newSubmissionQueue(db, store)
+	q.policy = policy
 	creator := submissionCreate{db: db, store: store, policy: policy, limits: limits}
 	ext := &runtime.Extensions{
 		Methods: []string{"get", "changes", "set", "query", "queryChanges"},

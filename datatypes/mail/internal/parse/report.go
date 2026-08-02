@@ -2,24 +2,25 @@ package parse
 
 import "github.com/naust-mail/naust-jmap/datatypes/mail/internal/message"
 
-// maxReportCapture bounds what one report part's sink retains. The
+// MaxReportCapture bounds what one report part's sink retains. The
 // machine-parsable content is a short group of header-format fields per
 // message and per recipient (RFC 3464 section 2, RFC 8098 section 3.1), and
 // correlation needs only the leading header block of the returned content -
 // so a conformant report uses a fraction of this. A part that overruns the
 // bound is left uninterpreted (the sink marks it) and the message falls back
-// to ordinary delivery.
-const maxReportCapture = 64 << 10
+// to ordinary delivery. Report generation bounds itself by the same
+// constant, so a report this module emits is always one it reads back.
+const MaxReportCapture = 64 << 10
 
 // ReportSink captures one report part's decoded content up to
-// maxReportCapture, remembering when there was more.
+// MaxReportCapture, remembering when there was more.
 type ReportSink struct {
 	Raw  []byte
 	Over bool
 }
 
 func (s *ReportSink) Write(b []byte) (int, error) {
-	if room := maxReportCapture - len(s.Raw); room > 0 {
+	if room := MaxReportCapture - len(s.Raw); room > 0 {
 		if len(b) > room {
 			b = b[:room]
 			s.Over = true

@@ -47,7 +47,7 @@ func TestExtractReportShape(t *testing.T) {
 		"\r\n--b\r\nContent-Type: text/plain\r\n\r\nhi\r\n" +
 		"--b\r\nContent-Type: message/delivery-status\r\n\r\n" +
 		"Reporting-MTA: dns; a.example\r\n\r\nFinal-Recipient: rfc822; x@example.com\r\nAction: failed\r\n" +
-		// 64<<10 octets: larger than internal/parse's maxReportCapture bound,
+		// 64<<10 octets: larger than internal/parse's MaxReportCapture bound,
 		// so the sink marks the part over and extraction fails open.
 		"Comment: " + strings.Repeat("x", 64<<10) + "\r\n" +
 		"\r\n--b--\r\n"

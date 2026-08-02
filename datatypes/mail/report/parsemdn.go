@@ -81,15 +81,36 @@ type ParsedMDN struct {
 // decoded or retained. Recognition is strict (see ErrNotMDN); any other
 // error is a failure reading r.
 func ParseMDN(r io.Reader) (*ParsedMDN, error) {
+	// Only two parts are ever read - the first component's text and the
+	// machine part, both direct children of the root. The machine part's
+	// type is always granted capture: it is the one part recognition
+	// cannot do without, and a first component that is itself a multipart
+	// (RFC 6522 section 3 permits that) can put arbitrarily many leaves
+	// ahead of it in walk order, so a shared grant budget would let the
+	// first component starve it. text/plain capture is granted to a
+	// bounded number of candidates instead of every leaf - the one text
+	// body ever read is the earliest text/plain of any recognizable MDN,
+	// and a hostile many-part message cannot multiply the per-sink cost
+	// by its part count. Machine-typed parts beyond the second component
+	// only appear in hostile input; their cost stays bounded by the
+	// walker's own part cap and by each sink's capture bound.
+	const maxTextGrants = 8
+	textGrants := 0
 	sinks := map[*message.Part]*parse.ReportSink{}
 	msg, err := message.Parse(r, func(p *message.Part) message.LeafSinks {
 		switch p.Type {
-		case "text/plain", "message/disposition-notification":
-			s := &parse.ReportSink{}
-			sinks[p] = s
-			return message.LeafSinks{Sinks: []message.Sink{s}}
+		case "text/plain":
+			if textGrants >= maxTextGrants {
+				return message.LeafSinks{}
+			}
+			textGrants++
+		case "message/disposition-notification":
+		default:
+			return message.LeafSinks{}
 		}
-		return message.LeafSinks{}
+		s := &parse.ReportSink{}
+		sinks[p] = s
+		return message.LeafSinks{Sinks: []message.Sink{s}}
 	})
 	if err != nil {
 		return nil, err

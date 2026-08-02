@@ -15,11 +15,15 @@ const maxMultipartDepth = 64
 // maxParts bounds the total number of body parts a single message yields.
 // maxMultipartDepth caps nesting depth, but not breadth: a bounded-size
 // message can still declare millions of tiny sibling parts, and one Part
-// struct per part balloons a small upload into hundreds of megabytes of
-// heap (roughly 15x). A real message has at most dozens of parts, so this
-// cap is far above anything legitimate; parts beyond it are dropped, the
-// same best-effort truncation maxMultipartDepth uses for over-deep nesting.
-const maxParts = 10000
+// struct per part multiplies a small upload into megabytes of heap and
+// milliseconds of walk. A real message has at most dozens of parts, so
+// this cap is far above anything legitimate; parts beyond it are dropped,
+// the same best-effort truncation maxMultipartDepth uses for over-deep
+// nesting. Lowering the cap can leave a value derived at delivery under
+// a higher one (a stored hasAttachment) disagreeing with the structure
+// recomputed on read; that only occurs at part counts no real message
+// reaches, and the stored answer simply goes stale.
+const maxParts = 2048
 
 // contentType returns the canonical media type (lowercase, parameters
 // stripped), its parameters, and whether a Content-Type header field was
