@@ -101,8 +101,8 @@ deliberately.
 
 ## Status and compatibility
 
-Pre-release, tagged v0.1.0. Requires `core` v0.3.0 or later and
-`datatypes/mail` v0.3.1 or later.
+Pre-release, tagged v0.1.1. Requires `core` v0.3.0 or later and
+`datatypes/mail` v0.3.2 or later.
 
 ## Related modules
 

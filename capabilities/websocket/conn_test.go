@@ -56,7 +56,7 @@ func newTestServer(t *testing.T) *testServer {
 		t.Fatal(err)
 	}
 	env := &testServer{srv: srv, gate: make(chan struct{}), started: make(chan struct{}, 8)}
-	env.handler = NewHandler(srv, staticAuth{})
+	env.handler = NewHandler(srv, staticAuth{}, Config{})
 	err = srv.Capability(CapabilityURI).
 		Advertise(SessionCapability(srv.BaseURL(), "/ws", false), struct{}{}).
 		Handle("/ws", env.handler).
@@ -584,7 +584,7 @@ func TestRevocationClosesSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := &testServer{srv: srv, gate: make(chan struct{})}
-	env.handler = NewHandler(srv, a)
+	env.handler = NewHandler(srv, a, Config{})
 	if err := srv.Capability(CapabilityURI).Handle("/ws", env.handler).Err(); err != nil {
 		t.Fatal(err)
 	}

@@ -219,14 +219,15 @@ func newInstance(t *testing.T, dsn string, accts []testAccount, cfg instanceConf
 		t.Fatal(err)
 	}
 
-	deliverer, err := deliver.New(db, blobs, resolve)
+	deliverer, err := deliver.New(db, blobs, resolve, deliver.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if cfg.submitter != nil {
-		worker, err := mailsubmit.NewWorker(queue, cfg.submitter,
-			mailsubmit.WorkerConfig{QueueScanInterval: cfg.scanInterval})
+		wcfg := mailsubmit.DefaultWorkerConfig()
+		wcfg.QueueScanInterval = cfg.scanInterval
+		worker, err := mailsubmit.NewWorker(queue, cfg.submitter, wcfg)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -49,7 +49,7 @@ func TestWebSocketEndToEnd(t *testing.T) {
 	if err := srv.Capability(mail.CapabilityURI).Advertise(struct{}{}, mail.DefaultAccountCapability()).Err(); err != nil {
 		t.Fatal(err)
 	}
-	ws := websocket.NewHandler(srv, users)
+	ws := websocket.NewHandler(srv, users, websocket.Config{})
 	ws.EnablePush(db, notifier)
 	if err := srv.Capability(websocket.CapabilityURI).
 		Advertise(websocket.SessionCapability(srv.BaseURL(), "/ws", ws.SupportsPush()), struct{}{}).

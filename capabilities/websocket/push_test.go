@@ -60,7 +60,7 @@ func pushServerCore(t *testing.T, types map[string]string, core jmap.CoreCapabil
 		t.Fatal(err)
 	}
 	env := &testServer{srv: srv, gate: make(chan struct{})}
-	env.handler = NewHandler(srv, staticAuth{})
+	env.handler = NewHandler(srv, staticAuth{}, Config{})
 	env.handler.EnablePush(db, notify.NewInProcess())
 	err = srv.Capability("urn:example:testnote").
 		Advertise(struct{}{}, struct{}{}).
@@ -276,7 +276,7 @@ func TestReauthBackstopClosesOnExpiredCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := &testServer{srv: srv, gate: make(chan struct{})}
-	env.handler = NewHandler(srv, a)
+	env.handler = NewHandler(srv, a, Config{})
 	if err := srv.Capability(CapabilityURI).Handle("/ws", env.handler).Err(); err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +343,7 @@ func TestReauthWithRevokerKnob(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := &testServer{srv: srv, gate: make(chan struct{})}
-	env.handler = NewHandler(srv, a)
+	env.handler = NewHandler(srv, a, Config{})
 	if env.handler.reauthEvery == 0 {
 		t.Fatal("knob set but the reauth loop is not armed")
 	}

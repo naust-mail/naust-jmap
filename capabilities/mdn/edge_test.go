@@ -160,9 +160,9 @@ func TestSendInjection(t *testing.T) {
 		// An extension field may not restate a defined notification
 		// field (RFC 8098 section 3.3 vs the section 3.1 grammar).
 		{"extension shadows Disposition", `"extensionFields":{"Disposition":"manual-action/mdn-sent-manually; deleted"}`, "invalidProperties"},
-		// The identity allow-check sees the raw string first, so an
-		// injected finalRecipient fails as forbiddenFrom.
-		{"finalRecipient", `"finalRecipient":"rfc822; john@example.com\r\nX-Evil: 1"`, "forbiddenFrom"},
+		// An injected finalRecipient fails validation at the property,
+		// before the identity allow-check ever sees it.
+		{"finalRecipient", `"finalRecipient":"rfc822; john@example.com\r\nX-Evil: 1"`, "invalidProperties"},
 	}
 	for _, c := range cases {
 		if serr := notSentError(t, e.mdnSendCall(t, mdnWith(c.mods), sampleOnSuccess)); serr.Type != c.wantType {

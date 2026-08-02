@@ -64,7 +64,7 @@ func TestConnectionChurnSoak(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewHandler(srv, a)
+	handler := NewHandler(srv, a, Config{})
 	handler.EnablePush(db, notify.NewInProcess())
 	err = srv.Capability("urn:example:testnote").Advertise(struct{}{}, struct{}{}).Err()
 	if err != nil {

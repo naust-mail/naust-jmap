@@ -324,20 +324,26 @@ func (h mdnSend) sendOne(ctx context.Context, call *runtime.Call, accountID, ide
 	// becomes the MDN's From as well when the identity has no concrete
 	// address of its own.
 	wildcard := strings.HasPrefix(identity.Email, "*@")
-	finalRecipient := identity.Email
+	finalRecipient := report.GenericAddress{Addr: identity.Email}
 	fromEmail := identity.Email
 	finalDefaulted := true
 	if m.FinalRecipient != "" {
-		bare, ok := genericAddress(m.FinalRecipient)
+		ga, ok := genericAddress(m.FinalRecipient)
 		if !ok {
-			return nil, "", &jmap.SetError{Type: jmap.SetErrInvalidProperties, Properties: []string{"finalRecipient"}, Description: "finalRecipient must be an address, optionally with an rfc822 type prefix"}
+			return nil, "", &jmap.SetError{Type: jmap.SetErrInvalidProperties, Properties: []string{"finalRecipient"}, Description: "finalRecipient must be an address, optionally with an rfc822 or utf-8 type prefix"}
 		}
-		if !identity.AllowsSend(bare) {
-			return nil, "", &jmap.SetError{Type: "forbiddenFrom", Description: fmt.Sprintf("the identity may not issue an MDN for %s", bare)}
+		// The stated type is carried through to the generated report;
+		// what the writer cannot generate (a non-ASCII address needs
+		// the RFC 6533 format) is refused here, at the property.
+		if err := ga.Validate(); err != nil {
+			return nil, "", &jmap.SetError{Type: jmap.SetErrInvalidProperties, Properties: []string{"finalRecipient"}, Description: err.Error()}
 		}
-		finalRecipient, finalDefaulted = bare, false
+		if !identity.AllowsSend(ga.Addr) {
+			return nil, "", &jmap.SetError{Type: "forbiddenFrom", Description: fmt.Sprintf("the identity may not issue an MDN for %s", ga.Addr)}
+		}
+		finalRecipient, finalDefaulted = ga, false
 		if wildcard {
-			fromEmail = bare
+			fromEmail = ga.Addr
 		}
 	} else if wildcard {
 		return nil, "", &jmap.SetError{Type: jmap.SetErrInvalidProperties, Properties: []string{"finalRecipient"}, Description: "the identity covers a whole domain; finalRecipient must name the address the MDN is issued for"}
@@ -357,10 +363,13 @@ func (h mdnSend) sendOne(ctx context.Context, call *runtime.Call, accountID, ide
 	if ids := view.HeaderMessageIDs("Message-ID"); len(ids) > 0 {
 		originalMessageID = ids[0]
 	}
-	var originalRecipient string
+	// The sender's value is copied with its stated address-type; one
+	// that does not validate is unreliable original-recipient
+	// information, and section 3.2.3 omits the field for that case.
+	var originalRecipient report.GenericAddress
 	if v := view.Header("Original-Recipient"); v != "" {
-		if bare, ok := genericAddress(v); ok {
-			originalRecipient = bare
+		if ga, ok := genericAddress(v); ok && ga.Validate() == nil {
+			originalRecipient = ga
 		}
 	}
 
@@ -498,17 +507,17 @@ func (h mdnSend) sendOne(ctx context.Context, call *runtime.Call, accountID, ide
 
 	// The sent echo carries what the server set or defaulted (section
 	// 2.1): the sample response's forms are kept - finalRecipient in the
-	// typed "rfc822; addr" form, originalMessageId as the full
-	// Message-ID header value with its angle brackets.
+	// typed "type; addr" form, originalMessageId as the full Message-ID
+	// header value with its angle brackets.
 	echo := make(map[string]any)
 	if finalDefaulted {
-		echo["finalRecipient"] = "rfc822; " + finalRecipient
+		echo["finalRecipient"] = finalRecipient.String()
 	}
 	if originalMessageID != "" {
 		echo["originalMessageId"] = "<" + originalMessageID + ">"
 	}
-	if originalRecipient != "" {
-		echo["originalRecipient"] = "rfc822; " + originalRecipient
+	if originalRecipient.Addr != "" {
+		echo["originalRecipient"] = originalRecipient.String()
 	}
 	rawEcho, err := json.Marshal(echo)
 	if err != nil {
@@ -559,19 +568,23 @@ func recHasKeyword(rec objectdb.Object, k string) bool {
 	return false
 }
 
-// genericAddress extracts the bare address from a generic-address that
-// may carry an address-type prefix (RFC 8098 section 3.2.4, e.g.
-// "rfc822; john@example.com"). Only the rfc822 and utf-8 types name an
-// email address; a bare address with no prefix passes through.
-func genericAddress(v string) (string, bool) {
+// genericAddress splits a generic-address that may carry an
+// address-type prefix (RFC 8098 section 3.2.4, e.g.
+// "rfc822; john@example.com") into its stated type and address. Only
+// the rfc822 and utf-8 types name an email address (RFC 6533 section
+// 3); a bare address states no type.
+func genericAddress(v string) (report.GenericAddress, bool) {
 	typ, addr, ok := strings.Cut(v, ";")
 	if !ok {
-		addr = v
-	} else if !strings.EqualFold(strings.TrimSpace(typ), "rfc822") && !strings.EqualFold(strings.TrimSpace(typ), "utf-8") {
-		return "", false
+		addr = strings.TrimSpace(v)
+		return report.GenericAddress{Addr: addr}, addr != ""
+	}
+	t := strings.TrimSpace(typ)
+	if !strings.EqualFold(t, "rfc822") && !strings.EqualFold(t, "utf-8") {
+		return report.GenericAddress{}, false
 	}
 	addr = strings.TrimSpace(addr)
-	return addr, addr != ""
+	return report.GenericAddress{Type: t, Addr: addr}, addr != ""
 }
 
 // addrSpecEqual compares two addr-specs the way RFC 8098 section 2.1

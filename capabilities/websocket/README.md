@@ -35,7 +35,7 @@ binary and from the dependency graph.
 Import cost: none beyond the standard library.
 
 ```go
-ws := websocket.NewHandler(srv, users)
+ws := websocket.NewHandler(srv, users, websocket.Config{})
 ws.EnablePush(db, notifier)          // optional: StateChange over the socket
 defer ws.Shutdown()
 
@@ -47,11 +47,17 @@ mux.Handle("/ws", ws)
 The advertised path and the mounted path must match; the session resource is
 what tells a client where to connect.
 
+With no `Origins` stated, browser pages are admitted same-origin only
+(against the server's BaseURL); non-browser clients send no Origin and
+always pass. List exact origins to widen that, or `"*"` for any - safe
+only with header-borne credentials (bearer tokens), never cookies.
+
 ## Public API
 
 | Symbol                                                                  | Kind   | What it is                                                                   |
 |-------------------------------------------------------------------------|--------|------------------------------------------------------------------------------|
-| `NewHandler(srv *runtime.Server, authn auth.Authenticator) *Handler`    | func   | The upgrade endpoint. Mount it on your mux                                   |
+| `NewHandler(srv *runtime.Server, authn auth.Authenticator, cfg Config) *Handler` | func | The upgrade endpoint. Mount it on your mux                            |
+| `Config`                                                                | type   | Construction config. `Origins`: exact origins allowed, `"*"` for any; others get 403 before auth |
 | `Handler`                                                               | type   | An `http.Handler` performing the RFC 6455 handshake and running the socket   |
 | `Handler.EnablePush(db, notifier)`                                      | method | Turn on StateChange push over the socket. Without it `SupportsPush` is false |
 | `Handler.SupportsPush()`                                                | method | Whether push is available, for the advertised capability object              |
@@ -94,7 +100,7 @@ floor, at the cost of one `Authenticate` per connection per interval.
 
 ## Status and compatibility
 
-Pre-release, tagged v0.1.2. Requires `core` v0.3.0 or later.
+Pre-release, tagged v0.1.3. Requires `core` v0.3.0 or later.
 
 Deviation from RFC 8887 worth knowing: no `pushState` is emitted or accepted.
 

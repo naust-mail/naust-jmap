@@ -405,7 +405,9 @@ func main() {
 	// jmap subprotocol. It authenticates with the same bearer tokens, and
 	// because tokenauth implements auth.Revoker, RevokeUser kills live
 	// sockets instantly - no re-auth polling needed.
-	ws := websocket.NewHandler(srv, users)
+	// Same-origin by default; set Config.Origins to admit browser pages
+	// from other origins (RFC 6455 section 10.2).
+	ws := websocket.NewHandler(srv, users, websocket.Config{})
 	ws.EnablePush(db, notifier)
 	if err := srv.Capability(websocket.CapabilityURI).
 		Advertise(websocket.SessionCapability(srv.BaseURL(), "/ws", ws.SupportsPush()), struct{}{}).
@@ -450,9 +452,10 @@ func main() {
 	// Report ingestion correlates inbound DSNs/MDNs with the submissions
 	// they report on, and the vacation responder answers per RFC 3834
 	// through the same submission queue everything else sends through.
-	deliverer, err := deliver.New(db, blobs, resolve,
-		deliver.WithReportIngestion(),
-		deliver.WithVacationResponder(queue))
+	dcfg := deliver.DefaultConfig()
+	dcfg.ReportIngestion = true
+	dcfg.VacationQueue = queue
+	deliverer, err := deliver.New(db, blobs, resolve, dcfg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -462,7 +465,8 @@ func main() {
 	// socket and the same queue engine.
 	var submitter submit.Submitter
 	if *relay != "" {
-		cfg := submit.SMTPRelayConfig{Addr: *relay}
+		cfg := submit.DefaultSMTPRelayConfig()
+		cfg.Addr = *relay
 		switch *relayTLS {
 		case "starttls":
 			cfg.Mode = submit.RequireSTARTTLS
@@ -488,7 +492,7 @@ func main() {
 		submitter = loopbackSubmitter{d: deliverer}
 		log.Printf("loopback sending: no -relay set, submissions deliver to local accounts only")
 	}
-	worker, err := submit.NewWorker(queue, submitter, submit.WorkerConfig{})
+	worker, err := submit.NewWorker(queue, submitter, submit.DefaultWorkerConfig())
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -506,7 +510,7 @@ func main() {
 		log.Fatal(err)
 	}
 	go func() {
-		if err := deliver.ServeLMTP(ln, deliverer, "mailserver.example"); err != nil {
+		if err := deliver.ServeLMTP(ln, deliverer, "mailserver.example", deliver.DefaultLMTPConfig()); err != nil {
 			log.Fatal(err)
 		}
 	}()
@@ -515,7 +519,10 @@ func main() {
 	// adapter, everything else is the JMAP server (/api, /.well-known/jmap,
 	// /eventsource, the blob endpoints).
 	root := http.NewServeMux()
-	root.Handle("/ingest", deliver.NewHTTPIngest(deliverer, deliver.WithIngestHostname("mailserver.example")))
+	root.Handle("/ingest", deliver.NewHTTPIngest(deliverer, deliver.HTTPIngestConfig{
+		MaxInFlight: deliver.DefaultHTTPIngestConfig().MaxInFlight,
+		Hostname:    "mailserver.example",
+	}))
 	root.Handle("/login", users.LoginHandler())
 	root.Handle("/", srv)
 

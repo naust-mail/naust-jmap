@@ -83,7 +83,7 @@ func sampleMDNWire(t *testing.T) string {
 		Subject:           "Read receipt for: World domination",
 		TextBody:          "This receipt shows that the email has been displayed on your recipient's computer. There is no guarantee it has been read or understood.",
 		ReportingUA:       "joes-pc.cs.example.com; Foomail 97.1",
-		FinalRecipient:    "john@example.com",
+		FinalRecipient:    report.GenericAddress{Addr: "john@example.com"},
 		OriginalMessageID: "199509192301.23456@example.org",
 		Disposition: report.Disposition{
 			ActionMode:  "manual-action",

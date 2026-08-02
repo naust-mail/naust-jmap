@@ -220,7 +220,7 @@ and [`drivers/`](drivers) is the guide to writing one.
 Requests and push on one connection instead of `/api` plus `/eventsource`:
 
 ```go
-ws := websocket.NewHandler(srv, users)
+ws := websocket.NewHandler(srv, users, websocket.Config{})
 srv.Capability(websocket.CapabilityURI).
     Advertise(websocket.SessionCapability(srv.BaseURL(), "/ws", ws.SupportsPush()), struct{}{})
 mux.Handle("/ws", ws)

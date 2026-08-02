@@ -49,7 +49,7 @@ func startFuzzServer() {
 	if err != nil {
 		panic(err)
 	}
-	h := NewHandler(srv, staticAuth{})
+	h := NewHandler(srv, staticAuth{}, Config{})
 	if err := srv.Capability(CapabilityURI).Handle("/ws", h).Err(); err != nil {
 		panic(err)
 	}

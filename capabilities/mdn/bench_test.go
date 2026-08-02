@@ -93,7 +93,7 @@ func BenchmarkParseMDNRealistic(b *testing.B) {
 	err := report.Write(context.Background(), &buf, report.Message{
 		From: report.Address{Email: "a@example.com"}, To: report.Address{Email: "b@example.com"},
 		Subject: "Read receipt", TextBody: "Displayed.",
-		FinalRecipient: "a@example.com", OriginalMessageID: "id-1@example.org",
+		FinalRecipient: report.GenericAddress{Addr: "a@example.com"}, OriginalMessageID: "id-1@example.org",
 		Disposition: report.Disposition{ActionMode: "manual-action", SendingMode: "mdn-sent-manually", Type: "displayed"},
 	})
 	if err != nil {
@@ -122,7 +122,7 @@ func benchAssemble(b *testing.B, ext []report.ExtensionField) {
 	msg := report.Message{
 		From: report.Address{Email: "a@example.com"}, To: report.Address{Email: "b@example.com"},
 		Subject: "Read receipt", TextBody: "Displayed.",
-		FinalRecipient: "a@example.com", OriginalMessageID: "id-1@example.org",
+		FinalRecipient: report.GenericAddress{Addr: "a@example.com"}, OriginalMessageID: "id-1@example.org",
 		Disposition:     report.Disposition{ActionMode: "manual-action", SendingMode: "mdn-sent-manually", Type: "displayed"},
 		ExtensionFields: ext,
 	}
@@ -166,7 +166,7 @@ func TestParseMDNHostileAllocs(t *testing.T) {
 func TestAssembleManyExtensionsAllocs(t *testing.T) {
 	msg := report.Message{
 		From: report.Address{Email: "a@example.com"}, To: report.Address{Email: "b@example.com"},
-		FinalRecipient:  "a@example.com",
+		FinalRecipient:  report.GenericAddress{Addr: "a@example.com"},
 		Disposition:     report.Disposition{ActionMode: "manual-action", SendingMode: "mdn-sent-manually", Type: "displayed"},
 		ExtensionFields: manyExtensions(3000),
 	}

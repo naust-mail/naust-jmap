@@ -181,3 +181,69 @@ func TestSendWireMinimal(t *testing.T) {
 		}
 	}
 }
+
+// TestSendWireAddressType: a stated utf-8 address-type survives to the
+// wire on both recipient fields (RFC 6533 section 3 registers it
+// alongside rfc822), a non-ASCII address is refused at the property
+// naming the missing RFC 6533 format, and an Original-Recipient header
+// whose value does not validate is omitted (RFC 8098 section 3.2.3: no
+// reliable original-recipient information).
+func TestSendWireAddressType(t *testing.T) {
+	e := setupSend(t, nil)
+	emailId := e.importMsg(t, receivedMsg(map[string]string{
+		"Original-Recipient": "utf-8; john-alias@example.com",
+	}))
+	mdnJSON := fmt.Sprintf(`{"forEmailId": %q, "finalRecipient": "utf-8; john@example.com",
+		"disposition": {"actionMode":"manual-action","sendingMode":"mdn-sent-manually","type":"displayed"}}`, emailId)
+	r := e.mdnSendCall(t, mdnJSON, sampleOnSuccess)
+	var out struct {
+		Sent map[jmap.Id]map[string]string `json:"sent"`
+	}
+	json.Unmarshal(r.MethodResponses[0].Args, &out)
+	if out.Sent["k1546"] == nil {
+		t.Fatalf("send failed: %s", r.MethodResponses[0].Args)
+	}
+	if got := out.Sent["k1546"]["originalRecipient"]; got != "utf-8; john-alias@example.com" {
+		t.Errorf("echoed originalRecipient = %q", got)
+	}
+	raw := e.sentMDNRaw(t)
+	for _, want := range []string{
+		"Original-Recipient: utf-8; john-alias@example.com",
+		"Final-Recipient: utf-8; john@example.com",
+	} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("MDN wire lacks %q", want)
+		}
+	}
+
+	second := e.importMsg(t, receivedMsg(map[string]string{"Message-ID": "<addr-type-2@example.org>"}))
+	nonASCII := fmt.Sprintf(`{"forEmailId": %q, "finalRecipient": "utf-8; jos\u00e9@example.com",
+		"disposition": {"actionMode":"manual-action","sendingMode":"mdn-sent-manually","type":"displayed"}}`, second)
+	serr := notSentError(t, e.mdnSendCall(t, nonASCII, sampleOnSuccess))
+	if serr.Type != "invalidProperties" || !strings.Contains(serr.Description, "6533") {
+		t.Errorf("non-ASCII finalRecipient = %+v, want invalidProperties naming RFC 6533", serr)
+	}
+}
+
+// TestSendUnreliableOriginalRecipient: an Original-Recipient header the
+// shared validation refuses never reaches the generated report.
+func TestSendUnreliableOriginalRecipient(t *testing.T) {
+	e := setupSend(t, nil)
+	emailId := e.importMsg(t, receivedMsg(map[string]string{
+		"Original-Recipient": "x-thing; john-alias@example.com",
+	}))
+	r := e.mdnSendCall(t, sampleMDN(emailId), sampleOnSuccess)
+	var out struct {
+		Sent map[jmap.Id]map[string]string `json:"sent"`
+	}
+	json.Unmarshal(r.MethodResponses[0].Args, &out)
+	if out.Sent["k1546"] == nil {
+		t.Fatalf("send failed: %s", r.MethodResponses[0].Args)
+	}
+	if _, ok := out.Sent["k1546"]["originalRecipient"]; ok {
+		t.Error("unreliable Original-Recipient echoed")
+	}
+	if raw := e.sentMDNRaw(t); strings.Contains(raw, "Original-Recipient") {
+		t.Error("unreliable Original-Recipient reached the wire")
+	}
+}

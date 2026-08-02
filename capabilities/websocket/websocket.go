@@ -3,6 +3,9 @@ package websocket
 import (
 	"log/slog"
 	"net/http"
+	"net/url"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,7 +23,7 @@ const CapabilityURI = "urn:ietf:params:jmap:websocket"
 // authenticated requests to the jmap subprotocol and runs the
 // connection. Mount it through the server's capability registrar:
 //
-//	ws := websocket.NewHandler(srv, authn)
+//	ws := websocket.NewHandler(srv, authn, websocket.Config{})
 //	err := srv.Capability(websocket.CapabilityURI).
 //		Advertise(websocket.SessionCapability(srv.BaseURL(), "/ws", false), struct{}{}).
 //		Handle("/ws", ws).
@@ -28,6 +31,14 @@ const CapabilityURI = "urn:ietf:params:jmap:websocket"
 type Handler struct {
 	srv   *runtime.Server
 	authn auth.Authenticator
+
+	// origins and anyOrigin are the construction-time origin policy
+	// (see Config.Origins). With none stated, selfOrigin (derived
+	// from the server's BaseURL) is the whole allowlist: same-origin
+	// by default.
+	origins    map[string]bool
+	anyOrigin  bool
+	selfOrigin string
 
 	// db and n are set by EnablePush (see push.go) and guarded by mu;
 	// a nil notifier means push is not supported on this endpoint.
@@ -47,13 +58,63 @@ type Handler struct {
 	closed bool
 }
 
+// Config is the endpoint's construction-time configuration.
+type Config struct {
+	// Origins is the browser origin policy. Each entry is an exact
+	// web origin (scheme://host, with the port when not the scheme
+	// default): a handshake carrying any other Origin is refused
+	// with 403 before authentication runs (RFC 6455 section 10.2).
+	// The single entry "*" allows every origin, the same spelling
+	// and semantics as CORS - correct exactly when no ambient
+	// browser credential can authenticate a request, because the
+	// browser WebSocket API cannot attach headers: an
+	// Authorization-borne credential (a bearer token) is unforgeable
+	// by a hostile page, while cookies and Basic realms travel
+	// automatically. Nil defaults to same-origin with the server's
+	// BaseURL. A handshake with no Origin header always passes -
+	// only browsers send one, and a non-browser client controls its
+	// own headers anyway.
+	Origins []string
+}
+
 // NewHandler wires the endpoint to a runtime server and the same
 // authenticator the rest of the server uses: the WebSocket handshake
 // request authenticates exactly like any HTTP request (RFC 8887
 // section 4.1), and the resulting identity holds for the connection's
-// life (section 4.2).
-func NewHandler(srv *runtime.Server, authn auth.Authenticator) *Handler {
+// life (section 4.2). One HTTP assumption does NOT carry over: the
+// handshake is exempt from the browser's same-origin policy, so an
+// authenticator honoring ambient credentials (cookies, a Basic realm)
+// is reachable by any web page unless origins are restricted (RFC 6455
+// section 10.2). A nil Config.Origins therefore defaults to
+// same-origin with the server's BaseURL - browser pages on any other
+// origin are refused until Config.Origins states a wider policy.
+// Non-browser clients send no Origin and always pass.
+func NewHandler(srv *runtime.Server, authn auth.Authenticator, cfg Config) *Handler {
 	h := &Handler{srv: srv, authn: authn, conns: map[*conn]struct{}{}}
+	for _, o := range cfg.Origins {
+		if o == "*" {
+			h.anyOrigin = true
+			continue
+		}
+		if h.origins == nil {
+			h.origins = make(map[string]bool, len(cfg.Origins))
+		}
+		// Normalized the way the browser serializes the header
+		// (default port omitted), so "https://app.example:443"
+		// still matches what actually arrives.
+		if n := webOrigin(o); n != "" {
+			o = n
+		}
+		h.origins[strings.ToLower(o)] = true
+	}
+	if !h.anyOrigin && len(h.origins) == 0 {
+		if srv != nil {
+			h.selfOrigin = webOrigin(srv.BaseURL())
+		}
+		slog.Debug("websocket: no origin policy stated, defaulting to same-origin "+
+			"(WebSocket bypasses CORS; see Config.Origins)",
+			"origin", h.selfOrigin)
+	}
 	if _, ok := authn.(auth.Revoker); !ok {
 		// Without a revocation stream, an open connection would outlive
 		// its credentials indefinitely; fall back to periodically
@@ -70,9 +131,69 @@ func NewHandler(srv *runtime.Server, authn auth.Authenticator) *Handler {
 	return h
 }
 
+// originAllowed applies the construction-time origin policy. A request
+// with no Origin header always passes - only browsers send one. One
+// carrying it passes under "*", on the Config.Origins list, or (with
+// no policy stated) equal to the server's own origin; comparison is
+// case-insensitive (RFC 6454 section 4 serializes lowercase).
+func (h *Handler) originAllowed(r *http.Request) bool {
+	if h.anyOrigin {
+		return true
+	}
+	o := r.Header.Get("Origin")
+	if o == "" {
+		return true
+	}
+	if len(h.origins) != 0 {
+		return h.origins[strings.ToLower(o)]
+	}
+	return h.selfOrigin != "" && strings.EqualFold(o, h.selfOrigin)
+}
+
+// allowedOrigins renders the origin policy in effect, for the refusal
+// log: the Config.Origins list when one was stated, else the server's
+// own origin. Sorted, so the line is stable across refusals.
+func (h *Handler) allowedOrigins() string {
+	if len(h.origins) == 0 {
+		return h.selfOrigin
+	}
+	list := make([]string, 0, len(h.origins))
+	for o := range h.origins {
+		list = append(list, o)
+	}
+	sort.Strings(list)
+	return strings.Join(list, " ")
+}
+
+// webOrigin reduces a URL to its web origin as a browser would
+// serialize it (RFC 6454 section 6.1: lowercase, the port omitted when
+// it is the scheme's default); empty when the URL does not parse.
+func webOrigin(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	host := u.Host
+	if p := u.Port(); (u.Scheme == "https" && p == "443") || (u.Scheme == "http" && p == "80") {
+		host = strings.TrimSuffix(host, ":"+p)
+	}
+	return strings.ToLower(u.Scheme + "://" + host)
+}
+
 // ServeHTTP authenticates, upgrades, and runs one connection; it
 // returns when the connection is finished.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// The origin policy runs before authentication: a disallowed page
+	// never exercises the authenticator at all (RFC 6455 section 10.2).
+	if !h.originAllowed(r) {
+		// The refused Origin is not logged: it is unauthenticated input,
+		// and it is the policy - not the value that failed it - that a
+		// first-party client blocked by a misconfigured origin needs to
+		// see.
+		slog.Debug("websocket: origin policy refused a handshake", "allowed", h.allowedOrigins())
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
 	ident, err := h.authn.Authenticate(r)
 	if err != nil {
 		// Failed authentication follows normal HTTP semantics: 401 with
