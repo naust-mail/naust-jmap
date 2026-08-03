@@ -101,9 +101,10 @@ go get github.com/naust-mail/naust-jmap/datatypes/mail          # RFC 8621 mail
 go get github.com/naust-mail/naust-jmap/drivers/sqlite          # single-node storage
 go get github.com/naust-mail/naust-jmap/drivers/postgres        # fleet storage
 go get github.com/naust-mail/naust-jmap/capabilities/websocket  # RFC 8887 transport
+go get github.com/naust-mail/naust-jmap/capabilities/quotas     # RFC 9425 quotas
 ```
 
-> `core` and `capabilities/websocket` build on Go 1.24. `datatypes/mail`, both
+> `core`, `capabilities/websocket` and `capabilities/quotas` build on Go 1.24. `datatypes/mail`, both
 > drivers and the examples require **Go 1.25**.
 
 ### 2. Run a server
@@ -130,7 +131,7 @@ reference; the site covers tasks. Nothing is duplicated across the three.
 
 | You want                                  | Look in                                                                                                                                                                                                   |
 |-------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| What a module provides and its public API | That module's README - [`core`](core), [`datatypes/mail`](datatypes/mail), [`drivers/sqlite`](drivers/sqlite), [`drivers/postgres`](drivers/postgres), [`capabilities/websocket`](capabilities/websocket), [`capabilities/mdn`](capabilities/mdn) |
+| What a module provides and its public API | That module's README - [`core`](core), [`datatypes/mail`](datatypes/mail), [`drivers/sqlite`](drivers/sqlite), [`drivers/postgres`](drivers/postgres), [`capabilities/websocket`](capabilities/websocket), [`capabilities/mdn`](capabilities/mdn), [`capabilities/quotas`](capabilities/quotas) |
 | The API reference                         | [pkg.go.dev](https://pkg.go.dev/github.com/naust-mail/naust-jmap/core)                                                                                                                                    |
 | Working code                              | [`examples/`](examples) - quickstart, a full mail server, a two-instance cluster proof                                                                                                                    |
 | How to accomplish a task                  | [naust.email/naust-jmap](https://naust.email/naust-jmap) - quickstart, auth, mail, websocket, fleet, reference                                                                                            |
@@ -239,7 +240,7 @@ runtime.
 | `core/providers/`       | The interfaces the runtime needs (storage, blobs, leases, notifications, auth), each with a built-in in-process implementation                                                | pick or implement         |
 | [`drivers/`](drivers)   | Provider implementations that need third-party dependencies ([sqlite](drivers/sqlite), [postgres](drivers/postgres)), each its own module - and the guide to writing your own | import at most one or two |
 | `datatypes/`            | JMAP datatypes served on top of the runtime ([mail](datatypes/mail) arrives here first), each its own module                                                                  | import what you serve     |
-| `capabilities/`         | Optional protocol capabilities beside the core endpoints (the RFC 8887 [WebSocket](capabilities/websocket) transport first), each its own module                              | import what you want      |
+| `capabilities/`         | Optional protocol capabilities beside the core endpoints ([WebSocket](capabilities/websocket) transport, [MDN](capabilities/mdn), [quotas](capabilities/quotas)), each its own module                              | import what you want      |
 | [`examples/`](examples) | Runnable servers: the quickstart above, a full mail server, and a two-instance cluster proof                                                                                  | read                      |
 
 ## JMAP support
@@ -288,9 +289,10 @@ breaking changes may still land in minor bumps. The mail module (see Mail
 above) reads, composes and sends, over either the sqlite or postgres driver
 (the latter including a multi-node cluster hint layer); read receipts are
 covered by [`capabilities/mdn`](capabilities/mdn) (MDN send/parse, RFC
-9007). Coming next, in order:
+9007), and resource limits by [`capabilities/quotas`](capabilities/quotas)
+(RFC 9425). Coming next, in order:
 
-- S/MIME verification and quotas as further RFC 8621-family modules
+- S/MIME verification and Sieve as further RFC 8621-family modules
 
 ## License
 

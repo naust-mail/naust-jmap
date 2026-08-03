@@ -365,11 +365,12 @@ type Extensions struct {
 	Query *QueryHooks
 	// Visible, when non-nil, is a per-record visibility predicate
 	// consulted by the derived /get and /query. Returning false hides
-	// the record from the caller: /get reports its id in notFound (RFC
-	// 8620 section 5.1 - the id does not exist or the caller lacks
-	// permission to see it) and /query omits it from results. The hook
-	// must be a pure predicate over the request context and the stored
-	// record: no side effects, no I/O.
+	// the record from the caller: /get reports its id in notFound and
+	// /query omits it from results. RFC 8620 section 5.1 defines
+	// notFound as the ids of records that do not exist; it is the only
+	// slot in the response a record withheld from list can occupy. The
+	// hook must be a pure predicate over the request context and the
+	// stored record: no side effects, no I/O.
 	//
 	// /changes is deliberately NOT filtered: it reports ids only, never
 	// content, and a client whose cached copy of a record must be

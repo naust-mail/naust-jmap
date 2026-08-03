@@ -196,6 +196,12 @@ func (st *stdType) get(ctx context.Context, call *Call) []jmap.Invocation {
 	}
 
 	maxGet := int(st.core.MaxObjectsInGet)
+	// notFound reports "the ids passed to the method for records that do
+	// not exist", and is empty when the ids argument was null or empty
+	// (5.1). With ids null the server chose the list, so a record it
+	// cannot return is simply left out rather than reported back as an
+	// id the caller never asked about.
+	explicitIds := a.Ids != nil
 	var ids []jmap.Id
 	if a.Ids == nil {
 		// ids null: all records, subject to maxObjectsInGet (5.1).
@@ -252,15 +258,22 @@ func (st *stdType) get(ctx context.Context, call *Call) []jmap.Invocation {
 	for i, obj := range objs {
 		id := ids[i]
 		if obj == nil {
-			resp.NotFound = append(resp.NotFound, id)
+			if explicitIds {
+				resp.NotFound = append(resp.NotFound, id)
+			}
 			continue
 		}
 		// A record the Visible hook hides is reported exactly like one
-		// that does not exist: RFC 8620 section 5.1 defines notFound as
-		// ids that do not exist OR the caller lacks permission to see,
-		// so a hidden record is indistinguishable from an absent one.
+		// that does not exist: 5.1 defines notFound as ids that do not
+		// exist OR the caller lacks permission to see, so a hidden
+		// record is indistinguishable from an absent one. That
+		// indistinguishability is why an ids:null call must not name it
+		// either - the server built that id list itself, and an absent
+		// record would never have appeared in it.
 		if st.ext != nil && st.ext.Visible != nil && !st.ext.Visible(ctx, a.AccountId, obj) {
-			resp.NotFound = append(resp.NotFound, id)
+			if explicitIds {
+				resp.NotFound = append(resp.NotFound, id)
+			}
 			continue
 		}
 		if len(computed) > 0 {
