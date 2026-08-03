@@ -196,6 +196,13 @@ func (st *stdType) get(ctx context.Context, call *Call) []jmap.Invocation {
 	}
 
 	maxGet := int(st.core.MaxObjectsInGet)
+	// notFound holds "the ids passed to the method for records that do
+	// not exist", and is empty when the ids argument was null or an
+	// empty array (5.1). With ids null the server chose the id list
+	// itself, so a record that has gone between listing and loading is
+	// left out rather than named back to a caller that never asked for
+	// it.
+	explicitIds := a.Ids != nil
 	var ids []jmap.Id
 	if a.Ids == nil {
 		// ids null: all records, subject to maxObjectsInGet (5.1).
@@ -247,7 +254,9 @@ func (st *stdType) get(ctx context.Context, call *Call) []jmap.Invocation {
 	for i, obj := range objs {
 		id := ids[i]
 		if obj == nil {
-			resp.NotFound = append(resp.NotFound, id)
+			if explicitIds {
+				resp.NotFound = append(resp.NotFound, id)
+			}
 			continue
 		}
 		if len(computed) > 0 {
