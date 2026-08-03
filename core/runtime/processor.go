@@ -48,8 +48,6 @@ type Handler func(ctx context.Context, call *Call) []jmap.Invocation
 type Processor struct {
 	methods      map[string]method
 	capabilities map[string]bool
-	// MaxCallsInRequest bounds methodCalls length; zero means no bound.
-	MaxCallsInRequest int
 	// verifyQueryProjection enables the projected-evaluation assertion
 	// mode for test builds (see VerifyQueryProjection).
 	verifyQueryProjection bool

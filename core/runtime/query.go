@@ -2,10 +2,13 @@ package runtime
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/bits"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -76,7 +79,7 @@ func (st *stdType) query(ctx context.Context, call *Call) []jmap.Invocation {
 	if errType != "" {
 		return fail(call.CallID, errType, desc)
 	}
-	compare, errType, desc := st.buildCompare(ctx, a.AccountId, a.Sort)
+	ord, errType, desc := st.buildCompare(ctx, a.AccountId, a.Sort)
 	if errType != "" {
 		return fail(call.CallID, errType, desc)
 	}
@@ -94,7 +97,16 @@ func (st *stdType) query(ctx context.Context, call *Call) []jmap.Invocation {
 		limit = *a.Limit
 	}
 
-	results, err := st.evaluate(ctx, a.AccountId, root, compare, len(a.Sort) == 0, collapse, extra, nil, st.queryProjection(root, a.Sort, collapse))
+	// Only the window is read back, so only the window needs ordering -
+	// unless an anchor has to be located in the whole list, or a
+	// negative position counts back from its end, or a collapse or an
+	// Arrange hook consumes every result in order.
+	if a.Anchor == nil && a.Position >= 0 && !collapse {
+		if q := st.queryHooks(); q == nil || q.Arrange == nil {
+			ord.window = int(a.Position + limit)
+		}
+	}
+	results, err := st.evaluate(ctx, a.AccountId, root, ord, len(a.Sort) == 0, collapse, extra, nil, st.queryProjection(root, a.Sort, collapse))
 	if err != nil {
 		return fail(call.CallID, jmap.ErrServerFail, err.Error())
 	}
@@ -245,7 +257,7 @@ func (st *stdType) queryChanges(ctx context.Context, call *Call) []jmap.Invocati
 	}
 	// Sort validation goes through the same path as /query, so a type's
 	// SortSemantics answers identically on both methods.
-	compare, errType, desc := st.buildCompare(ctx, a.AccountId, a.Sort)
+	ord, errType, desc := st.buildCompare(ctx, a.AccountId, a.Sort)
 	if errType != "" {
 		return fail(call.CallID, errType, desc)
 	}
@@ -472,7 +484,7 @@ func (st *stdType) queryChanges(ctx context.Context, call *Call) []jmap.Invocati
 				}
 			}
 		}
-		results, err := st.evaluate(ctx, a.AccountId, root, compare, len(a.Sort) == 0, collapse, nil, restrict, wanted)
+		results, err := st.evaluate(ctx, a.AccountId, root, ord, len(a.Sort) == 0, collapse, nil, restrict, wanted)
 		if err != nil {
 			return fail(call.CallID, jmap.ErrServerFail, err.Error())
 		}
@@ -622,7 +634,7 @@ func setToSortedIds(set map[jmap.Id]bool) []jmap.Id {
 	for id := range set {
 		out = append(out, id)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 
@@ -651,15 +663,15 @@ type filterNode struct {
 // wanted, when non-nil, narrows what each loaded record materializes
 // to the properties the query provably reads (see queryProjection);
 // nil loads full records.
-func (st *stdType) evaluate(ctx context.Context, acct jmap.Id, root *filterNode, compare func(a, b objectdb.Object) int, emptySort, collapse bool, extra map[string]json.RawMessage, restrict map[jmap.Id]bool, wanted map[string]bool) ([]jmap.Id, error) {
-	results, err := st.evaluateWith(ctx, acct, root, compare, emptySort, collapse, extra, restrict, wanted)
+func (st *stdType) evaluate(ctx context.Context, acct jmap.Id, root *filterNode, ord *ordering, emptySort, collapse bool, extra map[string]json.RawMessage, restrict map[jmap.Id]bool, wanted map[string]bool) ([]jmap.Id, error) {
+	results, err := st.evaluateWith(ctx, acct, root, ord, emptySort, collapse, extra, restrict, wanted)
 	if err != nil || wanted == nil || !st.p.verifyQueryProjection {
 		return results, err
 	}
 	// Assertion mode (Processor.VerifyQueryProjection): the projected
 	// answer must equal the full-decode answer, or a reads declaration
 	// omitted a property its hook reads.
-	full, err := st.evaluateWith(ctx, acct, root, compare, emptySort, collapse, extra, restrict, nil)
+	full, err := st.evaluateWith(ctx, acct, root, ord, emptySort, collapse, extra, restrict, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -674,7 +686,7 @@ func (st *stdType) evaluate(ctx context.Context, acct jmap.Id, root *filterNode,
 	return results, nil
 }
 
-func (st *stdType) evaluateWith(ctx context.Context, acct jmap.Id, root *filterNode, compare func(a, b objectdb.Object) int, emptySort, collapse bool, extra map[string]json.RawMessage, restrict map[jmap.Id]bool, wanted map[string]bool) ([]jmap.Id, error) {
+func (st *stdType) evaluateWith(ctx context.Context, acct jmap.Id, root *filterNode, ord *ordering, emptySort, collapse bool, extra map[string]json.RawMessage, restrict map[jmap.Id]bool, wanted map[string]bool) ([]jmap.Id, error) {
 	// Candidate set: the filter tree composed from index producers, a
 	// SUPERSET of the true matches (5.5). exact reports the set is precisely
 	// the match set, so no residual predicate could drop any; narrowed
@@ -713,11 +725,9 @@ func (st *stdType) evaluateWith(ctx context.Context, acct jmap.Id, root *filterN
 		return nil, err
 	}
 	// Ties (including the empty sort) fall back to id order, keeping the
-	// full order stable between calls as 5.5 requires. compare is that
+	// full order stable between calls as 5.5 requires. ord is that
 	// total order; collapse and Arrange receive records in it.
-	sort.SliceStable(matched, func(i, j int) bool {
-		return compare(matched[i].Obj, matched[j].Obj) < 0
-	})
+	ord.sortRecords(matched)
 	// collapseThreads keeps only the first record of each grouping-key
 	// value in the sorted list (RFC 8621 4.4.3); core behaviour, the
 	// type supplies only the key name.
@@ -725,7 +735,7 @@ func (st *stdType) evaluateWith(ctx context.Context, acct jmap.Id, root *filterN
 		matched = collapseByKey(matched, st.collapseKey())
 	}
 	if q := st.queryHooks(); q != nil && q.Arrange != nil {
-		return q.Arrange(ctx, acct, matched, compare, extra)
+		return q.Arrange(ctx, acct, matched, ord.compareFunc(), extra)
 	}
 	results := make([]jmap.Id, len(matched))
 	for i, m := range matched {
@@ -1246,9 +1256,8 @@ func intersectSets(a, b map[jmap.Id]bool) map[jmap.Id]bool {
 }
 
 func dedupSortIds(ids []jmap.Id) []jmap.Id {
-	out := make([]jmap.Id, len(ids))
-	copy(out, ids)
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	out := slices.Clone(ids)
+	slices.Sort(out)
 	// The candidate set already carries unique ids (map-backed), so no
 	// dedup pass is needed; sorting gives the stable id order the empty-sort
 	// result requires (5.5).
@@ -1342,23 +1351,46 @@ func (st *stdType) projectConds(n *filterNode, wanted map[string]bool) bool {
 
 // ---- sort ----
 
-// buildCompare returns the total-order comparison for /query results. A
-// type with a Sort override owns comparator parsing and comparison
-// (PROVISIONAL; see SortSemantics); otherwise the core declared-property
-// comparators apply. Either way an id tiebreak is appended so equal
-// records keep the stable order 5.5 requires.
-func (st *stdType) buildCompare(ctx context.Context, acct jmap.Id, sortRaw []json.RawMessage) (func(a, b objectdb.Object) int, string, string) {
+// ordering is the total order for /query results. A type with a Sort
+// override owns comparator parsing and comparison (PROVISIONAL; see
+// SortSemantics) and arrives as an opaque comparison; otherwise the
+// core declared-property comparators apply and stay visible here, which
+// is what lets sortRecords decode each record's comparison values once
+// instead of on every comparison. Either way an id tiebreak follows, so
+// equal records keep the stable order 5.5 requires.
+type ordering struct {
+	cmps []comparator                   // core language; nil under a Sort override
+	less func(a, b objectdb.Object) int // type-supplied; nil for the core language
+	// window is how many leading results the request actually reads,
+	// zero when it reads all of them - an anchor searches the whole
+	// list, and Foo/queryChanges consumes it entire. Ordering only that
+	// many is the difference between n log n comparisons and about n.
+	window int
+}
+
+// buildCompare returns the ordering for /query results.
+func (st *stdType) buildCompare(ctx context.Context, acct jmap.Id, sortRaw []json.RawMessage) (*ordering, string, string) {
 	if st.ext != nil && st.ext.Query != nil && st.ext.Query.Sort != nil {
 		less, errType, desc := st.ext.Query.Sort.ParseSort(ctx, acct, sortRaw)
 		if errType != "" {
 			return nil, errType, desc
 		}
-		return withIdTiebreak(less), "", ""
+		return &ordering{less: less}, "", ""
 	}
 	cmps, errType, desc := parseComparators(st.t, sortRaw)
 	if errType != "" {
 		return nil, errType, desc
 	}
+	return &ordering{cmps: cmps}, "", ""
+}
+
+// compareFunc is the record-pair comparison, for the caller that can
+// take only a function: QueryHooks.Arrange.
+func (o *ordering) compareFunc() func(a, b objectdb.Object) int {
+	if o.cmps == nil {
+		return withIdTiebreak(o.less)
+	}
+	cmps := o.cmps
 	return func(a, b objectdb.Object) int {
 		for _, c := range cmps {
 			if r := c.compare(a, b); r != 0 {
@@ -1366,7 +1398,126 @@ func (st *stdType) buildCompare(ctx context.Context, acct jmap.Id, sortRaw []jso
 			}
 		}
 		return strings.Compare(string(a["id"]), string(b["id"]))
-	}, "", ""
+	}
+}
+
+// sortRecords orders matched in place. Under the core language it is
+// decorate-sort-undecorate: each comparator's value is decoded once per
+// record, and the comparisons read the decoded values. Comparing the
+// records directly re-decodes the same JSON value about 2n log n times,
+// which for a string property is a scan and a case fold per comparison.
+// What the sort itself moves is a permutation, not the records. The
+// order produced is the one compareFunc gives, ties and missing
+// properties included.
+func (o *ordering) sortRecords(matched []QueryRecord) {
+	if o.cmps == nil {
+		less := o.compareFunc()
+		slices.SortStableFunc(matched, func(a, b QueryRecord) int {
+			return less(a.Obj, b.Obj)
+		})
+		return
+	}
+	k := len(o.cmps)
+	// One backing array for every record's values, not one slice each.
+	values := make([]sortValue, len(matched)*k)
+	ids := make([]json.RawMessage, len(matched))
+	order := make([]int32, len(matched))
+	for i, m := range matched {
+		row := values[i*k : (i+1)*k]
+		for j := range o.cmps {
+			row[j] = o.cmps[j].sortValue(m.Obj)
+		}
+		ids[i] = m.Obj["id"]
+		order[i] = int32(i)
+	}
+	// The input position is the last tiebreak, after the id, so the
+	// order is strict by construction: selection and sorting both put
+	// equal-comparing entries in one fixed sequence.
+	less := func(x, y int32) int {
+		vx, vy := values[int(x)*k:], values[int(y)*k:]
+		for j := range o.cmps {
+			if r := o.cmps[j].compareValues(vx[j], vy[j]); r != 0 {
+				return r
+			}
+		}
+		if r := bytes.Compare(ids[x], ids[y]); r != 0 {
+			return r
+		}
+		return cmp.Compare(x, y)
+	}
+	if w := o.window; w > 0 && w < len(order) {
+		// Only the first w results are read, so the rest need to be out
+		// of the way, not in order: selection puts them there in about n
+		// comparisons, and only the prefix is then sorted. Every position
+		// the caller reads holds what a full sort would have put there.
+		selectPrefix(order, w, less)
+		slices.SortStableFunc(order[:w], less)
+	} else {
+		slices.SortStableFunc(order, less)
+	}
+	src := slices.Clone(matched)
+	for i, pos := range order {
+		matched[i] = src[pos]
+	}
+}
+
+// selectPrefix rearranges order so its first w entries are the w
+// smallest under less, unordered among themselves. Hoare partitioning
+// with a median-of-three pivot, recursing only into the side holding
+// the boundary, and falling back to a full sort if the pivots go badly
+// enough to threaten quadratic time.
+func selectPrefix(order []int32, w int, less func(x, y int32) int) {
+	budget := 2 * bits.Len(uint(len(order)))
+	lo, hi := 0, len(order)
+	for hi-lo > 12 {
+		if budget == 0 {
+			slices.SortStableFunc(order[lo:hi], less)
+			return
+		}
+		budget--
+		mid := medianOfThree(order, lo, lo+(hi-lo)/2, hi-1, less)
+		order[lo], order[mid] = order[mid], order[lo]
+		pivot := order[lo]
+		i, j := lo+1, hi-1
+		for {
+			for i <= j && less(order[i], pivot) < 0 {
+				i++
+			}
+			for i <= j && less(order[j], pivot) > 0 {
+				j--
+			}
+			if i > j {
+				break
+			}
+			order[i], order[j] = order[j], order[i]
+			i++
+			j--
+		}
+		order[lo], order[j] = order[j], order[lo]
+		switch {
+		case w <= j:
+			hi = j
+		case w == j+1:
+			return
+		default:
+			lo = j + 1
+		}
+	}
+	slices.SortStableFunc(order[lo:hi], less)
+}
+
+// medianOfThree returns the index of the median of three entries.
+func medianOfThree(order []int32, a, b, c int, less func(x, y int32) int) int {
+	if less(order[b], order[a]) < 0 {
+		a, b = b, a
+	}
+	if less(order[c], order[b]) < 0 {
+		b = c
+		if less(order[b], order[a]) < 0 {
+			b = a
+		}
+	}
+	return b
 }
 
 // withIdTiebreak appends the id tiebreak to a type-supplied comparator; a
@@ -1428,29 +1579,69 @@ func parseComparators(t *descriptor.Type, raws []json.RawMessage) ([]comparator,
 	return out, "", ""
 }
 
-// compare returns <0, 0, >0 for a against b under this comparator.
-// Records missing the property sort first (a deterministic, stable
-// choice; 5.5 leaves it to the type).
+// compare returns <0, 0, >0 for a against b under this comparator. It
+// decodes both values and hands them to compareValues, so the pairwise
+// comparison and the decoded one are one rule with one implementation.
 func (c comparator) compare(a, b objectdb.Object) int {
-	ra, hasA := a[c.name]
-	rb, hasB := b[c.name]
+	return c.compareValues(c.sortValue(a), c.sortValue(b))
+}
+
+// sortValue is one record's decoded value for one comparator, decoded
+// once and compared many times. The states mirror the branches of a
+// comparison: the property absent, its value not encodable for the
+// kind, and a usable value - which for the i;ascii-numeric collation is
+// the leading digit run rather than an encoded index value, and for the
+// kinds SortInt covers is an integer rather than encoded bytes.
+type sortValue struct {
+	present bool
+	ok      bool
+	isInt   bool
+	num     int64
+	key     []byte
+	digits  string
+}
+
+// sortValue decodes obj's value for this comparator.
+func (c comparator) sortValue(obj objectdb.Object) sortValue {
+	raw, has := obj[c.name]
+	if !has {
+		return sortValue{}
+	}
+	if c.numeric {
+		digits, ok := leadingDigits(raw)
+		return sortValue{present: true, ok: ok, digits: digits}
+	}
+	if n, ok := objectdb.SortInt(c.prop, raw); ok {
+		return sortValue{present: true, ok: true, isInt: true, num: n}
+	}
+	k, err := objectdb.SortKey(c.prop, raw)
+	if err != nil {
+		return sortValue{present: true}
+	}
+	return sortValue{present: true, ok: true, key: k}
+}
+
+// compareValues returns <0, 0, >0 for a against b under this
+// comparator. Records missing the property sort first (a deterministic,
+// stable choice; 5.5 leaves it to the type), and a value that does not
+// encode for its kind compares equal to everything.
+func (c comparator) compareValues(a, b sortValue) int {
 	var r int
 	switch {
-	case !hasA && !hasB:
+	case !a.present && !b.present:
 		return 0
-	case !hasA:
+	case !a.present:
 		r = -1
-	case !hasB:
+	case !b.present:
 		r = 1
 	case c.numeric:
-		r = compareASCIINumeric(ra, rb)
+		r = compareDigitRuns(a, b)
+	case !a.ok || !b.ok:
+		return 0
+	case a.isInt && b.isInt:
+		r = cmp.Compare(a.num, b.num)
 	default:
-		ka, err1 := objectdb.SortKey(c.prop, ra)
-		kb, err2 := objectdb.SortKey(c.prop, rb)
-		if err1 != nil || err2 != nil {
-			return 0
-		}
-		r = bytes.Compare(ka, kb)
+		r = bytes.Compare(a.key, b.key)
 	}
 	if c.descending {
 		return -r
@@ -1458,31 +1649,28 @@ func (c comparator) compare(a, b objectdb.Object) int {
 	return r
 }
 
-// compareASCIINumeric implements the i;ascii-numeric collation
-// (RFC 4790 section 9.1) for JSON string values: order by the leading
-// run of ASCII digits interpreted as a decimal integer; values with no
-// leading digit compare equal to each other and greater than all
-// numeric values.
-func compareASCIINumeric(a, b json.RawMessage) int {
-	da, okA := leadingDigits(a)
-	db, okB := leadingDigits(b)
+// compareDigitRuns implements the i;ascii-numeric collation (RFC 4790
+// section 9.1) over decoded values: order by the leading run of ASCII
+// digits interpreted as a decimal integer; values with no leading digit
+// compare equal to each other and greater than all numeric values.
+func compareDigitRuns(a, b sortValue) int {
 	switch {
-	case !okA && !okB:
+	case !a.ok && !b.ok:
 		return 0
-	case !okA:
+	case !a.ok:
 		return 1
-	case !okB:
+	case !b.ok:
 		return -1
 	}
-	// Compare as unbounded integers: strip leading zeros, then longer is
-	// bigger, then lexicographic.
-	if len(da) != len(db) {
-		if len(da) < len(db) {
+	// Compare as unbounded integers: leading zeros are already stripped,
+	// so longer is bigger, then lexicographic.
+	if len(a.digits) != len(b.digits) {
+		if len(a.digits) < len(b.digits) {
 			return -1
 		}
 		return 1
 	}
-	return strings.Compare(da, db)
+	return strings.Compare(a.digits, b.digits)
 }
 
 func leadingDigits(raw json.RawMessage) (string, bool) {

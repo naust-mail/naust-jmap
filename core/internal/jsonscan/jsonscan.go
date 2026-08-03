@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"hash/maphash"
 	"sort"
+	"strings"
 	"unicode/utf16"
 	"unicode/utf8"
 )
@@ -261,6 +262,38 @@ func String(raw []byte) (string, bool) {
 		return "", false
 	}
 	return v, true
+}
+
+// StringFolded decodes one complete JSON string value and returns it
+// lowercased in ONE allocation, where String followed by
+// strings.ToLower costs two: the decoded string, then the folded copy.
+// An escape-free all-ASCII span - what a stored property value nearly
+// always is - folds as it is copied, lowering ASCII being
+// byte-identical to strings.ToLower there; anything else falls back to
+// strings.ToLower, so the folding rule itself is unchanged. The result
+// never aliases raw, so a caller may retain it.
+func StringFolded(raw []byte) ([]byte, bool) {
+	s := &scanner{buf: raw}
+	s.skipSpace()
+	start := s.pos
+	if err := s.skipString(); err != nil {
+		return nil, false
+	}
+	span := s.buf[start+1 : s.pos-1]
+	if s.end() != nil {
+		return nil, false
+	}
+	if !cleanASCII(span) {
+		return []byte(strings.ToLower(unquote(span))), true
+	}
+	out := make([]byte, len(span))
+	for i, c := range span {
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		out[i] = c
+	}
+	return out, true
 }
 
 // ValidString reports whether raw is one complete JSON string value,

@@ -3,7 +3,6 @@ package objectdb
 import (
 	"bytes"
 	"errors"
-	"strings"
 	"time"
 
 	"github.com/naust-mail/naust-jmap/core/descriptor"
@@ -123,6 +122,56 @@ func pendingKey(acct, blobID jmap.Id) []byte {
 	return key(seg(string(acct)), seg("p"), seg(string(blobID)))
 }
 
+// utcDateMicros reads the canonical RFC 3339 UTC form a stored date
+// nearly always has ("2026-08-04T12:30:00Z") straight from the JSON
+// bytes, returning microseconds since the epoch as the date encoding
+// counts them. ok is false for every other shape - an offset, a
+// fractional second, anything malformed - and the caller falls back to
+// time.Parse, so the accepted set only ever shrinks the work, never the
+// meaning. It exists because the fallback materializes a string for
+// every value it reads, which on a sort or an index rebuild is one
+// string per record.
+func utcDateMicros(raw []byte) (int64, bool) {
+	if len(raw) != 22 || raw[0] != '"' || raw[21] != '"' {
+		return 0, false
+	}
+	s := raw[1:21]
+	if s[4] != '-' || s[7] != '-' || s[10] != 'T' || s[13] != ':' || s[16] != ':' || s[19] != 'Z' {
+		return 0, false
+	}
+	num := func(at, width int) (int, bool) {
+		v := 0
+		for i := at; i < at+width; i++ {
+			c := s[i]
+			if c < '0' || c > '9' {
+				return 0, false
+			}
+			v = v*10 + int(c-'0')
+		}
+		return v, true
+	}
+	year, ok1 := num(0, 4)
+	month, ok2 := num(5, 2)
+	day, ok3 := num(8, 2)
+	hour, ok4 := num(11, 2)
+	minute, ok5 := num(14, 2)
+	second, ok6 := num(17, 2)
+	if !(ok1 && ok2 && ok3 && ok4 && ok5 && ok6) {
+		return 0, false
+	}
+	if month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 60 {
+		return 0, false
+	}
+	t := time.Date(year, time.Month(month), day, hour, minute, second, 0, time.UTC)
+	// time.Date normalizes a day past the end of its month (April 31
+	// becomes May 1) where time.Parse refuses it; refusing the mismatch
+	// keeps this path and the fallback answering identically.
+	if t.Year() != year || int(t.Month()) != month || t.Day() != day {
+		return 0, false
+	}
+	return t.UnixMicro(), true
+}
+
 // indexValue encodes a property value so that bytes.Compare on index
 // keys matches the type's comparison rules (RFC 8620 section 5.5:
 // booleans false<true, numbers numerically, dates chronologically;
@@ -145,11 +194,11 @@ func indexValue(p descriptor.Property, raw []byte) ([]byte, error) {
 	}
 	switch p.Kind {
 	case descriptor.KindString:
-		s, ok := jsonscan.String(raw)
+		k, ok := jsonscan.StringFolded(raw) // casemap fold, one allocation
 		if !ok {
 			return nil, errBadIndexValue
 		}
-		return []byte(strings.ToLower(s)), nil // ASCII casemap fold
+		return k, nil
 	case descriptor.KindBool:
 		b, ok := jsonscan.Bool(raw)
 		if !ok {
@@ -166,6 +215,9 @@ func indexValue(p descriptor.Property, raw []byte) ([]byte, error) {
 		}
 		return backend.EncodeInt64(n), nil
 	case descriptor.KindDate:
+		if micros, ok := utcDateMicros(raw); ok {
+			return backend.EncodeInt64(micros), nil
+		}
 		s, ok := jsonscan.String(raw)
 		if !ok {
 			return nil, errBadIndexValue

@@ -1333,3 +1333,44 @@ func (db *DB) TaggedAccounts(ctx context.Context, tag string) ([]jmap.Id, error)
 func SortKey(p descriptor.Property, raw json.RawMessage) ([]byte, error) {
 	return indexValue(p, raw)
 }
+
+// SortInt is SortKey for the kinds whose encoding is exactly an ordered
+// int64 - booleans, integers, and dates - returning that integer rather
+// than the encoded bytes, so a caller keying an in-memory sort on it
+// allocates nothing per record. The order it induces is the one SortKey
+// induces. ok is false for any other kind, for a Nullable property
+// (whose encoding carries a leading tag byte), and for a value that
+// does not match the kind; the caller then uses SortKey.
+func SortInt(p descriptor.Property, raw json.RawMessage) (int64, bool) {
+	if p.Nullable {
+		return 0, false
+	}
+	switch p.Kind {
+	case descriptor.KindBool:
+		b, ok := jsonscan.Bool(raw)
+		if !ok {
+			return 0, false
+		}
+		if b {
+			return 1, true
+		}
+		return 0, true
+	case descriptor.KindInt, descriptor.KindUnsignedInt:
+		return jsonscan.Int(raw)
+	case descriptor.KindDate:
+		// Microseconds since the epoch, as indexValue encodes a date.
+		if micros, ok := utcDateMicros(raw); ok {
+			return micros, true
+		}
+		s, ok := jsonscan.String(raw)
+		if !ok {
+			return 0, false
+		}
+		t, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			return 0, false
+		}
+		return t.UnixMicro(), true
+	}
+	return 0, false
+}
