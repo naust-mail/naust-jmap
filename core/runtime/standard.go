@@ -240,11 +240,6 @@ func (st *stdType) get(ctx context.Context, call *Call) []jmap.Invocation {
 	if len(computed) > 0 {
 		projection = nil
 	}
-	// A Visible hook may read any stored property to decide, so it needs
-	// the full record even when the client asked for a narrow list.
-	if st.ext != nil && st.ext.Visible != nil {
-		projection = nil
-	}
 	objs, err := st.db.GetManyProjected(ctx, a.AccountId, st.t.Name, ids, projection)
 	if err != nil {
 		return fail(call.CallID, jmap.ErrServerFail, err.Error())
@@ -252,14 +247,6 @@ func (st *stdType) get(ctx context.Context, call *Call) []jmap.Invocation {
 	for i, obj := range objs {
 		id := ids[i]
 		if obj == nil {
-			resp.NotFound = append(resp.NotFound, id)
-			continue
-		}
-		// A record the Visible hook hides is reported exactly like one
-		// that does not exist: RFC 8620 section 5.1 defines notFound as
-		// ids that do not exist OR the caller lacks permission to see,
-		// so a hidden record is indistinguishable from an absent one.
-		if st.ext != nil && st.ext.Visible != nil && !st.ext.Visible(ctx, a.AccountId, obj) {
 			resp.NotFound = append(resp.NotFound, id)
 			continue
 		}
@@ -276,17 +263,6 @@ func (st *stdType) get(ctx context.Context, call *Call) []jmap.Invocation {
 			}
 			for _, name := range computed {
 				if v, has := resolved[name]; has {
-					filtered[name] = v
-				}
-			}
-			obj = filtered
-		} else if projection == nil {
-			// The load was widened past the requested properties (the
-			// Visible hook needed the full record), so the response copy
-			// narrows back to exactly what the client asked for.
-			filtered := make(objectdb.Object, len(props))
-			for name := range props {
-				if v, has := obj[name]; has {
 					filtered[name] = v
 				}
 			}

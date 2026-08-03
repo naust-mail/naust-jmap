@@ -675,13 +675,6 @@ func (st *stdType) evaluate(ctx context.Context, acct jmap.Id, root *filterNode,
 }
 
 func (st *stdType) evaluateWith(ctx context.Context, acct jmap.Id, root *filterNode, compare func(a, b objectdb.Object) int, emptySort, collapse bool, extra map[string]json.RawMessage, restrict map[jmap.Id]bool, wanted map[string]bool) ([]jmap.Id, error) {
-	// A Visible hook must judge every result record, which rules out any
-	// answer produced without loading records, and it may read any stored
-	// property, so loads must materialize full records.
-	hasVisible := st.ext != nil && st.ext.Visible != nil
-	if hasVisible {
-		wanted = nil
-	}
 	// Candidate set: the filter tree composed from index producers, a
 	// SUPERSET of the true matches (5.5). exact reports the set is precisely
 	// the match set, so no residual predicate could drop any; narrowed
@@ -690,7 +683,7 @@ func (st *stdType) evaluateWith(ctx context.Context, acct jmap.Id, root *filterN
 	if err != nil {
 		return nil, err
 	}
-	if narrowed && exact && emptySort && !collapse && restrict == nil && !hasVisible {
+	if narrowed && exact && emptySort && !collapse && restrict == nil {
 		// Fast path: the candidate set is exactly the match set and needs no
 		// ordering beyond id order, so the ids are the answer with no record
 		// loads. RFC 8621 4.4's "total is fast for a single inMailbox
@@ -771,13 +764,6 @@ func (st *stdType) queryHooks() *QueryHooks {
 // know what an extras-driven arrangement reads.
 func (st *stdType) changeCalculable(root *filterNode, sortRaw []json.RawMessage, collapse, hasExtras bool) bool {
 	if hasExtras {
-		return false
-	}
-	// A Visible hook makes membership depend on the caller, not the
-	// record alone: a record's visibility can differ between two callers
-	// with identical filter/sort, and can change with no entry in the
-	// change log. No query over such a type is record-local.
-	if st.ext != nil && st.ext.Visible != nil {
 		return false
 	}
 	q := st.queryHooks()
@@ -1190,11 +1176,6 @@ func (st *stdType) loadAndMatch(ctx context.Context, acct jmap.Id, root *filterN
 	for i, obj := range objs {
 		if obj == nil {
 			continue // not found: GetMany's nil-slot convention, same as Get's ErrNotFound
-		}
-		// A record the Visible hook hides is absent from query results,
-		// exactly as /get reports it in notFound (RFC 8620 section 5.1).
-		if st.ext != nil && st.ext.Visible != nil && !st.ext.Visible(ctx, acct, obj) {
-			continue
 		}
 		rctx := ctx
 		if scoper != nil {

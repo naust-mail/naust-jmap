@@ -363,25 +363,6 @@ type Extensions struct {
 	Set *SetHooks
 	// Query customizes the derived /query.
 	Query *QueryHooks
-	// Visible, when non-nil, is a per-record visibility predicate
-	// consulted by the derived /get and /query. Returning false hides
-	// the record from the caller: /get reports its id in notFound (RFC
-	// 8620 section 5.1 - the id does not exist or the caller lacks
-	// permission to see it) and /query omits it from results. The hook
-	// must be a pure predicate over the request context and the stored
-	// record: no side effects, no I/O.
-	//
-	// /changes is deliberately NOT filtered: it reports ids only, never
-	// content, and a client whose cached copy of a record must be
-	// invalidated has to hear about the change even while the record is
-	// hidden from it (section 5.2 sync soundness). A hidden id fetched
-	// via /get simply lands in notFound.
-	//
-	// Visibility depends on the caller, not the record alone, so a
-	// /query over a type with this hook answers canCalculateChanges
-	// false and Foo/queryChanges refuses with cannotCalculateChanges
-	// (the section 5.6 escape hatch).
-	Visible func(ctx context.Context, acct jmap.Id, obj objectdb.Object) bool
 }
 
 // standardMethodArgs lists each derived method's own argument names;
@@ -433,9 +414,6 @@ func (e *Extensions) validate(t *descriptor.Type) error {
 	}
 	if e.Computed != nil && !e.derives("get") {
 		return fmt.Errorf("runtime: %s: Computed hook declared but /get is not derived", t.Name)
-	}
-	if e.Visible != nil && !e.derives("get") && !e.derives("query") {
-		return fmt.Errorf("runtime: %s: Visible hook declared but neither /get nor /query is derived", t.Name)
 	}
 	if e.ExtraResponse != nil && e.ExtraResponse.Changes != nil && !e.derives("changes") {
 		return fmt.Errorf("runtime: %s: ExtraResponse.Changes declared but /changes is not derived", t.Name)

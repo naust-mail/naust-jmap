@@ -111,19 +111,6 @@ func echo(_ context.Context, call *Call) []jmap.Invocation {
 	return []jmap.Invocation{{Name: "Core/echo", Args: json.RawMessage(args), CallID: call.CallID}}
 }
 
-// requestCapsKey is the context key carrying the request's "using" set
-// through Process into every handler and hook.
-type requestCapsKey struct{}
-
-// RequestCapabilities returns the set of capability URIs the current
-// request opted in to via "using" (RFC 8620 section 3.3), or nil when
-// ctx is not inside request processing. The map is shared by the whole
-// request and must not be modified.
-func RequestCapabilities(ctx context.Context) map[string]bool {
-	caps, _ := ctx.Value(requestCapsKey{}).(map[string]bool)
-	return caps
-}
-
 // CheckUsing validates the request's capability opt-ins, returning a
 // request-level unknownCapability problem if any is unsupported
 // (RFC 8620 section 3.6.1).
@@ -152,7 +139,6 @@ func (p *Processor) Process(ctx context.Context, req *jmap.Request, ident *auth.
 	for _, c := range req.Using {
 		using[c] = true
 	}
-	ctx = context.WithValue(ctx, requestCapsKey{}, using)
 	createdIds := req.CreatedIds
 	if createdIds == nil {
 		createdIds = make(map[jmap.Id]jmap.Id)
