@@ -350,6 +350,9 @@ func TestExtRegistrationValidation(t *testing.T) {
 			ExtraArgs: map[string]MethodArgs{"get": {Names: []string{""}}}}},
 		{"unknown default property", &Extensions{
 			DefaultGetProperties: []string{"nope"}}},
+		{"Visible without get or query", &Extensions{
+			Methods: []string{"changes"},
+			Visible: func(_ context.Context, _ jmap.Id, _ objectdb.Object) bool { return true }}},
 	}
 	for _, tc := range cases {
 		be := memory.New()

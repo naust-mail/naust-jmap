@@ -11,6 +11,15 @@
 // only where a test needs to drive a boundary without an impractical fixture;
 // changing one in production means recompiling.
 //
+// What zero means is per variable, not a package convention: it derives a
+// value for MaxConcurrentRequestsPerUser, disables the bound entirely for
+// MaxConnectionsPerUser and EventSourceMaxLifetime, and is a literal cap
+// elsewhere. The three readings are each right for what they bound - a
+// derived concurrency slot count has no useful literal zero, and a disabled
+// connection cap does - so each variable states its own. Read the comment
+// before setting one to zero; do not carry a reading over from its
+// neighbour.
+//
 // Spec-fixed vs tunable: everything in this file may be moved; the floors the
 // spec pins some of these values to live apart in spec.go, because a spec
 // floor is a fact, not a knob. Validate warns (it never blocks) when a tunable
