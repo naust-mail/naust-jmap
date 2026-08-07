@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/naust-mail/naust-jmap/core/objectdb"
+	"github.com/naust-mail/naust-jmap/core/private/rawjson"
 )
 
 // TypeEmail is the Email type name (RFC 8621 section 4).
@@ -71,36 +72,16 @@ func StrOrNull(s *string) json.RawMessage {
 // StoredSubject decodes a stored Email's subject property (a String or
 // null) to its text value.
 func StoredSubject(obj objectdb.Object) string {
-	var s string
-	if raw := obj["subject"]; raw != nil && json.Unmarshal(raw, &s) == nil {
-		return s
-	}
-	return ""
+	s, _ := rawjson.String(obj["subject"])
+	return s
 }
 
-// address is the decode shape of a stored EmailAddress property (RFC 8621
-// section 4.1.2.3): the same {name, email} JSON as internal/message.Address,
-// duplicated here so this package need not import internal/message.
-type address struct {
-	Name  *string `json:"name"`
-	Email string  `json:"email"`
-}
-
-// AddressText concatenates the names and emails of a stored EmailAddress[]
-// property (from/to/cc/bcc) for substring search.
-func AddressText(obj objectdb.Object, field string) string {
-	var addrs []address
-	json.Unmarshal(obj[field], &addrs)
-	var b strings.Builder
-	for _, a := range addrs {
-		if a.Name != nil {
-			b.WriteString(*a.Name)
-			b.WriteByte(' ')
-		}
-		b.WriteString(a.Email)
-		b.WriteByte(' ')
-	}
-	return b.String()
+// StoredPreview decodes a stored Email's preview property (RFC 8621
+// section 4.1.4, capped at 256 characters by construction - see
+// message.BuildPreview) to its text value.
+func StoredPreview(obj objectdb.Object) string {
+	s, _ := rawjson.String(obj["preview"])
+	return s
 }
 
 func ContainsFold(hay, needle string) bool {

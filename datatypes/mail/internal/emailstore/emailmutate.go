@@ -301,12 +301,15 @@ func isUnread(obj objectdb.Object) bool {
 	return !kw["$seen"] && !kw["$draft"]
 }
 
-// MailboxIdsOf is the set of Mailbox ids an Email belongs to.
+// MailboxIdsOf is the set of Mailbox ids an Email belongs to. Built
+// directly off EachKey rather than through ObjectKeys: viewOf calls this
+// for both sides of every counter-affecting change, and going through
+// ObjectKeys' map[string]bool first would mean building and discarding
+// a second map on every call just to retype its keys.
 func MailboxIdsOf(obj objectdb.Object) map[jmap.Id]bool {
-	keys := ObjectKeys(obj["mailboxIds"])
-	out := make(map[jmap.Id]bool, len(keys))
-	for k := range keys {
-		out[jmap.Id(k)] = true
+	out := make(map[jmap.Id]bool, 4)
+	if rawjson.EachKey(obj["mailboxIds"], func(k string) { out[jmap.Id(k)] = true }) != nil {
+		return map[jmap.Id]bool{}
 	}
 	return out
 }

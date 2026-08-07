@@ -192,7 +192,7 @@ func newInstance(t *testing.T, dsn string, accts []testAccount, cfg instanceConf
 	if err := mail.RegisterThread(proc, mail.ThreadConfig{DB: db, Core: core}); err != nil {
 		t.Fatal(err)
 	}
-	if err := mail.RegisterEmail(proc, mail.EmailConfig{DB: db, Store: blobs, Core: core, AccountCapability: acctCap, Searcher: search.New(blobs)}); err != nil {
+	if err := mail.RegisterEmail(proc, mail.EmailConfig{DB: db, Store: blobs, Core: core, AccountCapability: acctCap, Searcher: search.New(blobs, search.DefaultConfig())}); err != nil {
 		t.Fatal(err)
 	}
 	limits := mailsubmit.DefaultLimits()

@@ -26,11 +26,36 @@ import (
 // over the stored fast fields and the on-demand parsed message blob.
 type InProcess struct {
 	store blob.Store
+	cfg   Config
+}
+
+// Config controls the built-in InProcess searcher's cost/accuracy tradeoff.
+type Config struct {
+	// FullBodySearch makes the "text" and "body" conditions (RFC 8621
+	// section 4.4.1) open and parse each candidate's message blob to
+	// search its full decoded text. The query planner cannot narrow these
+	// conditions, so this choice governs an unbounded per-request cost.
+	//
+	// Default (false): match the stored preview only (section 4.1.4, at
+	// most 256 characters), an in-memory substring scan with no blob I/O
+	// or parsing - benchmarked under a second of CPU for 500,000 messages.
+	// Bounded, but can miss a match outside the preview window.
+	//
+	// true: follows the section 4.4.1 SHOULD, at real cost - benchmarked at
+	// up to 8.6 minutes of CPU for the same 500,000 messages (varies with
+	// hardware and message size). Fine for a small mailbox; a DoS risk once
+	// a mailbox reaches that scale.
+	FullBodySearch bool
+}
+
+// DefaultConfig returns the default Config: preview-only text/body search.
+func DefaultConfig() Config {
+	return Config{}
 }
 
 // New builds an InProcess searcher reading message blobs from store.
-func New(store blob.Store) *InProcess {
-	return &InProcess{store: store}
+func New(store blob.Store, cfg Config) *InProcess {
+	return &InProcess{store: store, cfg: cfg}
 }
 
 // Match implements the section 4.4.1 text conditions by substring.
@@ -56,13 +81,23 @@ func (s *InProcess) Match(ctx context.Context, acct jmap.Id, obj objectdb.Object
 				return true, nil
 			}
 		}
-		scan, err := s.scanBody(ctx, acct, obj, []string{q})
-		if err != nil {
-			return false, err
-		}
-		return scan.matched, nil
+		return s.matchBody(ctx, acct, obj, q)
 	}
 	return false, nil
+}
+
+// matchBody implements the "text"/"body" body match per Config.FullBodySearch:
+// by default, a substring match against the stored preview; with
+// FullBodySearch, a full parse and scan of the message blob.
+func (s *InProcess) matchBody(ctx context.Context, acct jmap.Id, obj objectdb.Object, q string) (bool, error) {
+	if !s.cfg.FullBodySearch {
+		return record.ContainsFold(record.StoredPreview(obj), q), nil
+	}
+	scan, err := s.scanBody(ctx, acct, obj, []string{q})
+	if err != nil {
+		return false, err
+	}
+	return scan.matched, nil
 }
 
 // matchHeader matches the header condition: presence of the named field, or
@@ -100,7 +135,9 @@ func (s *InProcess) Snippet(ctx context.Context, acct jmap.Id, obj objectdb.Obje
 		}
 	}
 	if len(bodyTerms) > 0 {
-		if scan, err := s.scanBody(ctx, acct, obj, bodyTerms); err == nil {
+		if !s.cfg.FullBodySearch {
+			preview = storedPreviewSnippet(record.StoredPreview(obj), bodyTerms)
+		} else if scan, err := s.scanBody(ctx, acct, obj, bodyTerms); err == nil {
 			preview = bodyPreview(scan, bodyTerms)
 		}
 	}

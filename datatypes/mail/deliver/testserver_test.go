@@ -136,7 +136,7 @@ func newEmailServer(t testing.TB, acctCap mail.AccountCapability) (*httptest.Ser
 	if err := mail.RegisterThread(p, mail.ThreadConfig{DB: db, Core: core}); err != nil {
 		t.Fatal(err)
 	}
-	if err := mail.RegisterEmail(p, mail.EmailConfig{DB: db, Store: store, Core: core, AccountCapability: acctCap, Searcher: search.New(store)}); err != nil {
+	if err := mail.RegisterEmail(p, mail.EmailConfig{DB: db, Store: store, Core: core, AccountCapability: acctCap, Searcher: search.New(store, search.DefaultConfig())}); err != nil {
 		t.Fatal(err)
 	}
 	if err := mail.RegisterIdentity(p, mail.IdentityConfig{DB: db, Core: core, Policy: policy}); err != nil {

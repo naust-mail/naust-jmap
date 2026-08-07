@@ -12,6 +12,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/naust-mail/naust-jmap/datatypes/mail/search"
 )
 
 // snippetGet runs SearchSnippet/get for the given filter and ids, returning
@@ -129,9 +131,11 @@ func TestSearchSnippetScoping(t *testing.T) {
 }
 
 // TestSearchSnippetPreviewCap covers the section 5 rule that a preview is
-// never larger than 255 octets, bracketing the match with ellipses.
+// never larger than 255 octets, bracketing the match with ellipses. It runs
+// with FullBodySearch true: the match is placed outside the stored preview
+// field on purpose, to exercise scanBody's windowing around a mid-body match.
 func TestSearchSnippetPreviewCap(t *testing.T) {
-	ts, db, store := emailServer(t)
+	ts, db, store := newEmailServer(t, DefaultAccountCapability(), search.Config{FullBodySearch: true})
 	inbox := createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
 	body := strings.Repeat("word ", 100) + "needle " + strings.Repeat("word ", 100)
 	id := putEmail(t, db, store, bodyMsg("a@x", "b@x", "Long", body, map[string]string{"Message-ID": "<a@x>"}), mset(inbox), nil)

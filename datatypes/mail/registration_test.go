@@ -46,7 +46,7 @@ func TestRegisterEmailInternalProperties(t *testing.T) {
 	err := RegisterEmail(p, EmailConfig{
 		DB: db, Store: store, Core: runtime.DefaultCoreCapabilities(),
 		AccountCapability: DefaultAccountCapability(),
-		Searcher:          search.New(store),
+		Searcher:          search.New(store, search.DefaultConfig()),
 		// Internal deliberately unset: RegisterEmail must force it.
 		InternalProperties: map[string]descriptor.Property{
 			"vendorMarker": {Kind: descriptor.KindObject},
@@ -70,7 +70,7 @@ func TestRegisterEmailInternalPropertyCollision(t *testing.T) {
 	err := RegisterEmail(p, EmailConfig{
 		DB: db, Store: store, Core: runtime.DefaultCoreCapabilities(),
 		AccountCapability: DefaultAccountCapability(),
-		Searcher:          search.New(store),
+		Searcher:          search.New(store, search.DefaultConfig()),
 		InternalProperties: map[string]descriptor.Property{
 			"subject": {Kind: descriptor.KindString},
 		},

@@ -72,13 +72,13 @@ go w.Run(ctx)
 
 ## Packages
 
-| Package                                             | Provides                                                                                                                                            | Import when...                                                                       |
-|------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------|
-| `github.com/naust-mail/naust-jmap/datatypes/mail`     | The five RFC 8621 types (`RegisterMailbox`, `RegisterThread`, `RegisterEmail`, `RegisterIdentity`, `RegisterVacationResponse`), the read-only View+Read family, `SendPolicy`, `Searcher`, `Outcome` | Always - every other package depends on it                                              |
-| `.../datatypes/mail/deliver`                         | The transport-agnostic `Deliverer`, LMTP server, HTTP ingest handler                                                                                | You accept inbound mail                                                                 |
-| `.../datatypes/mail/submit`                           | `EmailSubmission` registration, the durable queue, the sending worker, the reference SMTP relay, the server-side `Sender`                             | You send mail (JMAP submission and/or server-originated mail)                           |
-| `.../datatypes/mail/search`                           | `search.New(store)`: the built-in case-insensitive substring `Searcher`                                                                              | You want text search and have no index-backed implementation of your own                |
-| `.../datatypes/mail/report`                           | RFC 3464/8098 report parsing and RFC 8098 MDN generation                                                                                             | You are building report correlation or MDN generation outside `deliver`/`submit`'s built-in wiring |
+| Package                                           | Provides                                                                                                                                                                                            | Import when...                                                                                     |
+|---------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------|
+| `github.com/naust-mail/naust-jmap/datatypes/mail` | The five RFC 8621 types (`RegisterMailbox`, `RegisterThread`, `RegisterEmail`, `RegisterIdentity`, `RegisterVacationResponse`), the read-only View+Read family, `SendPolicy`, `Searcher`, `Outcome` | Always - every other package depends on it                                                         |
+| `.../datatypes/mail/deliver`                      | The transport-agnostic `Deliverer`, LMTP server, HTTP ingest handler                                                                                                                                | You accept inbound mail                                                                            |
+| `.../datatypes/mail/submit`                       | `EmailSubmission` registration, the durable queue, the sending worker, the reference SMTP relay, the server-side `Sender`                                                                           | You send mail (JMAP submission and/or server-originated mail)                                      |
+| `.../datatypes/mail/search`                       | `search.New(store, cfg)`: the built-in case-insensitive substring `Searcher`                                                                                                                        | You want text search and have no index-backed implementation of your own                           |
+| `.../datatypes/mail/report`                       | RFC 3464/8098 report parsing and RFC 8098 MDN generation                                                                                                                                            | You are building report correlation or MDN generation outside `deliver`/`submit`'s built-in wiring |
 
 ## Public API
 
@@ -94,14 +94,14 @@ Each `Register*` takes a config struct (`MailboxConfig`, `ThreadConfig`,
 required dependencies are validated at registration with an error naming
 every missing field, optional ones are nil-able with documented defaults.
 
-| Symbol                                                                       | Kind  | What it is                                                                            |
-|--------------------------------------------------------------------------------|-------|--------------------------------------------------------------------------------------|
-| `RegisterMailbox`, `RegisterThread`                                           | func  | Register the reading types into a `runtime.Processor`                                |
-| `RegisterEmail`                                                               | func  | Register Email and `SearchSnippet/get`; takes the `Searcher` explicitly              |
-| `RegisterIdentity`                                                            | func  | Register the sending-address type, gated by `SendPolicy`                             |
-| `RegisterVacationResponse`                                                    | func  | Register the section 8 singleton                                                     |
-| `CapabilityURI`, `VacationCapabilityURI`                                      | const | The capability URIs this package advertises (submission's is `submit.CapabilityURI`) |
-| `TypeEmail`, `TypeMailbox`, `TypeThread`, `TypeIdentity`, `TypeEmailSubmission`, `TypeEmailDelivery`, `TypeVacationResponse` | const | JMAP type names, for push type sets and capability wiring |
+| Symbol                                                                                                                       | Kind  | What it is                                                                           |
+|------------------------------------------------------------------------------------------------------------------------------|-------|--------------------------------------------------------------------------------------|
+| `RegisterMailbox`, `RegisterThread`                                                                                          | func  | Register the reading types into a `runtime.Processor`                                |
+| `RegisterEmail`                                                                                                              | func  | Register Email and `SearchSnippet/get`; takes the `Searcher` explicitly              |
+| `RegisterIdentity`                                                                                                           | func  | Register the sending-address type, gated by `SendPolicy`                             |
+| `RegisterVacationResponse`                                                                                                   | func  | Register the section 8 singleton                                                     |
+| `CapabilityURI`, `VacationCapabilityURI`                                                                                     | const | The capability URIs this package advertises (submission's is `submit.CapabilityURI`) |
+| `TypeEmail`, `TypeMailbox`, `TypeThread`, `TypeIdentity`, `TypeEmailSubmission`, `TypeEmailDelivery`, `TypeVacationResponse` | const | JMAP type names, for push type sets and capability wiring                            |
 
 <details>
 <summary><b>Capability objects</b> - the advertised limits</summary>
@@ -120,28 +120,28 @@ data, for server code that needs to look at a record without going through
 `runtime.Processor` dispatch (a vacation responder, a report generator, a
 migration script)
 
-| Symbol                                                                                    | Kind        | What it is                                                                                 |
-|------------------------------------------------------------------------------------------------|-------------|---------------------------------------------------------------------------------------------|
-| `EmailView`, `ReadEmail`, `ReadEmailOptions`                                                   | type / func | Stored Email metadata, and, when asked for, parsed header fields                            |
-| `EmailView.Header`, `.HeaderAll`, `.HeaderAddresses`, `.HeaderMessageIDs`, `.HasKeyword`         | method      | Header and keyword accessors over a loaded view                                             |
-| `OpenEmailMessage`                                                                              | func        | Stream the raw message blob directly, without loading a view                                |
-| `IdentityView`, `ReadIdentity`                                                                  | type / func | Stored Identity properties                                                                  |
-| `IdentityView.AllowsSend`                                                                       | method      | Whether a From address is allowed for this Identity                                         |
-| `VacationView`, `ReadVacationResponse`                                                          | type / func | Stored VacationResponse configuration; a missing record reads as disabled, never an error   |
-| `VacationView.ActiveAt`                                                                         | method      | Whether the auto-reply is active at a given time                                            |
+| Symbol                                                                                   | Kind        | What it is                                                                                |
+|------------------------------------------------------------------------------------------|-------------|-------------------------------------------------------------------------------------------|
+| `EmailView`, `ReadEmail`, `ReadEmailOptions`                                             | type / func | Stored Email metadata, and, when asked for, parsed header fields                          |
+| `EmailView.Header`, `.HeaderAll`, `.HeaderAddresses`, `.HeaderMessageIDs`, `.HasKeyword` | method      | Header and keyword accessors over a loaded view                                           |
+| `OpenEmailMessage`                                                                       | func        | Stream the raw message blob directly, without loading a view                              |
+| `IdentityView`, `ReadIdentity`                                                           | type / func | Stored Identity properties                                                                |
+| `IdentityView.AllowsSend`                                                                | method      | Whether a From address is allowed for this Identity                                       |
+| `VacationView`, `ReadVacationResponse`                                                   | type / func | Stored VacationResponse configuration; a missing record reads as disabled, never an error |
+| `VacationView.ActiveAt`                                                                  | method      | Whether the auto-reply is active at a given time                                          |
 
 <details>
 <summary><b>Everything else</b> - search interface, sending policy, message-id domain, migration</summary>
 
-| Symbol                                                  | Kind             | What it is                                                                        |
-|-------------------------------------------------------------|------------------|--------------------------------------------------------------------------------------|
-| `Searcher`, `SearchSnippet`                                | interface / type | Swappable search; the built-in is `search.New` (case-insensitive substring)          |
-| `SendPolicy`, `StaticSendPolicy`, `NewStaticSendPolicy`     | interface / func | Who may send as what. Deny by default                                               |
-| `StaticSendPolicy.Allow(acct, addrs...)`                    | method           | Grant an account the addresses it may send as                                       |
-| `Outcome`, `TempFailed`, `Rejected`, `Accepted`             | type / const     | Per-recipient delivery/send verdict, shared by `deliver.Event` and `submit.Result`  |
-| `EmailAddress`                                              | type             | One parsed address from an address header                                          |
-| `EmailConfig.MessageIDDomain`                               | field            | The domain synthesized Message-IDs live under. Configuration, never guessed          |
-| `MigrateThreadCounters`                                     | func             | One-time counter migration helper                                                   |
+| Symbol                                                  | Kind             | What it is                                                                         |
+|---------------------------------------------------------|------------------|------------------------------------------------------------------------------------|
+| `Searcher`, `SearchSnippet`                             | interface / type | Swappable search; the built-in is `search.New` (case-insensitive substring)        |
+| `SendPolicy`, `StaticSendPolicy`, `NewStaticSendPolicy` | interface / func | Who may send as what. Deny by default                                              |
+| `StaticSendPolicy.Allow(acct, addrs...)`                | method           | Grant an account the addresses it may send as                                      |
+| `Outcome`, `TempFailed`, `Rejected`, `Accepted`         | type / const     | Per-recipient delivery/send verdict, shared by `deliver.Event` and `submit.Result` |
+| `EmailAddress`                                          | type             | One parsed address from an address header                                          |
+| `EmailConfig.MessageIDDomain`                           | field            | The domain synthesized Message-IDs live under. Configuration, never guessed        |
+| `MigrateThreadCounters`                                 | func             | One-time counter migration helper                                                  |
 
 </details>
 
@@ -162,24 +162,24 @@ migration script)
 
 ### submit
 
-| Symbol                                                                   | Kind             | What it is                                                                             |
-|--------------------------------------------------------------------------|------------------|-------------------------------------------------------------------------------------------|
-| `Register`                                                                | func             | Registers `EmailSubmission` and returns the `Queue`                                       |
-| `Queue`                                                                   | type             | The live queue view a `Worker` consumes; `Queue.Sender()` returns the server-side `Sender` |
-| `Queue.EmailIDForMessageID(ctx, acct, mid)`                               | method           | Resolves a sent message's Message-ID to its Email via the indexed submission snapshot      |
-| `Queue.Policy()`                                                          | method           | The resolved `SendPolicy` as a read-only view: one policy answers every outbound path      |
-| `NewWorker`, `WorkerConfig`, `WorkerStats`                                | func / type      | The worker that drains due submissions                                                    |
-| `Worker.Run(ctx)`                                                         | method           | Start sending. Blocks until the context is cancelled                                      |
-| `Worker.ProcessDue(ctx, limit)`                                           | method           | The manual crank: a queue flush, a pacer, a test                                          |
-| `Worker.Stats()`                                                          | method           | Read the worker's counters at runtime                                                     |
-| `Submitter`                                                               | interface        | Where outbound mail actually goes                                                          |
-| `NewSMTPRelay`, `SMTPRelayConfig`, `TLSMode`, `PlainAuth`                  | func / type      | The reference `Submitter` over SMTP, RFC 3461                                             |
-| `SMTPRelay.Submit(ctx, env, msg)`                                         | method           | The `Submitter` implementation the worker calls                                            |
-| `Limits`, `DefaultLimits`                                                 | type / func      | Enforced EmailSubmission/set limits, including `MaxDelayedSend`                            |
-| `AccountCapability`, `AccountCapabilityFor`                               | type / func      | Section 1.3.2 submission capability object                                                |
-| `Envelope`, `Recipient`                                                   | type             | The SMTP envelope for one transmission attempt (section 7 derivation happens before this)  |
-| `Result`                                                                  | type             | One recipient's fate from one transmission attempt                                         |
-| `CapabilityURI`                                                           | const            | The submission capability URI to advertise                                                 |
+| Symbol                                                    | Kind        | What it is                                                                                 |
+|-----------------------------------------------------------|-------------|--------------------------------------------------------------------------------------------|
+| `Register`                                                | func        | Registers `EmailSubmission` and returns the `Queue`                                        |
+| `Queue`                                                   | type        | The live queue view a `Worker` consumes; `Queue.Sender()` returns the server-side `Sender` |
+| `Queue.EmailIDForMessageID(ctx, acct, mid)`               | method      | Resolves a sent message's Message-ID to its Email via the indexed submission snapshot      |
+| `Queue.Policy()`                                          | method      | The resolved `SendPolicy` as a read-only view: one policy answers every outbound path      |
+| `NewWorker`, `WorkerConfig`, `WorkerStats`                | func / type | The worker that drains due submissions                                                     |
+| `Worker.Run(ctx)`                                         | method      | Start sending. Blocks until the context is cancelled                                       |
+| `Worker.ProcessDue(ctx, limit)`                           | method      | The manual crank: a queue flush, a pacer, a test                                           |
+| `Worker.Stats()`                                          | method      | Read the worker's counters at runtime                                                      |
+| `Submitter`                                               | interface   | Where outbound mail actually goes                                                          |
+| `NewSMTPRelay`, `SMTPRelayConfig`, `TLSMode`, `PlainAuth` | func / type | The reference `Submitter` over SMTP, RFC 3461                                              |
+| `SMTPRelay.Submit(ctx, env, msg)`                         | method      | The `Submitter` implementation the worker calls                                            |
+| `Limits`, `DefaultLimits`                                 | type / func | Enforced EmailSubmission/set limits, including `MaxDelayedSend`                            |
+| `AccountCapability`, `AccountCapabilityFor`               | type / func | Section 1.3.2 submission capability object                                                 |
+| `Envelope`, `Recipient`                                   | type        | The SMTP envelope for one transmission attempt (section 7 derivation happens before this)  |
+| `Result`                                                  | type        | One recipient's fate from one transmission attempt                                         |
+| `CapabilityURI`                                           | const       | The submission capability URI to advertise                                                 |
 
 **`Sender` - server-side sending.** `Queue.Sender()` returns a `*Sender`, the
 seam for mail a host originates itself rather than a JMAP client's
@@ -193,7 +193,7 @@ caller composing its own message is responsible for what it composes.
 
 ### search
 
-`search.New(store)` builds `*InProcess`, the built-in `Searcher`:
+`search.New(store, cfg)` builds `*InProcess`, the built-in `Searcher`:
 case-insensitive substring matching over stored fast fields and the
 on-demand parsed message blob (RFC 8621 section 4.4.1 leaves exact search
 semantics server-defined). It satisfies `mail.Searcher` structurally without
@@ -237,13 +237,13 @@ decisions](#design-decisions); a Thread id is immutable once assigned.
 
 ## Extension points
 
-| Interface           | You implement it to...                                | Ships with                                       |
-|-----------------------|-----------------------------------------------------------|-------------------------------------------------|
-| `deliver.Resolver`   | Map an envelope recipient to an account, or reject it     | Nothing; the host owns its user directory        |
-| `mail.SendPolicy`    | Decide who may send as which address                       | `mail.StaticSendPolicy`                          |
-| `submit.Submitter`   | Hand outbound mail to the world                             | `submit.SMTPRelay` (reference relay, RFC 3461)   |
-| `mail.Searcher`      | Replace substring search with a real index                  | `search.InProcess` (built-in substring matching) |
-| `deliver.Sink`       | Observe deliveries                                           | Nothing; optional                                |
+| Interface          | You implement it to...                                | Ships with                                       |
+|--------------------|-------------------------------------------------------|--------------------------------------------------|
+| `deliver.Resolver` | Map an envelope recipient to an account, or reject it | Nothing; the host owns its user directory        |
+| `mail.SendPolicy`  | Decide who may send as which address                  | `mail.StaticSendPolicy`                          |
+| `submit.Submitter` | Hand outbound mail to the world                       | `submit.SMTPRelay` (reference relay, RFC 3461)   |
+| `mail.Searcher`    | Replace substring search with a real index            | `search.InProcess` (built-in substring matching) |
+| `deliver.Sink`     | Observe deliveries                                    | Nothing; optional                                |
 
 ## Design decisions
 
@@ -311,29 +311,29 @@ rejected, not clamped.
 <details>
 <summary>RFC 8621 support matrix</summary>
 
-| Object / method                             | Status | Notes                                                                                                  |
-|---------------------------------------------|--------|----------------------------------------------------------------------------------------------------------|
-| `Mailbox/get`, `/query`, `/changes`         | Yes    | 18 IANA roles, tree with a depth limit, computed `myRights`                                              |
-| `Mailbox/set`                               | Yes    | create/update/destroy, `onDestroyRemoveEmails` cascade                                                   |
-| Mailbox counters                            | Yes    | `totalEmails`, `unreadEmails`, `totalThreads`, `unreadThreads` (section 2.1, trash-aware)                |
-| `Thread/get`, `/changes`                    | Yes    | References + subject grouping; Threads never merge (see Design decisions)                                |
-| `Email/get`                                 | Yes    | stored fast fields + on-demand MIME parse; `header:{name}:as{Form}:all` parsed forms                     |
-| `Email/query`                               | Yes    | every section 4.4.1 condition, section 4.4.2 sort, `collapseThreads`, fast total                         |
-| `Email/set` (keywords, mailboxIds, destroy) | Yes    | flag and file existing mail; per-record atomic                                                           |
-| `Email/set` (create / compose)              | Yes    | strict-reject message generation from parts (see Design decisions)                                       |
-| `Email/import`, `Email/parse`               | Yes    | ingest a blob; parse without storing (`notParsable`, section 4.9, not yet split from serverFail)          |
-| `Email/copy`                                | Yes    | cross-account copy with `onSuccessDestroyOriginal`                                                        |
-| `SearchSnippet/get`                         | Yes    | highlighted subject and body preview                                                                     |
-| Delivery (LMTP, HTTP ingest)                | Yes    | transport-agnostic `deliver.Deliverer`; RFC 2033 LMTP; host-provided recipient `deliver.Resolver`         |
-| `EmailDelivery` push type                   | Yes    | section 1.5 method-less push; state advances on new mail only                                             |
-| `Identity/get`, `/changes`, `/set`          | Yes    | section 6 defaults, `SendPolicy`-gated creation, immutable `email`                                        |
-| `EmailSubmission` (all methods)             | Yes    | section 7 envelope derivation, section 7.5 error taxonomy, `onSuccessUpdateEmail/Destroy`                 |
-| Sending worker + SMTP relay                 | Yes    | records-as-queue worker (see Design decisions); reference `submit.Submitter` over SMTP, RFC 3461          |
-| FUTURERELEASE (RFC 4865)                    | Yes    | native holds via `sendAt`; over-limit or conflicting holds rejected, not clamped                          |
-| Trace stamping at delivery                  | Yes    | `Return-Path` + `Received` prefixed as the message streams in (RFC 5321 section 4.4); no FOR clause       |
+| Object / method                             | Status | Notes                                                                                                                 |
+|---------------------------------------------|--------|-----------------------------------------------------------------------------------------------------------------------|
+| `Mailbox/get`, `/query`, `/changes`         | Yes    | 18 IANA roles, tree with a depth limit, computed `myRights`                                                           |
+| `Mailbox/set`                               | Yes    | create/update/destroy, `onDestroyRemoveEmails` cascade                                                                |
+| Mailbox counters                            | Yes    | `totalEmails`, `unreadEmails`, `totalThreads`, `unreadThreads` (section 2.1, trash-aware)                             |
+| `Thread/get`, `/changes`                    | Yes    | References + subject grouping; Threads never merge (see Design decisions)                                             |
+| `Email/get`                                 | Yes    | stored fast fields + on-demand MIME parse; `header:{name}:as{Form}:all` parsed forms                                  |
+| `Email/query`                               | Yes    | every section 4.4.1 condition, section 4.4.2 sort, `collapseThreads`, fast total                                      |
+| `Email/set` (keywords, mailboxIds, destroy) | Yes    | flag and file existing mail; per-record atomic                                                                        |
+| `Email/set` (create / compose)              | Yes    | strict-reject message generation from parts (see Design decisions)                                                    |
+| `Email/import`, `Email/parse`               | Yes    | ingest a blob; parse without storing (`notParsable`, section 4.9, not yet split from serverFail)                      |
+| `Email/copy`                                | Yes    | cross-account copy with `onSuccessDestroyOriginal`                                                                    |
+| `SearchSnippet/get`                         | Yes    | highlighted subject and body preview                                                                                  |
+| Delivery (LMTP, HTTP ingest)                | Yes    | transport-agnostic `deliver.Deliverer`; RFC 2033 LMTP; host-provided recipient `deliver.Resolver`                     |
+| `EmailDelivery` push type                   | Yes    | section 1.5 method-less push; state advances on new mail only                                                         |
+| `Identity/get`, `/changes`, `/set`          | Yes    | section 6 defaults, `SendPolicy`-gated creation, immutable `email`                                                    |
+| `EmailSubmission` (all methods)             | Yes    | section 7 envelope derivation, section 7.5 error taxonomy, `onSuccessUpdateEmail/Destroy`                             |
+| Sending worker + SMTP relay                 | Yes    | records-as-queue worker (see Design decisions); reference `submit.Submitter` over SMTP, RFC 3461                      |
+| FUTURERELEASE (RFC 4865)                    | Yes    | native holds via `sendAt`; over-limit or conflicting holds rejected, not clamped                                      |
+| Trace stamping at delivery                  | Yes    | `Return-Path` + `Received` prefixed as the message streams in (RFC 5321 section 4.4); no FOR clause                   |
 | DSN/MDN ingestion                           | Yes    | ENVID = submission id (RFC 3461); RFC 3464/8098 parsed (via `report`) into `deliveryStatus`/`dsnBlobIds`/`mdnBlobIds` |
-| `VacationResponse/get`, `/set`              | Yes    | section 8 singleton; delivery-side responder per RFC 3834 through the one submission queue                |
-| Mail/Submission capability objects          | Yes    | `maxMailboxesPerEmail`, `maxSizeAttachmentsPerEmail`, `maxDelayedSend`, etc. (sections 1.3.1/1.3.2)        |
+| `VacationResponse/get`, `/set`              | Yes    | section 8 singleton; delivery-side responder per RFC 3834 through the one submission queue                            |
+| Mail/Submission capability objects          | Yes    | `maxMailboxesPerEmail`, `maxSizeAttachmentsPerEmail`, `maxDelayedSend`, etc. (sections 1.3.1/1.3.2)                   |
 
 Search is a swappable interface (`mail.Searcher`); the built-in implementation
 (`search.InProcess`) is case-insensitive substring matching. MDN send/parse

@@ -29,7 +29,7 @@ var testReceivedAt = time.Date(2021, 3, 4, 12, 0, 0, 0, time.UTC)
 
 // newEmailServer wires Mailbox + Email with a blob store, using acctCap
 // for both the advertised capability and the enforced limits.
-func newEmailServer(t *testing.T, acctCap AccountCapability) (*httptest.Server, *objectdb.DB, blob.Store) {
+func newEmailServer(t *testing.T, acctCap AccountCapability, searchCfg search.Config) (*httptest.Server, *objectdb.DB, blob.Store) {
 	t.Helper()
 	a := testsupport.NewStaticAuth()
 	a.AddUser("john@example.com", "secret", testAccount)
@@ -52,7 +52,7 @@ func newEmailServer(t *testing.T, acctCap AccountCapability) (*httptest.Server, 
 	if err := RegisterThread(p, ThreadConfig{DB: db, Core: core}); err != nil {
 		t.Fatal(err)
 	}
-	if err := RegisterEmail(p, EmailConfig{DB: db, Store: store, Core: core, AccountCapability: acctCap, Searcher: search.New(store)}); err != nil {
+	if err := RegisterEmail(p, EmailConfig{DB: db, Store: store, Core: core, AccountCapability: acctCap, Searcher: search.New(store, searchCfg)}); err != nil {
 		t.Fatal(err)
 	}
 	srv, err := runtime.NewServer(a, p, "https://jmap.example.com", core)
@@ -68,7 +68,7 @@ func newEmailServer(t *testing.T, acctCap AccountCapability) (*httptest.Server, 
 }
 
 func emailServer(t *testing.T) (*httptest.Server, *objectdb.DB, blob.Store) {
-	return newEmailServer(t, DefaultAccountCapability())
+	return newEmailServer(t, DefaultAccountCapability(), search.DefaultConfig())
 }
 
 // storeAndRecord streams content into a fresh blob writer and finalizes it
@@ -358,7 +358,7 @@ func TestEmailTooManyMailboxes(t *testing.T) {
 	acctCap := DefaultAccountCapability()
 	one := int64(1)
 	acctCap.MaxMailboxesPerEmail = &one
-	ts, db, store := newEmailServer(t, acctCap)
+	ts, db, store := newEmailServer(t, acctCap, search.DefaultConfig())
 	inbox := createMailbox(t, ts, `{"name":"Inbox","role":"inbox"}`)
 	archive := createMailbox(t, ts, `{"name":"Archive","role":"archive"}`)
 	id := putEmail(t, db, store, simpleMessage, map[string]bool{inbox: true}, nil)

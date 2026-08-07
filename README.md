@@ -184,7 +184,7 @@ mail.RegisterThread(proc, mail.ThreadConfig{DB: db, Core: core})
 mail.RegisterEmail(proc, mail.EmailConfig{
     DB: db, Store: blobs, Core: core,
     AccountCapability: mail.DefaultAccountCapability(),
-    Searcher:          search.New(blobs),
+    Searcher:          search.New(blobs, search.DefaultConfig()),
 })
 mail.RegisterIdentity(proc, mail.IdentityConfig{DB: db, Core: core, Policy: policy})
 

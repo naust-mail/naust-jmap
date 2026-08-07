@@ -67,7 +67,7 @@ func registerMailFull(t *testing.T, p *runtime.Processor, db *objectdb.DB, store
 	cfg := mail.EmailConfig{
 		DB: db, Store: store, Core: core,
 		AccountCapability: mail.DefaultAccountCapability(),
-		Searcher:          search.New(store),
+		Searcher:          search.New(store, search.DefaultConfig()),
 	}
 	if internal {
 		cfg.InternalProperties = EmailInternalProperties()

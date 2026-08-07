@@ -72,7 +72,7 @@ func benchDB(b *testing.B) (*objectdb.DB, blob.Store, jmap.Id) {
 	if err := mail.RegisterThread(p, mail.ThreadConfig{DB: db, Core: core}); err != nil {
 		b.Fatal(err)
 	}
-	if err := mail.RegisterEmail(p, mail.EmailConfig{DB: db, Store: store, Core: core, AccountCapability: mail.DefaultAccountCapability(), Searcher: search.New(store)}); err != nil {
+	if err := mail.RegisterEmail(p, mail.EmailConfig{DB: db, Store: store, Core: core, AccountCapability: mail.DefaultAccountCapability(), Searcher: search.New(store, search.DefaultConfig())}); err != nil {
 		b.Fatal(err)
 	}
 	var inbox jmap.Id

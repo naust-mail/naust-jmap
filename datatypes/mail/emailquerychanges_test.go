@@ -193,7 +193,7 @@ func TestEmailDeclarationsConformance(t *testing.T) {
 			map[string]bool{inbox: true}, map[string]bool{"$seen": i == 0}, base.Add(time.Duration(i)*time.Hour))
 		probes = append(probes, jmap.Id(id))
 	}
-	hooks := emailmethods.EmailQueryHooks(db, search.New(store))
+	hooks := emailmethods.EmailQueryHooks(db, search.New(store, search.DefaultConfig()))
 
 	// One or more sample values per declared condition and sort - the
 	// checker refuses unexercised declarations.

@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/naust-mail/naust-jmap/core/jmap"
+	"github.com/naust-mail/naust-jmap/datatypes/mail/search"
 )
 
 // TestEmailCreateDraftFlow: create a draft with both body alternatives
@@ -169,7 +170,7 @@ func TestEmailCreateErrors(t *testing.T) {
 	// The attachment size cap is enforced as tooLarge.
 	tiny := DefaultAccountCapability()
 	tiny.MaxSizeAttachmentsPerEmail = 8
-	ts2, db2, store2 := newEmailServer(t, tiny)
+	ts2, db2, store2 := newEmailServer(t, tiny, search.DefaultConfig())
 	inbox2 := createMailbox(t, ts2, `{"name":"Inbox","role":"inbox"}`)
 	big := uploadBlob(t, db2, store2, "way more than eight bytes")
 	r := callMail(t, ts2, inv("Email/set", fmt.Sprintf(`{"accountId":%q,"create":{"c":{

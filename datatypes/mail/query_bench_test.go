@@ -51,7 +51,7 @@ func benchEmailServer(b *testing.B) (*httptest.Server, *objectdb.DB, blob.Store,
 	if err := RegisterThread(p, ThreadConfig{DB: db, Core: core}); err != nil {
 		b.Fatal(err)
 	}
-	if err := RegisterEmail(p, EmailConfig{DB: db, Store: store, Core: core, AccountCapability: DefaultAccountCapability(), Searcher: search.New(store)}); err != nil {
+	if err := RegisterEmail(p, EmailConfig{DB: db, Store: store, Core: core, AccountCapability: DefaultAccountCapability(), Searcher: search.New(store, search.DefaultConfig())}); err != nil {
 		b.Fatal(err)
 	}
 	srv, err := runtime.NewServer(a, p, "https://jmap.example.com", core)

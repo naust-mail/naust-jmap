@@ -24,7 +24,6 @@ import (
 	"github.com/naust-mail/naust-jmap/core/private/rawjson"
 	"github.com/naust-mail/naust-jmap/core/runtime"
 	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/emailstore"
-	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/message"
 	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/parse"
 	"github.com/naust-mail/naust-jmap/datatypes/mail/internal/record"
 )
@@ -505,8 +504,7 @@ func emailUint(obj objectdb.Object, name string) uint64 {
 // firstAddr is the sort key for "from"/"to" (section 4.4.2): the name, or if
 // null/empty the email, of the first EmailAddress; the empty string if none.
 func firstAddr(obj objectdb.Object, field string) string {
-	var addrs []message.Address
-	json.Unmarshal(obj[field], &addrs)
+	addrs := record.Addresses(obj, field)
 	if len(addrs) == 0 {
 		return ""
 	}

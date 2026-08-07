@@ -116,7 +116,7 @@ type EmailConfig struct {
 	// conditions and section 5 snippets). Required, since the built-in
 	// substring implementation (datatypes/mail/search) is a separate
 	// package a host chooses to import rather than a default this package
-	// can fall back to; pass search.New(blobs) for it.
+	// can fall back to; pass search.New(blobs, search.DefaultConfig()) for it.
 	Searcher Searcher
 	// MessageIDDomain is the domain synthesized Message-IDs are scoped
 	// to when a creation omits one (RFC 5322 section 3.6.4) -

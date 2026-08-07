@@ -6,7 +6,8 @@ package search
 // server happened to cut the stream). These tests pin the two seams where that
 // could happen - the join between two body parts, and the chunk boundaries
 // within one - and the section 5 window the snippet is cut from, plus the
-// per-record parse cache InProcess shares its conditions through.
+// per-record parse cache InProcess shares its conditions through. They run
+// with FullBodySearch true, since that is the mode that reaches this code.
 
 import (
 	"context"
@@ -58,7 +59,7 @@ func searcherFor(t *testing.T, raw string) (*InProcess, objectdb.Object) {
 	if err := store.Put(context.Background(), testAccount, id, []byte(raw)); err != nil {
 		t.Fatal(err)
 	}
-	return New(store), objectdb.Object{"blobId": record.MustJSON(id)}
+	return New(store, Config{FullBodySearch: true}), objectdb.Object{"blobId": record.MustJSON(id)}
 }
 
 func matchBody(t *testing.T, s *InProcess, obj objectdb.Object, term string) bool {
@@ -193,7 +194,7 @@ func TestSearcherParseCachePerRecord(t *testing.T) {
 	if err := cs.Put(context.Background(), testAccount, blobID, raw); err != nil {
 		t.Fatal(err)
 	}
-	s := New(cs)
+	s := New(cs, Config{FullBodySearch: true})
 	obj := objectdb.Object{"blobId": record.MustJSON(blobID)}
 
 	ctx := parse.NewRecordContext(context.Background())

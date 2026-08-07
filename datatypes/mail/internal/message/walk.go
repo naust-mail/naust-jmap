@@ -27,7 +27,20 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 )
+
+// copyBufPool pools walkState's shared 32KB copy buffer across parses,
+// cutting the GC pressure a busy concurrent ingest path pays for a fresh
+// 32KB allocation on every message. Fixed-size, so the pool can never
+// accumulate an oversized buffer.
+var copyBufPool = sync.Pool{New: func() any { b := make([]byte, 32<<10); return &b }}
+
+// getCopyBuf and putCopyBuf are sync.Pool's Get/Put, typed to *[]byte rather
+// than []byte: sync.Pool holds any, and putting a []byte directly would box
+// its slice header onto the heap on every Put, defeating the pool.
+func getCopyBuf() *[]byte  { return copyBufPool.Get().(*[]byte) }
+func putCopyBuf(b *[]byte) { copyBufPool.Put(b) }
 
 // maxDelimLine bounds the prefix of a line the walker inspects for a boundary
 // delimiter. RFC 2046 5.1.1 caps a boundary at 70 characters, and RFC 5322 2.1.1
@@ -244,7 +257,7 @@ type walkState struct {
 // copyBuf returns the walk's shared copy buffer.
 func (st *walkState) copyBuf() []byte {
 	if st.buf == nil {
-		st.buf = make([]byte, 32<<10)
+		st.buf = *getCopyBuf()
 	}
 	return st.buf
 }

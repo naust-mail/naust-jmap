@@ -88,17 +88,34 @@ func bodyPreview(scan bodyScan, terms []string) string {
 	if !scan.matched {
 		return ""
 	}
-	window := scan.window
-	ranges := matchRanges(window, terms)
+	ranges := matchRanges(scan.window, terms)
 	if len(ranges) == 0 {
 		return ""
 	}
+	return highlightWindow(scan.window, ranges, scan.atStart, scan.atEnd)
+}
 
+// storedPreviewSnippet highlights term matches in the stored preview field
+// (Config.FullBodySearch false: see search.go) instead of a scanBody window.
+// The preview is already a bounded excerpt of the body (RFC 8621 section
+// 4.1.4), so it is treated as its own complete window with no ellipsis.
+func storedPreviewSnippet(text string, terms []string) string {
+	ranges := matchRanges(text, terms)
+	if len(ranges) == 0 {
+		return ""
+	}
+	return highlightWindow(text, ranges, true, true)
+}
+
+// highlightWindow escapes and highlights window, keeping the result within
+// maxPreviewOctets and bracketing it with an ellipsis on any side that is not
+// a body edge. See bodyPreview.
+func highlightWindow(window string, ranges [][2]int, atStart, atEnd bool) string {
 	head, tail := "", ""
-	if !scan.atStart {
+	if !atStart {
 		head = "..."
 	}
-	if !scan.atEnd {
+	if !atEnd {
 		tail = "..."
 	}
 	budget := maxPreviewOctets - len(head) - len(tail)
