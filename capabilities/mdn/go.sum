@@ -1,6 +1,6 @@
 github.com/naust-mail/naust-jmap/core v0.3.0 h1:Se8NoOY+sw4RIlxF/a1lrj6almB02OiYnzKGP6fzcQU=
 github.com/naust-mail/naust-jmap/core v0.3.0/go.mod h1:TjPDhlaN8mGxYdE3iWAcTsn5Wl1b7rxZ6C8xe3YuzSM=
-github.com/naust-mail/naust-jmap/datatypes/mail v0.3.2 h1:izuMU1BV4j4UNMxhuRas8bEhUvMzzY1ym74CxutTOG8=
-github.com/naust-mail/naust-jmap/datatypes/mail v0.3.2/go.mod h1:RDtNEkdY1luIlYnvQDV6sfyFLJXrcLgVI0EgQ5DCyEo=
+github.com/naust-mail/naust-jmap/datatypes/mail v0.3.3 h1:yNxdXMMRdx0HAsuAIIfXldKL1kK4yacGdhO4N84LBuI=
+github.com/naust-mail/naust-jmap/datatypes/mail v0.3.3/go.mod h1:RDtNEkdY1luIlYnvQDV6sfyFLJXrcLgVI0EgQ5DCyEo=
 golang.org/x/text v0.34.0 h1:oL/Qq0Kdaqxa1KbNeMKwQq0reLCCaFtqu2eNuSeNHbk=
 golang.org/x/text v0.34.0/go.mod h1:homfLqTYRFyVYemLBFl5GgL/DWEiH5wcsQ5gSh1yziA=
