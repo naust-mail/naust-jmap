@@ -279,9 +279,11 @@ func (db *DB) getManyRaw(ctx context.Context, acct jmap.Id, typeName string, ids
 	return out, raws, nil
 }
 
-// AllIds lists every record id of a type, in id order. If max > 0 and
-// more than max exist, it returns max+1 ids so the caller can detect
-// the overflow (RFC 8620 section 5.1: /get with ids null is subject to
+// AllIds lists every record id of a type, in id order, up to max (0
+// means no limit). The limit stops the scan itself, so a caller
+// bounding its work never materializes more than max ids: passing
+// budget+1 and refusing on overflow caps both time and memory at the
+// budget (RFC 8620 section 5.1: /get with ids null is subject to
 // maxObjectsInGet).
 func (db *DB) AllIds(ctx context.Context, acct jmap.Id, typeName string, max int) ([]jmap.Id, error) {
 	if db.types[typeName] == nil {
@@ -291,7 +293,7 @@ func (db *DB) AllIds(ctx context.Context, acct jmap.Id, typeName string, max int
 	var ids []jmap.Id
 	err := db.be.Scan(ctx, start, end, false, func(k, _ []byte) bool {
 		ids = append(ids, idFromObjKey(k))
-		return max <= 0 || len(ids) <= max
+		return max <= 0 || len(ids) < max
 	})
 	return ids, err
 }

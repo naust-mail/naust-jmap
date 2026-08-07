@@ -206,7 +206,7 @@ func (st *stdType) get(ctx context.Context, call *Call) []jmap.Invocation {
 	var ids []jmap.Id
 	if a.Ids == nil {
 		// ids null: all records, subject to maxObjectsInGet (5.1).
-		all, err := st.db.AllIds(ctx, a.AccountId, st.t.Name, maxGet)
+		all, err := st.db.AllIds(ctx, a.AccountId, st.t.Name, maxGet+1)
 		if err != nil {
 			return fail(call.CallID, jmap.ErrServerFail, err.Error())
 		}

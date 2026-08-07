@@ -357,8 +357,14 @@ func TestAllIdsAndOverflow(t *testing.T) {
 			t.Errorf("unexpected id %s", id)
 		}
 	}
-	// max smaller than the population: max+1 returned to signal overflow.
+	// max smaller than the population: capped at max, exactly.
 	ids, err = db.AllIds(ctx, acct, "TestNote", 2)
+	if err != nil || len(ids) != 2 {
+		t.Errorf("cap: got %d ids (%v)", len(ids), err)
+	}
+	// budget+1 signals overflow: population is 4, so 3 asks for one more
+	// than the caller's budget of 2 and gets back all 3, one over budget.
+	ids, err = db.AllIds(ctx, acct, "TestNote", 3)
 	if err != nil || len(ids) != 3 {
 		t.Errorf("overflow signal: got %d ids (%v)", len(ids), err)
 	}

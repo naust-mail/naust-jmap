@@ -114,6 +114,7 @@ var defaultClient = sync.OnceValue(func() *http.Client {
 // space in particular (RFC 6598) is reachable behind carrier-grade NAT and is
 // the practical SSRF gap a bare IsPrivate check leaves open.
 var reservedPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),       // RFC 1122 section 3.2.1.3 "this network"
 	netip.MustParsePrefix("100.64.0.0/10"),   // RFC 6598 shared address space (CGNAT)
 	netip.MustParsePrefix("192.0.0.0/24"),    // RFC 6890 IETF protocol assignments
 	netip.MustParsePrefix("192.0.2.0/24"),    // RFC 5737 TEST-NET-1

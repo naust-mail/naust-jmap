@@ -54,22 +54,22 @@ only with header-borne credentials (bearer tokens), never cookies.
 
 ## Public API
 
-| Symbol                                                                  | Kind   | What it is                                                                   |
-|-------------------------------------------------------------------------|--------|------------------------------------------------------------------------------|
-| `NewHandler(srv *runtime.Server, authn auth.Authenticator, cfg Config) *Handler` | func | The upgrade endpoint. Mount it on your mux                            |
-| `Config`                                                                | type   | Construction config. `Origins`: exact origins allowed, `"*"` for any; others get 403 before auth |
-| `Handler`                                                               | type   | An `http.Handler` performing the RFC 6455 handshake and running the socket   |
-| `Handler.EnablePush(db, notifier)`                                      | method | Turn on StateChange push over the socket. Without it `SupportsPush` is false |
-| `Handler.SupportsPush()`                                                | method | Whether push is available, for the advertised capability object              |
-| `Handler.ServeHTTP`                                                     | method | It is an `http.Handler`; mount it at the path you advertise                  |
-| `Handler.Shutdown()`                                                    | method | Drain and close live sockets, bounded by `DrainDeadline`; returns with no connection goroutine left running |
-| `SessionCapability(baseURL, path string, supportsPush bool) Capability` | func   | The capability object to advertise in the session resource                   |
-| `Capability`                                                            | type   | The advertised object: URL and push support                                  |
-| `CapabilityURI`                                                         | const  | `urn:ietf:params:jmap:websocket`                                             |
-| `IdleTimeout`, `WriteDeadline`, `DrainDeadline`, `CloseReplyDeadline`   | var    | Connection timing                                                            |
-| `MaxMessageSize`, `MaxFragments`, `MaxRequestIDLength`, `LaneCap`       | var    | Per-connection limits                                                        |
-| `ReauthInterval`                                                        | var    | How often a live socket re-checks its credential                             |
-| `ReauthWithRevoker`                                                     | var    | Run the re-auth backstop even when the authenticator has a revocation stream |
+| Symbol                                                                                   | Kind   | What it is                                                                                                  |
+|------------------------------------------------------------------------------------------|--------|-------------------------------------------------------------------------------------------------------------|
+| `NewHandler(srv *runtime.Server, authn auth.Authenticator, cfg Config) *Handler`         | func   | The upgrade endpoint. Mount it on your mux                                                                  |
+| `Config`                                                                                 | type   | Construction config. `Origins`: exact origins allowed, `"*"` for any; others get 403 before auth            |
+| `Handler`                                                                                | type   | An `http.Handler` performing the RFC 6455 handshake and running the socket                                  |
+| `Handler.EnablePush(db, notifier)`                                                       | method | Turn on StateChange push over the socket. Without it `SupportsPush` is false                                |
+| `Handler.SupportsPush()`                                                                 | method | Whether push is available, for the advertised capability object                                             |
+| `Handler.ServeHTTP`                                                                      | method | It is an `http.Handler`; mount it at the path you advertise                                                 |
+| `Handler.Shutdown()`                                                                     | method | Drain and close live sockets, bounded by `DrainDeadline`; returns with no connection goroutine left running |
+| `SessionCapability(baseURL, path string, supportsPush bool) Capability`                  | func   | The capability object to advertise in the session resource                                                  |
+| `Capability`                                                                             | type   | The advertised object: URL and push support                                                                 |
+| `CapabilityURI`                                                                          | const  | `urn:ietf:params:jmap:websocket`                                                                            |
+| `IdleTimeout`, `WriteDeadline`, `MessageDeadline`, `DrainDeadline`, `CloseReplyDeadline` | var    | Connection timing                                                                                           |
+| `MaxMessageSize`, `MaxFragments`, `MaxRequestIDLength`, `LaneCap`                        | var    | Per-connection limits                                                                                       |
+| `ReauthInterval`                                                                         | var    | How often a live socket re-checks its credential                                                            |
+| `ReauthWithRevoker`                                                                      | var    | Run the re-auth backstop even when the authenticator has a revocation stream                                |
 
 The package-level vars are the tuning surface; set them before serving.
 
